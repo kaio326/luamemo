@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# memo — CLI wrapper for lapis-memory HTTP API.
+#
+# Configuration (env vars or ~/.memorc):
+#   MEMO_URL    Base URL of the memory API, e.g. https://app.example.com/api/memory
+#   MEMO_TOKEN  Bearer token sent as Authorization header (optional)
+#
+# Usage:
+#   memo write   --scope SCOPE --kind KIND --title T --body B [--tags a,b,c]
+#   memo search  QUERY [--scope SCOPE] [--kind KIND] [--limit N] [--since ISO|EPOCH] [--until ISO|EPOCH]
+#   memo recent  [--scope SCOPE] [--limit N]
+#   memo get     ID
+#   memo update  ID [--title T] [--body B] [--scope S] [--kind K] [--tags a,b]
+#   memo delete  ID
+#   memo summarize [--scope S] [--dry-run] [--weight-threshold F] [--retention-days N]
+#   memo promote --from FROM_SCOPE --to TO_SCOPE [--delete-source] [--dry-run] [--limit N]
+
+set -euo pipefail
+
+# Load ~/.memorc if present (simple KEY=VALUE format).
+if [[ -f "$HOME/.memorc" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.memorc"
+fi
+
+: "${MEMO_URL:?MEMO_URL is not set}"
+TOKEN_HEADER=()
+if [[ -n "${MEMO_TOKEN:-}" ]]; then
+    TOKEN_HEADER=(-H "Authorization: Bearer ${MEMO_TOKEN}")
+fi
+
+require_jq() {
+    if ! command -v jq >/dev/null; then
+        echo "memo: 'jq' is required but not installed" >&2
+        exit 1
+    fi
+}
+
+# Build a JSON body from --key value pairs. --tags is split on commas.
+build_json() {
+    local json='{}'
+    while [[ $# -gt 0 ]]; do
+        local key="${1#--}"
+        local val="$2"
+        if [[ "$key" == "tags" ]]; then
+            local arr; arr=$(printf '%s' "$val" | jq -R 'split(",")|map(gsub("^\\s+|\\s+$";""))')
+            json=$(printf '%s' "$json" | jq --argjson v "$arr" '. + {tags: $v}')
+        else
+            json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+        fi
+        shift 2
+    done
+    printf '%s' "$json"
+}
+
+cmd_write() {
+    require_jq
+    local body; body=$(build_json "$@")
+    curl -sS -X POST "${MEMO_URL}/write" \
+        "${TOKEN_HEADER[@]}" \
+        -H "Content-Type: application/json" \
+        -d "$body" | jq .
+}
+
+cmd_search() {
+    require_jq
+    local q="$1"; shift
+    local args=(--data-urlencode "q=$q")
+    while [[ $# -gt 0 ]]; do
+        args+=(--data-urlencode "${1#--}=$2"); shift 2
+    done
+    curl -sS -G "${MEMO_URL}/search" "${TOKEN_HEADER[@]}" "${args[@]}" | jq .
+}
+
+cmd_recent() {
+    require_jq
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        args+=(--data-urlencode "${1#--}=$2"); shift 2
+    done
+    curl -sS -G "${MEMO_URL}/recent" "${TOKEN_HEADER[@]}" "${args[@]}" | jq .
+}
+
+cmd_get() {
+    require_jq
+    curl -sS "${MEMO_URL}/$1" "${TOKEN_HEADER[@]}" | jq .
+}
+
+cmd_update() {
+    require_jq
+    local id="$1"; shift
+    local body; body=$(build_json "$@")
+    curl -sS -X POST "${MEMO_URL}/${id}/update" \
+        "${TOKEN_HEADER[@]}" \
+        -H "Content-Type: application/json" \
+        -d "$body" | jq .
+}
+
+cmd_delete() {
+    require_jq
+    curl -sS -X POST "${MEMO_URL}/$1/delete" "${TOKEN_HEADER[@]}" | jq .
+}
+
+cmd_summarize() {
+    require_jq
+    local json='{}'
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                json=$(printf '%s' "$json" | jq '. + {dry_run: true}')
+                shift
+                ;;
+            --*)
+                local key="${1#--}"; key="${key//-/_}"
+                local val="$2"
+                json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+                shift 2
+                ;;
+            *)
+                echo "memo summarize: unknown arg: $1" >&2; exit 1 ;;
+        esac
+    done
+    curl -sS -X POST "${MEMO_URL}/summarize" \
+        "${TOKEN_HEADER[@]}" \
+        -H "Content-Type: application/json" \
+        -d "$json" | jq .
+}
+
+cmd_promote() {
+    require_jq
+    local json='{}'
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                json=$(printf '%s' "$json" | jq '. + {dry_run: true}')
+                shift
+                ;;
+            --delete-source)
+                json=$(printf '%s' "$json" | jq '. + {delete_source: true}')
+                shift
+                ;;
+            --from)
+                json=$(printf '%s' "$json" | jq --arg v "$2" '. + {from_scope: $v}')
+                shift 2
+                ;;
+            --to)
+                json=$(printf '%s' "$json" | jq --arg v "$2" '. + {to_scope: $v}')
+                shift 2
+                ;;
+            --*)
+                local key="${1#--}"; key="${key//-/_}"
+                local val="$2"
+                json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+                shift 2
+                ;;
+            *)
+                echo "memo promote: unknown arg: $1" >&2; exit 1 ;;
+        esac
+    done
+    curl -sS -X POST "${MEMO_URL}/promote" \
+        "${TOKEN_HEADER[@]}" \
+        -H "Content-Type: application/json" \
+        -d "$json" | jq .
+}
+
+usage() {
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+[[ $# -lt 1 ]] && usage
+sub="$1"; shift
+case "$sub" in
+    write)  cmd_write  "$@" ;;
+    search) cmd_search "$@" ;;
+    recent) cmd_recent "$@" ;;
+    get)    cmd_get    "$@" ;;
+    update) cmd_update "$@" ;;
+    delete) cmd_delete "$@" ;;
+    summarize) cmd_summarize "$@" ;;
+    promote) cmd_promote "$@" ;;
+    -h|--help|help) usage ;;
+    *) echo "memo: unknown subcommand: $sub" >&2; usage ;;
+esac

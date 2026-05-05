@@ -1,0 +1,8 @@
+# Local eval artefacts and downloaded datasets
+eval/data/
+eval/results/
+eval/*.json
+*.log
+*.swp
+*~
+.DS_Store
