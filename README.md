@@ -312,27 +312,48 @@ if memory.secrets.enabled() then ... end
 > while the MCP server is connected. The assistant recognises them as tool calls
 > and executes them against the running lapis-memory HTTP API.
 
-Four tools are available once the MCP server is connected:
+Three tools are safe to call from the chat window (no raw values involved):
 
-| Tool | Description |
-|------|-------------|
-| `secret_list` | List stored secrets (names + metadata only) |
-| `secret_store(name, value, description?)` | Store or replace an encrypted secret |
-| `secret_delete(name)` | Permanently delete a secret |
-| `secret_execute(name, url, method?, headers?, body?, timeout_ms?)` | HTTP request with `{secret}` substituted server-side |
+| Tool | Safe in chat? | Description |
+|------|:---:|-------------|
+| `secret_list` | ✅ | List stored secrets (names + metadata only — no values) |
+| `secret_delete(name)` | ✅ | Permanently delete a secret |
+| `secret_execute(name, url, ...)` | ✅ | HTTP request with `{secret}` substituted server-side |
+| ~~`secret_store`~~ | ❌ | **Use `memo secret-store` from terminal instead** (see below) |
+
+**`secret_store` must never be called from the chat window.** The value would enter the LLM context and could be logged by the AI provider. Store secrets from the terminal only (see the section below).
 
 #### Adding a new API key
 
-Type this in the chat window — the agent will call the tool:
+> ⚠️ **Never type a secret value in the chat window.** The chat is processed by
+> the LLM (and potentially logged by the AI provider). Use the terminal instead.
 
-```
-Store my OpenAI key: secret_store("openai-key", "sk-proj-...", "OpenAI API key")
+Store secrets from the terminal using `memo secret-store`. It prompts for the
+value with **no echo** — the key never appears on screen, in shell history, or
+in the chat context:
+
+```bash
+# Prompted, no echo — safest
+export MEMO_URL=https://your-app.example.com/api/memory
+export MEMO_TOKEN=your-bearer-token   # if auth is enabled
+
+memo secret-store openai-key --desc "OpenAI API key"
+# Secret value for "openai-key": ████████  (hidden, no echo)
 ```
 
-Or simply ask naturally and the agent will use the tool:
+Or read the value from a file (e.g. a password manager export):
 
+```bash
+memo secret-store openai-key --file ~/.secrets/openai-key.txt --desc "OpenAI API key"
 ```
-Save my SendGrid API key "SG.xxxxxxxx" as "sendgrid"
+
+Or call the HTTP API directly from the terminal (value stays in your terminal, never in chat):
+
+```bash
+curl -sS -X POST "$MEMO_URL/secrets" \
+  -H "Authorization: Bearer $MEMO_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"openai-key","value":"sk-proj-...","description":"OpenAI API key"}'
 ```
 
 The value is encrypted server-side immediately. **It can never be retrieved** — not by

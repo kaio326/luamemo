@@ -14,6 +14,9 @@
 #   memo delete  ID
 #   memo summarize [--scope S] [--dry-run] [--weight-threshold F] [--retention-days N]
 #   memo promote --from FROM_SCOPE --to TO_SCOPE [--delete-source] [--dry-run] [--limit N]
+#   memo secret-store  NAME [--desc DESCRIPTION] [--file PATH]
+#   memo secret-list
+#   memo secret-delete NAME
 #   memo init    [--non-interactive] [--multilingual] [--long] [--hosted] [--allow-hash] [--write PATH] [--root DIR]
 #   memo doctor  [--setup PATH] [--json]
 
@@ -132,6 +135,69 @@ cmd_summarize() {
         -d "$json" | jq .
 }
 
+# ---------------------------------------------------------------------------
+# Secrets subcommands
+# ---------------------------------------------------------------------------
+# SECURITY: secret-store reads the value from --file or a no-echo stdin
+# prompt. The value NEVER appears in shell arguments or chat context.
+# ---------------------------------------------------------------------------
+
+cmd_secret_store() {
+    require_jq
+    local name=""
+    local desc=""
+    local file=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --desc)  desc="$2";  shift 2 ;;
+            --file)  file="$2";  shift 2 ;;
+            -*)  echo "memo secret-store: unknown flag: $1" >&2; exit 1 ;;
+            *)   name="$1"; shift ;;
+        esac
+    done
+    if [[ -z "$name" ]]; then
+        echo "Usage: memo secret-store NAME [--desc DESCRIPTION] [--file PATH]" >&2
+        exit 1
+    fi
+    local value
+    if [[ -n "$file" ]]; then
+        value=$(cat "$file")
+    else
+        # Read without echo so the value never appears on screen or in logs.
+        read -r -s -p "Secret value for \"${name}\": " value
+        echo >&2  # newline after the hidden input
+    fi
+    if [[ -z "$value" ]]; then
+        echo "memo secret-store: value cannot be empty" >&2
+        exit 1
+    fi
+    local body; body=$(jq -n \
+        --arg n "$name" \
+        --arg v "$value" \
+        --arg d "$desc" \
+        '{name: $n, value: $v, description: (if $d == "" then null else $d end)}')
+    # Zero the shell variable immediately after JSON encoding.
+    value=""
+    curl -sS -X POST "${MEMO_URL}/secrets" \
+        "${TOKEN_HEADER[@]}" \
+        -H "Content-Type: application/json" \
+        -d "$body" | jq '{ok, secret: {id: .secret.id, name: .secret.name, description: .secret.description}}'
+}
+
+cmd_secret_list() {
+    require_jq
+    curl -sS "${MEMO_URL}/secrets" "${TOKEN_HEADER[@]}" \
+        | jq '[.secrets[] | {id, name, description, used_count, last_used_at, updated_at}]'
+}
+
+cmd_secret_delete() {
+    require_jq
+    if [[ -z "${1:-}" ]]; then
+        echo "Usage: memo secret-delete NAME" >&2; exit 1
+    fi
+    curl -sS -X POST "${MEMO_URL}/secrets/$1/delete" "${TOKEN_HEADER[@]}" | jq .
+}
+
 cmd_promote() {
     require_jq
     local json='{}'
@@ -218,6 +284,9 @@ case "$sub" in
     delete) cmd_delete "$@" ;;
     summarize) cmd_summarize "$@" ;;
     promote) cmd_promote "$@" ;;
+    secret-store)  cmd_secret_store  "$@" ;;
+    secret-list)   cmd_secret_list        ;;
+    secret-delete) cmd_secret_delete "$@" ;;
     init)    cmd_local_lua init   "$@" ;;
     doctor)  cmd_local_lua doctor "$@" ;;
     -h|--help|help) usage ;;
