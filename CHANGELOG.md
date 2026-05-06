@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 — 2026-05-05
 
 - **Secrets management** (`lapis_memory.secrets`): encrypted API-key storage
   with the `execute_with_secret` design principle. Secrets are AES-256-CBC
