@@ -1,34 +1,63 @@
 # Changelog
 
-## 0.1.5 — 2026-05-16
+## 0.2.0 — 2026-05-06
 
-- **Secrets: file-based store (breaking change vs 0.1.3/0.1.4)**: The
-  `lm_secrets` PostgreSQL table has been removed. Secrets are now stored as
-  AES-256-CBC encrypted entries in a local JSON file. Activation requires two
-  new config keys: `secrets_file` (path to the writable JSON file) and the
-  existing master-key resolution chain (`master_key_path` / `master_key_env` /
-  `master_key`). When `secrets_file` is not set, the feature is disabled; all
-  other features work normally. This means no DB table is created and the
-  feature can be activated per-deployment by mounting a volume file — no SQL
-  migration needed.
-  - `M.configure()` now sets `_file_path` from `config.secrets_file`.
-  - `M.enabled()` requires **both** `_key` and `_file_path` to be non-nil.
-  - `load_store()` / `save_store()` replace all DB queries; writes are atomic
-    (write to `.tmp` then `os.rename()`).
-  - `migration 005_lm_secrets.sql` deleted — run `memo migrate` output does
-    not include the `lm_secrets` table any more.
-  - 503 error message updated to `"secrets: not configured (secrets_file or
-    master_key not set)"`.
+- `luamemo/util.lua`: extracted `clip()` and `parse_scores()` helpers shared
+  across `store.lua` and `rerank.lua`.
+- `luamemo/db.lua`: portable PostgreSQL adapter — delegates to `lapis.db`
+  inside OpenResty; creates a direct `pgmoon` connection outside (plain Lua,
+  CLI, eval harnesses). Config keys: `pg_host`, `pg_port`, `pg_database`,
+  `pg_user`, `pg_password`; falls back to standard `PG*` env vars.
+- `luamemo/http.lua`: portable HTTP client — uses `resty.http` inside
+  OpenResty workers; falls back to `ssl.https` / `socket.http` outside.
+- Security hardening: constant-time token comparison in `routes.lua`;
+  HMAC-SHA256 authentication tag on all encrypted secrets; CSRF double-submit
+  cookie in `web.lua`; input length caps on all HTTP endpoints.
 
-## 0.1.4 — 2026-05-08
-
-- **`memo migrate`**: new CLI command that prints all idempotent SQL
-  migrations to stdout. Pipe directly to `psql` to bring any database up to
-  date in one step. No MEMO_URL required — runs without a running server.
+---
 
 ## 0.1.3 — 2026-05-05
 
-- **Secrets management** (`lapis_memory.secrets`): encrypted API-key storage
+### ⚠ Breaking changes (upgrade from 0.1.2)
+
+- **Secrets ciphertext format changed.** `secrets.lua` now stores secrets as
+  `iv_hex:ct_hex:mac_hex` (16-byte IV + HMAC-SHA256 authentication tag).
+  The v0.1.2 format was `salt_hex:ct_hex` (8-byte salt, no MAC).
+  **Existing secrets stored with v0.1.2 cannot be decrypted by v0.1.3.**
+  Before upgrading: record the plaintext values of any stored secrets,
+  delete them from the `lm_secrets` table, upgrade the library, then
+  re-store them with the new version. The v0.1.3 format adds integrity
+  verification (HMAC) that the v0.1.2 format lacked.
+
+- **Portability refactor** — the library no longer requires OpenResty at runtime:
+  - `luamemo/http.lua`: new portable HTTP client abstraction. Uses
+    `resty.http` (non-blocking cosockets) when running inside an OpenResty
+    worker; falls back to `ssl.https` / `socket.http` (luasec / luasocket)
+    in plain-Lua environments such as CLI tools, test harnesses, and non-web
+    Lua apps. `resty.http` cannot be used outside OpenResty (no cosocket API),
+    and `socket.http` cannot be used inside OpenResty (blocking I/O stalls the
+    worker). Both paths are therefore required — they are not redundant.
+  - All HTTP adapters (`embed.lua`, every reranker, every summarizer) and
+    `secrets.lua` now use `luamemo.http` instead of `resty.http` directly.
+  - `luamemo/secrets.lua`: all `resty.aes` / `resty.random` /
+    `resty.string` replaced with `lua-openssl` (`openssl.cipher`,
+    `openssl.rand`, `openssl.hmac`). Ciphertext format updated to
+    `iv_hex:ct_hex:mac_hex` (16-byte IV; was 8-byte salt). Pure-Lua hex
+    helpers; no OpenResty dependency at all.
+  - `luamemo/db.lua`: new portable PostgreSQL abstraction. In
+    OpenResty, delegates to `lapis.db` (nginx connection pool, type
+    coercion). Outside OpenResty, creates a pgmoon connection from
+    `pg_host`/`pg_port`/`pg_database`/`pg_user`/`pg_password` config
+    keys or the standard `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/
+    `PGPASSWORD` env vars. All modules (`store`, `kg`, `summarizer`,
+    `tune_weights`, `init`, `web`) now use `luamemo.db` instead of
+    `lapis.db` directly. pgmoon already handles type coercion
+    (int→number, bool→boolean, NULL→nil) identically to lapis.db, so
+    no adapter layer is needed.
+  - Rockspec: added `luamemo.db` module; added `pgmoon >= 1.13`
+    dependency; updated summary to reflect Lua-first portability.
+
+- **Secrets management** (`luamemo.secrets`): encrypted API-key storage
   with the `execute_with_secret` design principle. Secrets are AES-256-CBC
   encrypted at rest with a master key that is never persisted in the database.
   `execute_with_secret` substitutes `{secret}` server-side in HTTP request
@@ -47,7 +76,7 @@
   - Migration `005_lm_secrets.sql` adds the `lm_secrets` table.
   - Documented in README "Secrets Management" section.
 
-- **Web UI (read-only)**: new sub-app `lapis_memory.web` mountable via
+- **Web UI (read-only)**: new sub-app `luamemo.web` mountable via
   `memory.web.register(app, { prefix = "/memory/ui" })`. Pure-Lua HTML
   rendering (no etlua dependency on the host), inline CSS, paginated
   list (`GET /memory/ui`) and detail (`GET /memory/ui/:id`) pages.
@@ -65,7 +94,7 @@
 - **Eval harness vs LongMemEval**: pure-Lua benchmark harness under
   `eval/`. `eval/datasets/longmemeval.lua` loads the published dataset
   and flattens chat sessions into per-question scoped memories. `eval/run.lua`
-  ingests the haystack into a dedicated `lapis_memory_eval` table, runs
+  ingests the haystack into a dedicated `luamemo_eval` table, runs
   hybrid search, and writes a `results.json`. `eval/score.lua` reports
   R@1 / R@5 / R@10 overall and per `question_type`. Dataset download via
   `scripts/download_eval.sh` (Apache-2.0). Decay weighting is bypassed in
@@ -79,8 +108,8 @@
   /api/memory/summarize` endpoint, or the new `memo summarize` CLI
   command. Selection criterion: `weight < threshold` AND age > retention
   days. Replacement is transactional (BEGIN/COMMIT) so a failed summary
-  cannot lose the originals. See `lapis_memory/summarizer.lua` and
-  `lapis_memory/summarizers/`.
+  cannot lose the originals. See `luamemo/summarizer.lua` and
+  `luamemo/summarizers/`.
 - **Dedup on write**: `store.write` now runs a top-1 vector pre-search in
   the same scope; near-duplicates (default cosine ≥ 0.95) are merged
   into the existing row instead of creating a new one. Configurable via

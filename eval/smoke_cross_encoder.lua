@@ -1,4 +1,4 @@
--- Smoke test for lapis_memory.rerankers.cross_encoder.
+-- Smoke test for luamemo.rerankers.cross_encoder.
 -- Does NOT require a running TEI sidecar — we monkey-patch
 -- resty.http to return canned responses and verify the parser
 -- handles both TEI native and Cohere/Jina shapes.
@@ -20,7 +20,7 @@ package.loaded["resty.http"] = {
 -- Provide a minimal eval/_resty_http_shim if cross_encoder ever switches
 package.loaded["eval._resty_http_shim"] = package.loaded["resty.http"]
 
-local ce = require("lapis_memory.rerankers.cross_encoder")
+local ce = require("luamemo.rerankers.cross_encoder")
 
 local function assert_eq(a, b, msg)
     if a ~= b then

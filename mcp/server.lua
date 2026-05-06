@@ -1,10 +1,10 @@
 #!/usr/bin/env lua
--- lapis-memory MCP stdio server (pure Lua, single-file)
+-- luamemo MCP stdio server (pure Lua, single-file)
 --
 -- Implements the Model Context Protocol (https://modelcontextprotocol.io/)
 -- stdio transport: newline-delimited JSON-RPC 2.0 over stdin/stdout. Bridges
 -- MCP clients (Claude Desktop, Cursor, Continue.dev, Copilot Agent Mode,
--- ...) to a running lapis-memory HTTP API.
+-- ...) to a running luamemo HTTP API.
 --
 -- Lua-First Policy
 -- ----------------
@@ -14,7 +14,7 @@
 --
 -- Configuration (env vars)
 -- ------------------------
---   MEMO_URL     REQUIRED  Base URL of the lapis-memory HTTP API,
+--   MEMO_URL     REQUIRED  Base URL of the luamemo HTTP API,
 --                          e.g. https://app.example.com/api/memory
 --   MEMO_TOKEN   optional  Bearer token sent as Authorization header
 --   MEMO_SCOPE   optional  Default scope applied when a tool call omits it
@@ -26,6 +26,11 @@
 
 local cjson = require("cjson.safe")
 
+-- Seed the PRNG once at startup.  Seeding inside a function (as was done
+-- previously) resets the sequence on every call; two requests within the
+-- same second would produce identical temp filenames.
+math.randomseed(os.time() + math.floor(os.clock() * 1e6))
+
 -- ===========================================================================
 -- Config
 -- ===========================================================================
@@ -35,15 +40,15 @@ local MEMO_SCOPE = os.getenv("MEMO_SCOPE")
 local DEBUG      = os.getenv("MEMO_DEBUG") == "1"
 
 local PROTOCOL_VERSION = "2024-11-05"
-local SERVER_NAME      = "lapis-memory"
-local SERVER_VERSION   = "0.1.0"
+local SERVER_NAME      = "luamemo"
+local SERVER_VERSION   = "0.2.0"
 
 -- ===========================================================================
 -- Logging (stderr only — stdout is reserved for JSON-RPC frames)
 -- ===========================================================================
 local function log(...)
     if not DEBUG then return end
-    io.stderr:write("[lapis-memory-mcp] ")
+    io.stderr:write("[luamemo-mcp] ")
     for i = 1, select("#", ...) do
         if i > 1 then io.stderr:write(" ") end
         io.stderr:write(tostring((select(i, ...))))
@@ -53,7 +58,7 @@ local function log(...)
 end
 
 local function fatal(msg)
-    io.stderr:write("[lapis-memory-mcp] FATAL: " .. tostring(msg) .. "\n")
+    io.stderr:write("[luamemo-mcp] FATAL: " .. tostring(msg) .. "\n")
     io.stderr:flush()
     os.exit(1)
 end
@@ -124,7 +129,14 @@ local function http_request(method, path, query, body)
     -- materialize it to a temp file and pass it to curl with --data-binary @file.
     local tmpname
     if body then
-        tmpname = os.tmpname()
+        -- Build the temp path ourselves instead of using os.tmpname() to
+        -- avoid the TOCTOU window between os.tmpname() returning a path and
+        -- io.open() creating the file (a local attacker could plant a symlink
+        -- in that window on world-writable /tmp).
+        local tmpdir = os.getenv("TMPDIR") or "/tmp"
+        tmpname = tmpdir .. "/lm_mcp_"
+            .. tostring(os.time()) .. "_"
+            .. tostring(math.random(100000000, 999999999)) .. ".json"
         local tmpf, terr = io.open(tmpname, "wb")
         if not tmpf then return nil, "tempfile: " .. tostring(terr) end
         tmpf:write(cjson.encode(body))

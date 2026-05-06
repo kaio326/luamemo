@@ -1,10 +1,10 @@
 -- eval/smoke_recommend.lua — decision-tree matrix tests for cli.recommend.
 -- Pure Lua, no DB, no network. Run with:
---   cd lapis-memory && lua5.1 eval/smoke_recommend.lua
+--   cd luamemo && lua5.1 eval/smoke_recommend.lua
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
-local R = require("lapis_memory.cli.recommend")
+local R = require("luamemo.cli.recommend")
 
 local cases = {
     -- has_gpu, gpu_free, has_docker, has_ollama, ram_mb, multi, long, hosted, allow_hash | want_adapter, want_model

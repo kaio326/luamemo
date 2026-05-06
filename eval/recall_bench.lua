@@ -9,7 +9,7 @@
 --
 -- The runner is **retrieval-side only**: a hit means the answer session
 -- appeared in the top-K results, not that an LLM produced the right
--- answer. That isolates lapis-memory's contribution from the downstream
+-- answer. That isolates luamemo's contribution from the downstream
 -- generator.
 --
 -- Usage:
@@ -119,19 +119,11 @@ local function ensure_corpus(path)
 end
 ensure_corpus(args.corpus)
 
--- --- pgmoon shim ---------------------------------------------------------
-local db_shim = require("_smoke_lapis_db")
-db_shim._connect({
-    host     = os.getenv("PGHOST") or "127.0.0.1",
-    port     = tonumber(os.getenv("PGPORT") or "5432"),
-    database = os.getenv("PGDATABASE") or "lm_bruteforce_test",
-    user     = os.getenv("PGUSER") or "postgres",
-    password = os.getenv("PGPASSWORD") or "postgres",
-})
-package.loaded["lapis.db"] = db_shim
+-- luamemo.db creates a pgmoon connection automatically from
+-- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
 
-local memory     = require("lapis_memory")
-local db         = require("lapis.db")
+local memory     = require("luamemo")
+local db         = require("luamemo.db")
 local longmemev  = require("longmemeval")
 local paraphrase
 if args.paraphrase ~= "none" then

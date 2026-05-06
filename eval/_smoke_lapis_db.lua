@@ -1,4 +1,4 @@
--- Minimal lapis.db shim for smoke-testing lapis-memory without a full
+-- Minimal lapis.db shim for smoke-testing luamemo without a full
 -- Lapis install. Wraps pgmoon. NOT for production. Only loaded by
 -- eval/smoke harnesses that set package.path explicitly.
 

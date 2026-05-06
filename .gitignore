@@ -8,3 +8,13 @@ eval/*.json
 .DS_Store
 *.src.rock
 *.rock
+
+# Dev container environment file (may contain MEMO_MASTER_KEY)
+dev/.env
+
+# Local secrets — never commit
+.github/copilot-sec
+.github/copilot-prompts
+secrets/
+.env
+.env.backup

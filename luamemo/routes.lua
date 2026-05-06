@@ -1,0 +1,309 @@
+-- luamemo.routes
+-- Lapis route factory. Call routes.register(app, { prefix = "/api/memory" }).
+
+local cjson = require("cjson.safe")
+
+local M = {}
+
+local function json(status, body)
+    return { status = status, json = body }
+end
+
+local function decode_body(self)
+    if self.params and next(self.params) then return self.params end
+    -- Explicit JSON body parsing: lapis does not always auto-decode
+    -- application/json bodies, so read the raw body and parse it here.
+    local ct = (self.req and self.req.headers and self.req.headers["content-type"]) or ""
+    if ct:find("application/json", 1, true) then
+        ngx.req.read_body()
+        local raw = ngx.req.get_body_data()
+        if raw and raw ~= "" then
+            local ok, parsed = pcall(cjson.decode, raw)
+            if ok and type(parsed) == "table" then return parsed end
+        end
+    end
+    if self.req and self.req.params_post then return self.req.params_post end
+    return {}
+end
+
+local function get_cfg()
+    -- Lazy require to avoid circular dependency at module load.
+    return require("luamemo").config
+end
+
+local function authorise(self)
+    local cfg = get_cfg()
+    if cfg.before_request then
+        local hook_ok, hook_result, hook_err = pcall(cfg.before_request, self)
+        if not hook_ok then
+            -- before_request threw a Lua error; never expose internals
+            return json(500, { error = "internal error" })
+        end
+        if not hook_result then
+            return json(hook_err and hook_err.status or 403,
+                        { error = hook_err and hook_err.message or "forbidden" })
+        end
+    end
+    local auth_ok, auth_result = pcall(cfg.auth_fn, self)
+    if not auth_ok or not auth_result then
+        return json(403, { error = "forbidden" })
+    end
+    return nil
+end
+
+--- Register all memory routes on a Lapis app.
+-- @param app  Lapis Application instance
+-- @param opts table  { prefix = "/api/memory" }
+function M.register(app, opts)
+    opts = opts or {}
+    local prefix = opts.prefix or "/api/memory"
+    local store  = require("luamemo.store")
+
+    -- POST /write
+    app:post(prefix .. "/write", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = decode_body(self)
+        local row, err, action = store.write({
+            scope          = p.scope,
+            kind           = p.kind,
+            title          = p.title,
+            body           = p.body,
+            tags           = p.tags,
+            metadata       = p.metadata,
+            importance     = p.importance,
+            decay_rate     = p.decay_rate,
+            dedup_strategy = p.dedup_strategy,
+        })
+        if not row then return json(400, { error = err }) end
+        return json(200, { ok = true, memory = row, action = action or "inserted" })
+    end)
+
+    -- GET /search
+    app:get(prefix .. "/search", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = self.params
+        if not p.q or p.q == "" then
+            return json(400, { error = "q is required" })
+        end
+        local rows, err = store.search({
+            query        = p.q,
+            scope        = p.scope,
+            kind         = p.kind,
+            limit        = tonumber(p.limit),
+            ignore_decay = p.ignore_decay == "1" or p.ignore_decay == "true",
+            -- Phase 11: temporal bounds. `until` is a Lua reserved word so
+            -- we read the HTTP param as bracket syntax and pass on as
+            -- `until_` to the store layer.
+            since        = p.since,
+            until_       = p["until"],
+        })
+        if not rows then return json(400, { error = err }) end
+        return json(200, { ok = true, results = rows })
+    end)
+
+    -- GET /recent
+    app:get(prefix .. "/recent", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = self.params
+        local rows = store.recent({
+            scope = p.scope,
+            limit = tonumber(p.limit),
+        })
+        return json(200, { ok = true, results = rows })
+    end)
+
+    -- GET /:id
+    app:get(prefix .. "/:id", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local row = store.get(self.params.id)
+        if not row then return json(404, { error = "not found" }) end
+        return json(200, { ok = true, memory = row })
+    end)
+
+    -- POST /:id/update
+    app:post(prefix .. "/:id/update", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = decode_body(self)
+        local row, err = store.update(self.params.id, p)
+        if not row then return json(400, { error = err }) end
+        return json(200, { ok = true, memory = row })
+    end)
+
+    -- POST /:id/delete
+    app:post(prefix .. "/:id/delete", function(self)
+        local denied = authorise(self); if denied then return denied end
+        store.delete(self.params.id)
+        return json(200, { ok = true })
+    end)
+
+    -- POST /summarize  (manual trigger; same auth as the rest of the API)
+    app:post(prefix .. "/summarize", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = decode_body(self)
+        local summarizer = require("luamemo.summarizer")
+        local result = summarizer.run({
+            scope            = p.scope,
+            dry_run          = p.dry_run == true or p.dry_run == "1" or p.dry_run == "true",
+            weight_threshold = tonumber(p.weight_threshold),
+            retention_days   = tonumber(p.retention_days),
+            batch_size       = tonumber(p.batch_size),
+            max_batches      = tonumber(p.max_batches),
+        })
+        return json(200, { ok = true, result = result })
+    end)
+
+    -- POST /promote  (session continuity: roll from_scope into to_scope)
+    app:post(prefix .. "/promote", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = decode_body(self)
+        local summarizer = require("luamemo.summarizer")
+        local result = summarizer.promote({
+            from_scope    = p.from_scope,
+            to_scope      = p.to_scope,
+            delete_source = p.delete_source == true or p.delete_source == "1" or p.delete_source == "true",
+            dry_run       = p.dry_run == true or p.dry_run == "1" or p.dry_run == "true",
+            limit         = tonumber(p.limit),
+            min_rows      = tonumber(p.min_rows),
+        })
+        local status = (result.promoted == 1 or result.reason == "no_rows") and 200 or 400
+        return json(status, { ok = status == 200, result = result })
+    end)
+
+    -- ---------------------------------------------------------------
+    -- Knowledge-graph layer (Phase 16.5)
+    -- ---------------------------------------------------------------
+    local kg = require("luamemo.kg")
+
+    -- POST /kg/assert
+    app:post(prefix .. "/kg/assert", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = decode_body(self)
+        local row, err = kg.assert_fact({
+            scope            = p.scope,
+            subject          = p.subject,
+            predicate        = p.predicate,
+            object           = p.object,
+            valid_from       = p.valid_from,
+            source_memory_id = tonumber(p.source_memory_id),
+            supersede        = p.supersede == true or p.supersede == "1" or p.supersede == "true",
+        })
+        if not row then return json(400, { error = err }) end
+        return json(200, { ok = true, fact = row })
+    end)
+
+    -- GET /kg/query
+    app:get(prefix .. "/kg/query", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = self.params
+        local rows, err = kg.query({
+            scope               = p.scope,
+            subject             = p.subject,
+            predicate           = p.predicate,
+            object              = p.object,
+            at                  = p.at,
+            include_invalidated = p.include_invalidated == "1" or p.include_invalidated == "true",
+            limit               = tonumber(p.limit),
+        })
+        if not rows then return json(400, { error = err }) end
+        return json(200, { ok = true, results = rows })
+    end)
+
+    -- POST /kg/invalidate
+    app:post(prefix .. "/kg/invalidate", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = decode_body(self)
+        local n, err = kg.invalidate({
+            scope     = p.scope,
+            subject   = p.subject,
+            predicate = p.predicate,
+            object    = p.object,
+            at        = p.at,
+        })
+        if not n then return json(400, { error = err }) end
+        return json(200, { ok = true, invalidated = n })
+    end)
+
+    -- GET /kg/timeline
+    app:get(prefix .. "/kg/timeline", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = self.params
+        local rows, err = kg.timeline({
+            scope     = p.scope,
+            subject   = p.subject,
+            predicate = p.predicate,
+        })
+        if not rows then return json(400, { error = err }) end
+        return json(200, { ok = true, results = rows })
+    end)
+
+    -- ---------------------------------------------------------------
+    -- Secrets layer (lm_secrets)
+    -- All endpoints require secrets to be enabled (master key configured).
+    -- Values are NEVER returned in any response.
+    -- ---------------------------------------------------------------
+    local secrets_mod = require("luamemo.secrets")
+
+    -- GET /secrets — list secret names and metadata (no values)
+    app:get(prefix .. "/secrets", function(self)
+        local denied = authorise(self); if denied then return denied end
+        if not secrets_mod.enabled() then
+            return json(503, { error = "secrets: not configured (secrets_file or master_key not set)" })
+        end
+        local rows = secrets_mod.list()
+        return json(200, { ok = true, secrets = rows })
+    end)
+
+    -- POST /secrets — create or update a secret
+    app:post(prefix .. "/secrets", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = decode_body(self)
+        if not p.name or p.name == "" then
+            return json(400, { error = "name is required" })
+        end
+        if not p.value or p.value == "" then
+            return json(400, { error = "value is required" })
+        end
+        local row, err = secrets_mod.store(p.name, p.value, p.description)
+        if not row then return json(400, { error = err }) end
+        return json(200, { ok = true, secret = row })
+    end)
+
+    -- POST /secrets/:name/delete — permanently delete a secret
+    app:post(prefix .. "/secrets/:name/delete", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local ok, err = secrets_mod.delete(self.params.name)
+        if not ok then
+            local status = (err and err:find("not found")) and 404 or 400
+            return json(status, { error = err })
+        end
+        return json(200, { ok = true })
+    end)
+
+    -- POST /secrets/:name/execute — execute HTTP request with secret substituted
+    app:post(prefix .. "/secrets/:name/execute", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = decode_body(self)
+        if not p.url or p.url == "" then
+            return json(400, { error = "url is required" })
+        end
+        local headers = p.headers
+        if type(headers) == "string" then
+            -- Allow JSON-encoded headers from form posts
+            local decoded, derr = cjson.decode(headers)
+            if decoded then headers = decoded
+            else return json(400, { error = "headers must be a JSON object: " .. tostring(derr) })
+            end
+        end
+        local body, err = secrets_mod.execute_with_secret(self.params.name, {
+            url        = p.url,
+            method     = p.method,
+            headers    = headers,
+            body       = p.body,
+            timeout_ms = tonumber(p.timeout_ms),
+        })
+        if not body then return json(400, { error = err }) end
+        return json(200, { ok = true, response = body })
+    end)
+end
+
+return M

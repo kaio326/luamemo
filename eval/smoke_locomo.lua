@@ -12,7 +12,7 @@
 --   docker exec -i <postgres-container> psql -U postgres -c \
 --     'DROP DATABASE IF EXISTS lm_bruteforce_test; CREATE DATABASE lm_bruteforce_test;'
 --   docker exec -i <postgres-container> psql -U postgres -d lm_bruteforce_test \
---     < lapis_memory/schema_bruteforce.sql
+--     < luamemo/schema_bruteforce.sql
 --
 -- Run:
 --   PGHOST=127.0.0.1 PGPORT=5432 lua5.1 eval/smoke_locomo.lua

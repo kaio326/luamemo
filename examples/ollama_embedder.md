@@ -14,10 +14,10 @@ ollama pull nomic-embed-text   # 768-dim, recommended
 ollama pull all-minilm          # 384-dim, smaller/faster
 ```
 
-## 2. Configure lapis-memory
+## 2. Configure luamemo
 
 ```lua
-local memory = require("lapis_memory")
+local memory = require("luamemo")
 memory.setup({
     embedder_url     = "http://localhost:11434/api/embeddings",
     embedder_adapter = "ollama",

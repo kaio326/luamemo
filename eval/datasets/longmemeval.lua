@@ -51,7 +51,7 @@ end
 --- Flatten a single session into a memory body. Each session is a chat
 --- transcript; we serialise it into a "USER: ... | ASSISTANT: ..." block
 --- so it embeds as one document. This matches the way agents would write
---- the session into lapis-memory at run time.
+--- the session into luamemo at run time.
 function M.session_to_body(turns)
     if type(turns) ~= "table" then return "" end
     local lines = {}

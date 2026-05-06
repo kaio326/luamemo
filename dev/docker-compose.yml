@@ -1,0 +1,53 @@
+# dev/docker-compose.yml
+# Minimal dev stack for lapis-memory.  NOT part of the installed library.
+#
+# Usage:
+#   cp dev/.env.example dev/.env     # fill in MEMO_MASTER_KEY
+#   cd dev && docker compose up
+#
+# The MCP server (mcp/server.lua) can then connect with:
+#   MEMO_URL=http://localhost:8765/api/memory
+#   MEMO_TOKEN=<MEMO_TOKEN from .env>
+#   MEMO_SCOPE=lapis-memory-dev
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../:/app           # entire repo; changes reflected live (lua_code_cache off)
+      - secrets:/data      # persists the encrypted secrets JSON file across restarts
+    ports:
+      - "8765:8765"
+    env_file: .env
+    environment:
+      LAPIS_ENVIRONMENT: development
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: lapis_memory_dev
+      PGUSER: lapis
+      PGPASSWORD: lapis
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["openresty", "-c", "/app/dev/nginx.conf", "-g", "daemon off;"]
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: lapis_memory_dev
+      POSTGRES_USER: lapis
+      POSTGRES_PASSWORD: lapis
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lapis -d lapis_memory_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  pg_data:
+  secrets:

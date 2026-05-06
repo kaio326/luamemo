@@ -1,18 +1,18 @@
-# lapis-memory
+# luamemo
 
-A drop-in **persistent memory store for AI agents** built on
-[Lapis](https://leafo.net/lapis/) + [OpenResty](https://openresty.org/) +
-plain PostgreSQL. [pgvector](https://github.com/pgvector/pgvector) is
+A drop-in **persistent memory store for AI agents** built on plain
+PostgreSQL. Works in any Lua 5.1+ runtime — [pgvector](https://github.com/pgvector/pgvector) is
 auto-detected and used when available, but **not required** — the default
 backend is a pure-Lua brute-force search that runs on any Postgres 15+.
 
 > Give your agent a real memory that survives session crashes, JSON-overflow
 > errors in chat clients, container restarts, and device switches — without
-> taking on any new runtime services beyond what your Lapis app already runs.
+> taking on any new runtime services beyond what your app already runs.
 
 **Lua-first.** Every component — embedder, store, routes, Web UI, MCP
-server, summarizer — is written in Lua. The only non-Lua hard dependencies
-are PostgreSQL and OpenResty (and OpenResty is optional for CLI / MCP use).
+server, summarizer — is written in Lua. Hard dependencies are PostgreSQL,
+`lua-openssl` (AES-256-CBC crypto), and `luasocket` (HTTP outside OpenResty).
+OpenResty is optional — the library runs in any Lua 5.1+ runtime.
 
 ---
 
@@ -39,7 +39,7 @@ are PostgreSQL and OpenResty (and OpenResty is optional for CLI / MCP use).
   `session:<uuid>` scope into a single summary in a long-term scope —
   the next session starts knowing what the previous one knew. See
   [SESSION_CONTINUITY.md](SESSION_CONTINUITY.md).
-- **Auto-capture hooks**: `lapis_memory.hooks` wires chat agents into
+  Auto-capture hooks**: `luamemo.hooks` wires chat agents into
   the store with two lines per turn — user/assistant messages, tool
   calls, and durable decisions land in the right scope with sane
   dedup defaults. See [HOOKS.md](HOOKS.md).
@@ -66,23 +66,28 @@ are PostgreSQL and OpenResty (and OpenResty is optional for CLI / MCP use).
 ```
           ┌──────────────────────────────────┐
           │  Caller surfaces                  │
-          │  HTTP routes  │  CLI (memo)  │  │
-          │  Web UI       │  MCP server  │  │
-          └──────┬───────────┬──────────────────┘
+          │  HTTP routes  │  CLI (memo)  │   │
+          │  Web UI       │  MCP server  │   │
+          └──────┬───────────┬───────────────┘
                  │           │
                  ▼           ▼
           ┌──────────────────────────────────┐
-          │  init.lua  —  setup() + config  │
-          └───┬────────────────────────────────┘
+          │  init.lua  —  setup() + config   │
+          └───┬──────────────────────────────┘
               │
-     ┌───────┼───────────────┐
-     ▼               ▼                ▼
-  store.lua       embed.lua       summarizer.lua
-  (write/get/    (in-process     (timer + adapters
-   search/        hash OR HTTP    in summarizers/)
-   recent/         adapter in
-   delete/         adapters/)
+     ┌────────┼───────────────┐
+     ▼        ▼               ▼
+  store.lua  embed.lua    summarizer.lua
+  (write/    (in-process  (timer + adapters
+   search/    hash OR      in summarizers/)
+   recent/    HTTP via
+   delete/    http.lua)
    dedup)
+     │            │
+     │            └──► http.lua ─► resty.http (OpenResty)
+     │                             └► socket.http (plain Lua)
+     ▼
+  db.lua ──► lapis.db (OpenResty)  OR  pgmoon (plain Lua)
      │
      ▼
   PostgreSQL  (pgvector if present, REAL[] otherwise)
@@ -92,20 +97,25 @@ are PostgreSQL and OpenResty (and OpenResty is optional for CLI / MCP use).
 
 | Module                              | Role                                            |
 |-------------------------------------|-------------------------------------------------|
-| `lapis_memory.init`                 | Public entry point. `setup()`, re-exports, `start_background_jobs()`. |
-| `lapis_memory.store`                | All SQL. Write / get / search / recent / update / delete / dedup / summary replacement. |
-| `lapis_memory.embed`                | Embedder dispatcher. Picks in-process embedder or HTTP adapter. |
-| `lapis_memory.embedders.hash`       | Pure-Lua feature-hashing embedder. Zero deps.   |
-| `lapis_memory.adapters.*`           | HTTP embedder adapters (Ollama, OpenAI, Voyage, Cohere, generic). |
-| `lapis_memory.routes`               | Lapis route factory. 7 endpoints under one prefix. |
-| `lapis_memory.web`                  | Server-rendered admin browser. Pure-Lua HTML, double-submit-cookie CSRF. |
-| `lapis_memory.summarizer`           | Selection + adapter dispatch + transactional replacement. |
-| `lapis_memory.summarizers.*`        | LLM adapters for summarisation (`noop`, `ollama`, `openai`). |
-| `lapis_memory.schema.sql`           | Fresh-install schema for the **pgvector** backend. |
-| `lapis_memory.schema_bruteforce.sql`| Fresh-install schema for the **brute-force** backend (no extension). |
-| `lapis_memory.migrations/`          | Idempotent ALTERs for live DBs.                 |
+| `luamemo.init`                 | Public entry point. `setup()`, re-exports, `start_background_jobs()`. |
+| `luamemo.store`                | All SQL. Write / get / search / recent / update / delete / dedup / summary replacement. |
+| `luamemo.db`                   | Portable PostgreSQL adapter. Delegates to `lapis.db` under OpenResty; falls back to `pgmoon` in plain Lua 5.1+. All other library modules go through this layer — no direct `lapis.db` dependency. |
+| `luamemo.http`                 | Portable HTTP client. Uses `resty.http` (non-blocking cosockets) under OpenResty; falls back to `socket.http` / `ssl.https` (LuaSocket) in plain Lua 5.1+. Used by embedder adapters, rerankers, and `execute_with_secret`. |
+| `luamemo.embed`                | Embedder dispatcher. Picks in-process embedder or HTTP adapter. |
+| `luamemo.embedders.hash`       | Pure-Lua feature-hashing embedder. Zero deps.   |
+| `luamemo.adapters.*`           | HTTP embedder adapters (Ollama, OpenAI, Voyage, Cohere, generic). |
+| `luamemo.routes`               | Lapis route factory. 7 endpoints under one prefix. |
+| `luamemo.web`                  | Server-rendered admin browser. Pure-Lua HTML, double-submit-cookie CSRF. |
+| `luamemo.secrets`              | AES-256-CBC encrypted secret storage + `execute_with_secret`. Requires `master_key_*` config. |
+| `luamemo.kg`                   | Knowledge-graph fact store (`lm_kg_facts` table). |
+| `luamemo.summarizer`           | Selection + adapter dispatch + transactional replacement. |
+| `luamemo.summarizers.*`        | LLM adapters for summarisation (`noop`, `ollama`, `openai`). |
+| `luamemo.rerankers.*`          | Reranker adapters (`noop`, `ollama`, `openai`, `cross_encoder`). |
+| `luamemo.schema.sql`           | Fresh-install schema for the **pgvector** backend. |
+| `luamemo.schema_bruteforce.sql`| Fresh-install schema for the **brute-force** backend (no extension). |
+| `luamemo.migrations/`          | Idempotent ALTERs for live DBs.                 |
 | `cli/memo`                          | Bash CLI; calls the HTTP API with bearer token. |
-| `mcp/server.lua`                    | Pure-Lua stdio MCP server. 6 tools.             |
+| `mcp/server.lua`                    | Pure-Lua stdio MCP server. 11 tools.            |
 
 ### Request flow (write)
 
@@ -152,14 +162,14 @@ See “Backends & cost” below for the trade-off.
 
 **Default (zero infra):** any PostgreSQL 15+. No extension required.
 ```bash
-psql -U postgres -d mydb -f lapis_memory/schema_bruteforce.sql
+psql -U postgres -d mydb -f luamemo/schema_bruteforce.sql
 ```
 
 **Faster path (when you can install extensions):** the official
 `pgvector/pgvector:pg15` image, the `postgresql-15-pgvector` Debian/Ubuntu
 package, or a managed Postgres that allows `CREATE EXTENSION vector`.
 ```bash
-psql -U postgres -d mydb -f lapis_memory/schema.sql
+psql -U postgres -d mydb -f luamemo/schema.sql
 ```
 The library auto-detects which is in use — no config change.
 
@@ -186,7 +196,7 @@ See [examples/local_hash_embedder.md](examples/local_hash_embedder.md).
 
 ```lua
 local lapis  = require("lapis")
-local memory = require("lapis_memory")
+local memory = require("luamemo")
 local app    = lapis.Application()
 
 memory.setup({
@@ -204,6 +214,41 @@ memory.routes.register(app, { prefix = "/api/memory" })
 return app
 ```
 
+### 3b. Wire into a plain Lua 5.1+ app (outside OpenResty)
+
+`luamemo` runs in any Lua 5.1+ runtime — no OpenResty or Lapis required.
+The `luamemo.db` module detects the absence of `ngx` and falls back to
+a direct pgmoon connection. Configure PostgreSQL via `pg_*` keys or the
+standard `PG*` environment variables.
+
+```lua
+local memory = require("luamemo")
+
+memory.setup({
+    embedder_local = "hash",
+    embed_dim      = 384,
+    default_scope  = "repo:my-app",
+    auth_fn        = function() return true end,   -- no HTTP auth context outside Lapis
+
+    -- PostgreSQL connection — ignored under OpenResty (lapis.db manages it)
+    pg_host     = "127.0.0.1",
+    pg_port     = 5432,
+    pg_database = "mydb",
+    pg_user     = "myuser",
+    pg_password = "mypass",
+})
+
+-- Now use memory.write / memory.search / memory.recent directly
+memory.write{
+    scope = "repo:my-app",
+    title = "First note from plain Lua",
+    body  = "Works without a web server.",
+}
+```
+
+Alternatively, set the standard `PGHOST` / `PGDATABASE` / `PGUSER` /
+`PGPASSWORD` environment variables and omit the `pg_*` keys entirely.
+
 That's it. You now have:
 
 | Method | Path                          | Purpose                       |
@@ -219,7 +264,7 @@ That's it. You now have:
 
 ## Secrets Management
 
-`lapis-memory` can store encrypted API keys and tokens server-side and
+`luamemo` can store encrypted API keys and tokens server-side and
 inject them into HTTP requests without ever exposing the raw value to the
 LLM. This is the `lm_secrets` module, built on the `execute_with_secret`
 design principle.
@@ -262,7 +307,7 @@ to persist across restarts. The file is created automatically on the first
 **3. Configure `secrets_file` and the key source**
 
 Both `secrets_file` and a master key must be set for the feature to activate.
-If either is absent, secrets are **disabled** — all other lapis-memory features
+If either is absent, secrets are **disabled** — all other luamemo features
 continue to work normally.
 
 ```lua
@@ -319,7 +364,7 @@ does not include any `lm_secrets` DDL.
 ### Usage (Lua API)
 
 ```lua
-local memory = require("lapis_memory")
+local memory = require("luamemo")
 
 -- Store a secret (value is encrypted before writing to the JSON file)
 memory.secrets.store("openai-key", "sk-...", "OpenAI API key")
@@ -346,7 +391,7 @@ if memory.secrets.enabled() then ... end
 > **These are not terminal commands.** You type them in the chat window of your
 > AI assistant (Claude Desktop, Copilot Agent Mode, Cursor, Continue.dev, etc.)
 > while the MCP server is connected. The assistant recognises them as tool calls
-> and executes them against the running lapis-memory HTTP API.
+> and executes them against the running luamemo HTTP API.
 
 Three tools are safe to call from the chat window (no raw values involved):
 
@@ -474,7 +519,7 @@ Permanently deletes from the secrets file. Cannot be undone.
 ## Programmatic API
 
 ```lua
-local memory = require("lapis_memory")
+local memory = require("luamemo")
 
 memory.write{
     scope = "repo:my-app",
@@ -554,7 +599,7 @@ and returns:
 is a valid embedder. The vector length **must** match `embed_dim` from
 `setup()`.
 
-Adapters in `lapis_memory.adapters.*` translate this contract to
+Adapters in `luamemo.adapters.*` translate this contract to
 provider-specific formats:
 
 | Adapter      | Status        | Notes                                           |
@@ -576,8 +621,8 @@ Two schema files ship in the repo:
 
 | File                         | Backend     | Postgres extension required |
 |------------------------------|-------------|-----------------------------|
-| `lapis_memory/schema.sql`              | `pgvector`  | `vector` (HNSW for fast ANN) |
-| `lapis_memory/schema_bruteforce.sql`   | `bruteforce`| none                        |
+| `luamemo/schema.sql`              | `pgvector`  | `vector` (HNSW for fast ANN) |
+| `luamemo/schema_bruteforce.sql`   | `bruteforce`| none                        |
 
 Both define the same columns. The only differences are the type of
 `embedding` (`vector(N)` vs `REAL[]`) and whether an HNSW index is created.
@@ -590,7 +635,7 @@ different model.
 
 ## Backends & cost
 
-`lapis-memory` ships two backends. Both are first-class — the HTTP API,
+`luamemo` ships two backends. Both are first-class — the HTTP API,
 Web UI, CLI, and MCP server work identically against either.
 
 ### `bruteforce` (default, zero infra)
@@ -600,7 +645,7 @@ Web UI, CLI, and MCP server work identically against either.
   `bruteforce_candidate_limit` (default **1000**) candidate rows; Lua
   computes cosine and ranks them.
 - **Pros**
-  - `luarocks install lapis-memory` + any Postgres 15 = working install.
+  - `luarocks install luamemo` + any Postgres 15 = working install.
   - Same code on dev, CI, and prod.
   - No extension privileges needed; works on managed Postgres that
     forbids `CREATE EXTENSION`.
@@ -721,18 +766,42 @@ end-to-end recipe.
 
 A pure-Lua eval harness against
 [LongMemEval](https://huggingface.co/datasets/xiaoyangwu/longmemeval)
-lives in [`eval/`](eval/README.md). Run:
+lives in [`eval/`](eval/README.md). Results are on the `_s` (short-session)
+corpus, bruteforce backend, default hybrid weights (`vector=0.7, fts=0.3`).
 
+### LongMemEval `_s` — retrieval recall (latest numbers)
+
+| Embedder | n | R@1 | R@5 | R@10 | R@20 | MRR |
+|---|---|---|---|---|---|---|
+| hash (pure Lua, in-process) | 200 | ~40% | ~60% | ~70% | ~80% | ~0.50 |
+| nomic-embed-text 768d (Ollama) | 200 | 62.0% | 81.5% | 87.5% | 92.5% | 0.706 |
+| **bge-m3 1024d (TEI sidecar)** | **500** | **85.2%** | **96.0%** | **97.8%** | **99.4%** | **0.900** |
+
+[MemPalace](https://arxiv.org/abs/2410.07983) reports **96.6% R@5** on
+LongMemEval-S using a custom LLM-summarisation pipeline. The bge-m3 result
+above (96.0%) is **0.6 pp behind MemPalace** — with no LLM summarisation,
+no training data, and single-stage retrieval.
+
+The **bge-m3** result requires a GPU sidecar (see [eval/sidecars/tei.md](eval/sidecars/tei.md))
+but no other code or schema changes — just swap the embedder in `setup()`.
+See [eval/results/longmemeval.md](eval/results/longmemeval.md) for full
+phase-by-phase details, reproduce commands, and the weight-sweep analysis.
+
+Quick start:
 ```bash
-scripts/download_eval.sh eval/data
-resty -I . eval/run.lua --dataset eval/data/longmemeval_oracle.json \
-    --out eval/results/oracle_hash.json --embedder hash
-lua eval/score.lua eval/results/oracle_hash.json
-```
+# zero-deps benchmark (hash embedder, no GPU needed)
+PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
+  lua5.1 eval/longmemeval_run.lua --embedder hash \
+    --corpus eval/data/longmemeval_s.json --n 50 \
+    --out eval/results/smoke.json
 
-Reports R@1 / R@5 / R@10 globally and per `question_type`. Results are
-embedder-dependent; see `eval/README.md` for the comparison recipe across
-`hash`, `ollama`, and `openai` embedders.
+# GPU benchmark (requires TEI sidecars — see eval/sidecars/)
+PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
+  TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
+  lua5.1 eval/longmemeval_run.lua --embedder tei \
+    --corpus eval/data/longmemeval_s.json \
+    --out eval/results/my_run.json
+```
 
 ---
 
@@ -745,7 +814,7 @@ AI coding agents lose context constantly:
 - A new device or new session = total amnesia.
 - Cloud-only memory tools don't survive offline work or org policies.
 
-`lapis-memory` makes the chat transcript **disposable**. The agent writes
+`luamemo` makes the chat transcript **disposable**. The agent writes
 durable summaries / decisions / facts to your own Postgres, then searches
 them on demand. Survives crashes, devices, and editor bugs.
 

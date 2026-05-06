@@ -1,7 +1,7 @@
 # Auto-Capture Hooks
 
-> **TL;DR:** wire chat agents into `lapis-memory` in two lines per turn
-> with `lapis_memory.hooks`. Captures user messages, assistant
+> **TL;DR:** wire chat agents into `luamemo` in two lines per turn
+> with `luamemo.hooks`. Captures user messages, assistant
 > messages, tool calls, and durable decisions into the right scope with
 > sensible dedup defaults.
 
@@ -43,8 +43,8 @@ All four return the same `(row, err)` tuple as `store.write`.
 ## Quick start
 
 ```lua
-local memory = require("lapis_memory")
-local hooks  = require("lapis_memory.hooks")   -- or memory.hooks
+local memory = require("luamemo")
+local hooks  = require("luamemo.hooks")   -- or memory.hooks
 
 memory.setup({ db_table = "lapis_memory", embedder_local = "ollama" })
 

@@ -1,6 +1,6 @@
 -- Phase 16.6 — LoCoMo bench runner.
 --
--- End-to-end retrieval-side run of LoCoMo through lapis-memory. Unlike
+-- End-to-end retrieval-side run of LoCoMo through luamemo. Unlike
 -- LongMemEval (one question per row) LoCoMo has multiple QA pairs that
 -- share the same conversation haystack. We exploit that: one ingest per
 -- row, then loop over the row's `qa` list issuing N searches against
@@ -69,19 +69,11 @@ if not fh then
 end
 fh:close()
 
--- --- pgmoon shim ---------------------------------------------------------
-local db_shim = require("_smoke_lapis_db")
-db_shim._connect({
-    host     = os.getenv("PGHOST") or "127.0.0.1",
-    port     = tonumber(os.getenv("PGPORT") or "5432"),
-    database = os.getenv("PGDATABASE") or "lm_bruteforce_test",
-    user     = os.getenv("PGUSER") or "postgres",
-    password = os.getenv("PGPASSWORD") or "postgres",
-})
-package.loaded["lapis.db"] = db_shim
+-- luamemo.db creates a pgmoon connection automatically from
+-- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
 
-local memory  = require("lapis_memory")
-local db      = require("lapis.db")
+local memory  = require("luamemo")
+local db      = require("luamemo.db")
 local locomo  = require("locomo")
 
 -- --- embedder config (mirrors longmemeval_run.lua) -----------------------

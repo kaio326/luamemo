@@ -1,28 +1,22 @@
--- Phase 16.5 smoke test: knowledge-graph layer (lapis_memory.kg).
+-- Phase 16.5 smoke test: knowledge-graph layer (luamemo.kg).
 -- Runs against the lm_bruteforce_test Postgres used by smoke_bruteforce.
 --
 -- Prereqs:
 --   docker exec -i <postgres-container> psql -U postgres -c \
 --     'DROP DATABASE IF EXISTS lm_bruteforce_test; CREATE DATABASE lm_bruteforce_test;'
 --   docker exec -i <postgres-container> psql -U postgres -d lm_bruteforce_test \
---     < lapis_memory/schema_bruteforce.sql
+--     < luamemo/schema_bruteforce.sql
 --   docker exec -i <postgres-container> psql -U postgres -d lm_bruteforce_test \
---     < lapis_memory/migrations/003_kg.sql
+--     < luamemo/migrations/003_kg.sql
 --   PGHOST=127.0.0.1 PGPORT=5432 lua5.1 eval/smoke_kg.lua
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
-local db_shim = require("_smoke_lapis_db")
-db_shim._connect({
-    host     = os.getenv("PGHOST")     or "127.0.0.1",
-    port     = tonumber(os.getenv("PGPORT") or "5432"),
-    database = os.getenv("PGDATABASE") or "lm_bruteforce_test",
-    user     = os.getenv("PGUSER")     or "postgres",
-    password = os.getenv("PGPASSWORD") or "postgres",
-})
-package.loaded["lapis.db"] = db_shim
+-- luamemo.db creates a pgmoon connection automatically from
+-- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
 
-local memory = require("lapis_memory")
+local db     = require("luamemo.db")
+local memory = require("luamemo")
 memory.setup({
     db_table       = "lapis_memory",
     embedder_local = "hash",
@@ -36,7 +30,7 @@ local kg = memory.kg
 assert(kg, "memory.kg should be exported")
 
 -- Clean slate. Assumes migration 003_kg.sql has been applied (see header).
-db_shim.query("TRUNCATE lm_kg_facts RESTART IDENTITY")
+db.query("TRUNCATE lm_kg_facts RESTART IDENTITY")
 
 local function header(s) print("\n=== " .. s .. " ===") end
 
@@ -107,7 +101,7 @@ print("  scopes do not leak OK")
 -- ---------------------------------------------------------------------------
 header("point-in-time query")
 -- Wipe and replay with explicit timestamps.
-db_shim.query("TRUNCATE lm_kg_facts RESTART IDENTITY")
+db.query("TRUNCATE lm_kg_facts RESTART IDENTITY")
 local t1 = "2025-01-01T00:00:00Z"
 local t2 = "2025-06-01T00:00:00Z"
 assert(kg.assert_fact({ scope = "user:42", subject = "user:42",
@@ -135,7 +129,7 @@ print("  at=2025-08-01 -> light OK")
 -- Test 5: invalidate without supersede
 -- ---------------------------------------------------------------------------
 header("explicit invalidate")
-db_shim.query("TRUNCATE lm_kg_facts RESTART IDENTITY")
+db.query("TRUNCATE lm_kg_facts RESTART IDENTITY")
 assert(kg.assert_fact({ scope = "team:eng", subject = "csp",
                         predicate = "inline_styles_allowed", object = "true" }))
 local n = assert(kg.invalidate({ scope = "team:eng", subject = "csp",

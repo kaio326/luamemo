@@ -1,25 +1,18 @@
 -- Phase 7.5 smoke test: brute-force backend against plain Postgres 15
--- (no pgvector). Run from lapis-memory/ dir:
+-- (no pgvector). Run from luamemo/ dir:
 --   docker exec -i <postgres-container> psql -U postgres -c \
 --     'DROP DATABASE IF EXISTS lm_bruteforce_test; CREATE DATABASE lm_bruteforce_test;'
 --   docker exec -i <postgres-container> psql -U postgres -d lm_bruteforce_test \
---     < lapis_memory/schema_bruteforce.sql
+--     < luamemo/schema_bruteforce.sql
 --   PGHOST=127.0.0.1 PGPORT=5432 lua5.1 eval/smoke_bruteforce.lua
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
--- Wire the shim BEFORE requiring any lapis_memory module.
-local db_shim = require("_smoke_lapis_db")
-db_shim._connect({
-    host     = os.getenv("PGHOST") or "127.0.0.1",
-    port     = tonumber(os.getenv("PGPORT") or "5432"),
-    database = os.getenv("PGDATABASE") or "lm_bruteforce_test",
-    user     = os.getenv("PGUSER") or "postgres",
-    password = os.getenv("PGPASSWORD") or "postgres",
-})
-package.loaded["lapis.db"] = db_shim
+-- luamemo.db creates a pgmoon connection automatically from
+-- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
 
-local memory = require("lapis_memory")
+local db     = require("luamemo.db")
+local memory = require("luamemo")
 
 memory.setup({
     db_table       = "lapis_memory",
@@ -37,7 +30,7 @@ print("resolved backend =", memory.store.backend())
 assert(memory.store.backend() == "bruteforce", "expected bruteforce")
 
 -- Clean slate.
-db_shim.query("TRUNCATE lapis_memory")
+db.query("TRUNCATE lapis_memory")
 
 header("write 5 unrelated memories")
 local seeds = {
@@ -108,4 +101,3 @@ print("  total recent rows =", #recents)
 assert(#recents >= 6, "expected at least 6 rows total (5 seeds + 1 append)")
 
 header("ALL PASS")
-db_shim._disconnect()

@@ -18,7 +18,7 @@ character trigrams. This captures **lexical** similarity (shared words,
 shared sub-strings) but **not semantic** similarity — it cannot tell that
 "car" and "automobile" are related.
 
-In practice this matters less than it sounds, because `lapis-memory`
+In practice this matters less than it sounds, because `luamemo`
 already runs a hybrid query: vector cosine **plus** Postgres FTS. The
 hash embedder mostly reinforces what FTS already finds, while still
 benefiting from pgvector's HNSW index for fast top-K filtering.
@@ -38,7 +38,7 @@ through your app, or call `memory.update(id, {body = row.body})` for each row.
 ## Setup
 
 ```lua
-local memory = require("lapis_memory")
+local memory = require("luamemo")
 memory.setup({
     embedder_local = "hash",     -- enables in-process embedder
     embed_dim      = 384,        -- must match your schema's vector(N)
@@ -54,7 +54,7 @@ container in `docker-compose.yml`, no API keys.
 ## Self-test
 
 ```lua
-local hash = require("lapis_memory.embedders.hash")
+local hash = require("luamemo.embedders.hash")
 local ok, err = hash.selftest({ embed_dim = 384 })
 assert(ok, err)
 ```

@@ -1,6 +1,6 @@
 # Importance & decay scoring
 
-`lapis-memory` weights search results by a per-row `importance` and an
+`luamemo` weights search results by a per-row `importance` and an
 optional `decay_rate`. This makes recent, important memories outrank stale
 or low-value ones automatically — without any client-side filtering.
 

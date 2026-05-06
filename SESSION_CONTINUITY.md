@@ -5,7 +5,7 @@
 > because the new session has a different uuid. Without intervention,
 > every new session starts cold.
 
-`lapis-memory` solves this with one helper — `memory.promote()` — that
+`luamemo` solves this with one helper — `memory.promote()` — that
 folds a hot session scope into a long-term scope at session end. The
 next session searches the long-term scope and finds the carried-over
 context.
@@ -35,7 +35,7 @@ explicit `/end` command, websocket close, etc.), call `promote()`:
 ### From Lua
 
 ```lua
-local memory = require("lapis_memory")
+local memory = require("luamemo")
 
 local result = memory.promote({
     from_scope    = "session:" .. session_uuid,

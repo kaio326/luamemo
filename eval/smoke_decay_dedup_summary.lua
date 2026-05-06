@@ -1,18 +1,12 @@
 -- Phase 8.3 smoke: decay + dedup + summarizer against bruteforce backend.
--- Run from lapis-memory/ dir after smoke_bruteforce.lua's setup recipe.
+-- Run from luamemo/ dir after smoke_bruteforce.lua's setup recipe.
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
-local db_shim = require("_smoke_lapis_db")
-db_shim._connect({
-    host     = os.getenv("PGHOST") or "127.0.0.1",
-    port     = tonumber(os.getenv("PGPORT") or "5432"),
-    database = os.getenv("PGDATABASE") or "lm_bruteforce_test",
-    user     = os.getenv("PGUSER") or "postgres",
-    password = os.getenv("PGPASSWORD") or "postgres",
-})
-package.loaded["lapis.db"] = db_shim
+-- luamemo.db creates a pgmoon connection automatically from
+-- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
 
-local memory = require("lapis_memory")
+local db     = require("luamemo.db")
+local memory = require("luamemo")
 
 memory.setup({
     db_table       = "lapis_memory",
@@ -30,7 +24,7 @@ memory.setup({
 
 local function header(s) print("\n=== " .. s .. " ===") end
 
-db_shim.query("TRUNCATE lapis_memory")
+db.query("TRUNCATE lapis_memory")
 
 ----------------------------------------------------------------------
 -- 1. DECAY
@@ -65,9 +59,9 @@ end
 
 -- Backdate the rotting row by 30 days. The touch trigger on UPDATE would
 -- otherwise reset updated_at = now(), so disable it briefly.
-db_shim.query("ALTER TABLE lapis_memory DISABLE TRIGGER lapis_memory_touch_updated_at_trg")
-db_shim.query("UPDATE lapis_memory SET updated_at = now() - interval '30 days' WHERE id = " .. rotting.id)
-db_shim.query("ALTER TABLE lapis_memory ENABLE TRIGGER lapis_memory_touch_updated_at_trg")
+db.query("ALTER TABLE lapis_memory DISABLE TRIGGER lapis_memory_touch_updated_at_trg")
+db.query("UPDATE lapis_memory SET updated_at = now() - interval '30 days' WHERE id = " .. rotting.id)
+db.query("ALTER TABLE lapis_memory ENABLE TRIGGER lapis_memory_touch_updated_at_trg")
 
 local post = memory.search({ query = "deploy procedure runbook", scope = "h83-decay", limit = 5 })
 print("  post-backdate (30 days):")
@@ -129,7 +123,7 @@ local d3, _, a3 = memory.write({
 })
 assert(d3 and a3 == "inserted" and d3.id ~= d1.id, "append should create new row")
 
-local n = db_shim.query("SELECT count(*) AS c FROM lapis_memory WHERE scope = 'h83-dedup'")
+local n = db.query("SELECT count(*) AS c FROM lapis_memory WHERE scope = 'h83-dedup'")
 assert(tonumber(n[1].c) == 2, "expected 2 rows in h83-dedup; got " .. tostring(n[1].c))
 print("  dedup OK (1 merged + 1 appended)")
 
@@ -152,11 +146,11 @@ end
 
 -- Backdate them all so they're outside the retention window. Disable the
 -- touch trigger so our manual updated_at sticks.
-db_shim.query("ALTER TABLE lapis_memory DISABLE TRIGGER lapis_memory_touch_updated_at_trg")
-db_shim.query("UPDATE lapis_memory SET updated_at = now() - interval '30 days' WHERE scope = 'h83-sum'")
-db_shim.query("ALTER TABLE lapis_memory ENABLE TRIGGER lapis_memory_touch_updated_at_trg")
+db.query("ALTER TABLE lapis_memory DISABLE TRIGGER lapis_memory_touch_updated_at_trg")
+db.query("UPDATE lapis_memory SET updated_at = now() - interval '30 days' WHERE scope = 'h83-sum'")
+db.query("ALTER TABLE lapis_memory ENABLE TRIGGER lapis_memory_touch_updated_at_trg")
 
-local pre_count = db_shim.query("SELECT count(*) AS c FROM lapis_memory WHERE scope = 'h83-sum'")
+local pre_count = db.query("SELECT count(*) AS c FROM lapis_memory WHERE scope = 'h83-sum'")
 print("  rows before summarize: " .. pre_count[1].c)
 assert(tonumber(pre_count[1].c) == 4)
 
@@ -176,7 +170,7 @@ assert(dry.summarised == 1, "expected 1 dry-run summary")
 assert(#dry.replaced_ids == 4, "expected 4 ids slated for replacement")
 
 -- Confirm dry-run did not mutate.
-local mid_count = db_shim.query("SELECT count(*) AS c FROM lapis_memory WHERE scope = 'h83-sum'")
+local mid_count = db.query("SELECT count(*) AS c FROM lapis_memory WHERE scope = 'h83-sum'")
 assert(tonumber(mid_count[1].c) == 4, "dry-run should not mutate; got " .. tostring(mid_count[1].c))
 
 -- Real run.
@@ -195,7 +189,7 @@ assert(#real.new_ids == 1, "expected 1 new summary row id")
 assert(#real.errors == 0, "expected no errors")
 
 -- Verify single 'summary' row remains; original 4 rows are gone.
-local rows = db_shim.query("SELECT id, kind, title, metadata FROM lapis_memory WHERE scope = 'h83-sum' ORDER BY id")
+local rows = db.query("SELECT id, kind, title, metadata FROM lapis_memory WHERE scope = 'h83-sum' ORDER BY id")
 print("  rows after summarize:")
 for _, r in ipairs(rows) do
     print(string.format("    id=%d kind=%s title=%q", r.id, r.kind, r.title))
@@ -216,4 +210,3 @@ assert(meta.summarized_ids and #meta.summarized_ids == 4,
 print("  summarizer OK (4 rows -> 1 summary, source_ids tracked)")
 
 header("PHASE 8.3 ALL PASS")
-db_shim._disconnect()

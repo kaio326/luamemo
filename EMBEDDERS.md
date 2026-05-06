@@ -50,10 +50,10 @@ docker run -d --name ollama -p 11434:11434 -v ollama:/root/.ollama ollama/ollama
 docker exec -it ollama ollama pull nomic-embed-text
 ```
 
-### 2. Configure `lapis-memory`
+### 2. Configure `luamemo`
 
 ```lua
-require("lapis_memory").setup({
+require("luamemo").setup({
     db_table         = "lapis_memory",
     embedder_url     = "http://localhost:11434/api/embeddings",
     embedder_adapter = "ollama",
@@ -105,10 +105,10 @@ shipped at
 and the operator notes are at
 [`eval/sidecars/tei.md`](eval/sidecars/tei.md).
 
-#### 2. Configure `lapis-memory`
+#### 2. Configure `luamemo`
 
 ```lua
-require("lapis_memory").setup({
+require("luamemo").setup({
     db_table         = "lapis_memory",
     embedder_url     = "http://localhost:8081/embed",
     embedder_adapter = "tei",
@@ -137,7 +137,7 @@ Best when you don't want to operate Ollama. ~$0.02 per 1M input
 tokens, well-understood quality.
 
 ```lua
-require("lapis_memory").setup({
+require("luamemo").setup({
     db_table         = "lapis_memory",
     embedder_url     = "https://api.openai.com/v1/embeddings",
     embedder_adapter = "openai",
@@ -161,12 +161,12 @@ the path below documents its exact `setup()` shape.
 
 | Adapter   | Source                                         | Typical model + dim                         |
 |-----------|------------------------------------------------|---------------------------------------------|
-| TEI       | [`lapis_memory/adapters/tei.lua`](lapis_memory/adapters/tei.lua) | `BAAI/bge-m3` / 1024 (sidecar, see above)   |
-| Voyage    | [`lapis_memory/adapters/voyage.lua`](lapis_memory/adapters/voyage.lua)   | `voyage-3` / 1024                           |
-| Cohere    | [`lapis_memory/adapters/cohere.lua`](lapis_memory/adapters/cohere.lua)   | `embed-english-v3.0` / 1024                 |
-| Anthropic | [`lapis_memory/adapters/anthropic.lua`](lapis_memory/adapters/anthropic.lua) | placeholder (no first-party embedding API as of writing) |
-| DeepSeek  | [`lapis_memory/adapters/deepseek.lua`](lapis_memory/adapters/deepseek.lua) | placeholder                                 |
-| generic   | [`lapis_memory/adapters/generic.lua`](lapis_memory/adapters/generic.lua) | any OpenAI-shaped endpoint                   |
+| TEI       | [`luamemo/adapters/tei.lua`](luamemo/adapters/tei.lua) | `BAAI/bge-m3` / 1024 (sidecar, see above)   |
+| Voyage    | [`luamemo/adapters/voyage.lua`](luamemo/adapters/voyage.lua)   | `voyage-3` / 1024                           |
+| Cohere    | [`luamemo/adapters/cohere.lua`](luamemo/adapters/cohere.lua)   | `embed-english-v3.0` / 1024                 |
+| Anthropic | [`luamemo/adapters/anthropic.lua`](luamemo/adapters/anthropic.lua) | placeholder (no first-party embedding API as of writing) |
+| DeepSeek  | [`luamemo/adapters/deepseek.lua`](luamemo/adapters/deepseek.lua) | placeholder                                 |
+| generic   | [`luamemo/adapters/generic.lua`](luamemo/adapters/generic.lua) | any OpenAI-shaped endpoint                   |
 
 If your provider is not listed, copy `generic.lua` and override the
 two functions (`build_request`, `parse_response`).
@@ -244,7 +244,7 @@ If the data is regenerable (test data, scratch scope, etc.):
 ```sql
 -- pgvector backend: column type encodes dim, must be re-created
 DROP TABLE lapis_memory;
--- then re-run lapis_memory/schema_pgvector.sql with the new VECTOR(N)
+-- then re-run luamemo/schema_pgvector.sql with the new VECTOR(N)
 ```
 
 For the brute-force backend (`REAL[]`) the column has no fixed dim so

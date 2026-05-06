@@ -5,22 +5,16 @@
 --   3. Per-row validation error: one bad row does not abort the batch
 --   4. Optional dedup ("skip" / "update") gates correctly
 --
--- Run from lapis-memory/ dir against the same brute-force DB used by the
+-- Run from luamemo/ dir against the same brute-force DB used by the
 -- other smokes:
 --   PGHOST=127.0.0.1 PGPORT=5432 lua5.1 eval/smoke_write_many.lua
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
-local db_shim = require("_smoke_lapis_db")
-db_shim._connect({
-    host     = os.getenv("PGHOST") or "127.0.0.1",
-    port     = tonumber(os.getenv("PGPORT") or "5432"),
-    database = os.getenv("PGDATABASE") or "lm_bruteforce_test",
-    user     = os.getenv("PGUSER") or "postgres",
-    password = os.getenv("PGPASSWORD") or "postgres",
-})
-package.loaded["lapis.db"] = db_shim
+-- luamemo.db creates a pgmoon connection automatically from
+-- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
 
-local memory = require("lapis_memory")
+local db     = require("luamemo.db")
+local memory = require("luamemo")
 
 memory.setup({
     db_table        = "lapis_memory",
@@ -37,7 +31,7 @@ local function header(s) print("\n=== " .. s .. " ===") end
 
 assert(memory.store.backend() == "bruteforce", "expected bruteforce backend")
 
-db_shim.query("DELETE FROM lapis_memory WHERE scope LIKE 'smoke_wm%'")
+db.query("DELETE FROM lapis_memory WHERE scope LIKE 'smoke_wm%'")
 
 -- 1. Happy path -----------------------------------------------------------
 header("happy path: 5 rows in single chunk")
@@ -62,7 +56,7 @@ print("  OK (5/5 inserted, order preserved)")
 
 -- 2. Multi-chunk ----------------------------------------------------------
 header("multi-chunk: 12 rows with batch_size=5")
-db_shim.query("DELETE FROM lapis_memory WHERE scope = 'smoke_wm'")
+db.query("DELETE FROM lapis_memory WHERE scope = 'smoke_wm'")
 local big = {}
 for i = 1, 12 do
     big[i] = { scope = "smoke_wm", kind = "fact",
@@ -79,7 +73,7 @@ print("  OK (12/12 inserted across 3 chunks, order preserved)")
 
 -- 3. Mixed validation error -----------------------------------------------
 header("mixed: bad row in middle does not abort batch")
-db_shim.query("DELETE FROM lapis_memory WHERE scope = 'smoke_wm'")
+db.query("DELETE FROM lapis_memory WHERE scope = 'smoke_wm'")
 local mixed = {
     { scope = "smoke_wm", kind = "fact", title = "good 1", body = "alpha aaa" },
     { scope = "smoke_wm", kind = "fact", title = "",       body = "" },  -- bad
@@ -104,7 +98,7 @@ print("  OK (3 inserted, 3 errored)")
 
 -- 4. Optional dedup ("skip") ---------------------------------------------
 header("dedup_strategy=skip catches near-duplicates without aborting")
-db_shim.query("DELETE FROM lapis_memory WHERE scope = 'smoke_wm'")
+db.query("DELETE FROM lapis_memory WHERE scope = 'smoke_wm'")
 -- Seed an existing row.
 local seed = memory.write({ scope = "smoke_wm", kind = "fact",
     title = "Postgres backup strategy",

@@ -1,5 +1,5 @@
 """
-Minimal embedder sidecar for lapis-memory.
+Minimal embedder sidecar for luamemo.
 
 Implements the generic contract:
     POST /embed  { "text": "..." }  -> { "vector": [...] }

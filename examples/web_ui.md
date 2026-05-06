@@ -1,6 +1,6 @@
 # Web UI
 
-`lapis-memory` ships a self-contained, server-rendered web browser at
+`luamemo` ships a self-contained, server-rendered web browser at
 `/memory/ui` (configurable). It's the fastest way to inspect, search,
 edit, and delete stored memories without dropping into `psql`.
 
@@ -8,7 +8,7 @@ edit, and delete stored memories without dropping into `psql`.
 
 ```lua
 local lapis  = require("lapis")
-local memory = require("lapis_memory")
+local memory = require("luamemo")
 local app    = lapis.Application()
 
 memory.setup({ ... })                              -- as usual

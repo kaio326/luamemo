@@ -1,6 +1,6 @@
 # Brute-force backend (no pgvector)
 
-The brute-force backend lets you run `lapis-memory` against a stock PostgreSQL
+The brute-force backend lets you run `luamemo` against a stock PostgreSQL
 install — no extensions, no superuser, no `apt install postgresql-NN-pgvector`.
 This is the path to use when:
 
@@ -28,7 +28,7 @@ the Web UI, HTTP, CLI, and MCP surfaces don't care which backend ran.
 
 ```bash
 docker exec -i my-postgres \
-  psql -U postgres -d my_db < lapis_memory/schema_bruteforce.sql
+  psql -U postgres -d my_db < luamemo/schema_bruteforce.sql
 ```
 
 This is the same schema as `schema.sql` minus `CREATE EXTENSION vector` and
@@ -37,7 +37,7 @@ the HNSW index. The trigger, FTS column, and CHECK constraints are unchanged.
 ### 2. Configure the library
 
 ```lua
-local memory = require("lapis_memory")
+local memory = require("luamemo")
 
 memory.setup({
     db_table       = "lapis_memory",
@@ -56,7 +56,7 @@ override the probe.
 The choice is logged at startup:
 
 ```
-[info] lapis-memory: backend=bruteforce
+[info] luamemo: backend=bruteforce
 ```
 
 ### 3. Use the same API
@@ -89,7 +89,7 @@ The migration is non-destructive:
 
 ```bash
 psql -U postgres -d my_db -c "CREATE EXTENSION vector;"
-psql -U postgres -d my_db < lapis_memory/schema.sql
+psql -U postgres -d my_db < luamemo/schema.sql
 ```
 
 The `schema.sql` migration is idempotent — it adds the HNSW index and
@@ -105,7 +105,7 @@ against a throwaway database:
 docker exec -i <postgres-container> psql -U postgres -c \
   'DROP DATABASE IF EXISTS lm_bruteforce_test; CREATE DATABASE lm_bruteforce_test;'
 docker exec -i <postgres-container> psql -U postgres -d lm_bruteforce_test \
-  < lapis_memory/schema_bruteforce.sql
+  < luamemo/schema_bruteforce.sql
 PGHOST=127.0.0.1 PGUSER=postgres PGPASSWORD=postgres \
   PGDATABASE=lm_bruteforce_test lua5.1 eval/smoke_bruteforce.lua
 ```

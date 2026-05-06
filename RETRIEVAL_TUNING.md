@@ -1,4 +1,4 @@
-# Retrieval Tuning — How to Get the Most Out of `lapis-memory`
+# Retrieval Tuning — How to Get the Most Out of `luamemo`
 
 > **TL;DR:** the biggest cost lever in any memory-backed agent is `K`
 > (how many memory rows you stuff into the prompt). The work below is
@@ -156,7 +156,7 @@ care about, the next lever is a **reranker** — a second pass that
 takes the top-N candidates from hybrid search and re-scores them
 against the query using a smarter (and more expensive) model.
 
-Since v0.2 this is built into `lapis-memory`. Three adapters ship:
+Since v0.2 this is built into `luamemo`. Three adapters ship:
 
 | Adapter  | Cost / latency       | Notes                                    |
 |----------|----------------------|------------------------------------------|
@@ -238,7 +238,7 @@ lua5.1 eval/longmemeval_run.lua --embedder ollama \
 
 ### Cross-encoder adapter (`cross_encoder`) — measured negative result
 
-`lapis_memory/rerankers/cross_encoder.lua` exposes a TEI / Cohere / Jina
+`luamemo/rerankers/cross_encoder.lua` exposes a TEI / Cohere / Jina
 `POST /rerank` sidecar as a drop-in reranker. It was benched
 (2026-05-06) with `bge-m3` embeddings + `bge-reranker-v2-m3` reranker,
 n=200, `longmemeval_s`:

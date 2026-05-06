@@ -4,17 +4,11 @@
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
-local db_shim = require("_smoke_lapis_db")
-db_shim._connect({
-    host     = os.getenv("PGHOST") or "127.0.0.1",
-    port     = tonumber(os.getenv("PGPORT") or "5432"),
-    database = os.getenv("PGDATABASE") or "lm_bruteforce_test",
-    user     = os.getenv("PGUSER") or "postgres",
-    password = os.getenv("PGPASSWORD") or "postgres",
-})
-package.loaded["lapis.db"] = db_shim
+-- luamemo.db creates a pgmoon connection automatically from
+-- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
 
-local memory = require("lapis_memory")
+local db     = require("luamemo.db")
+local memory = require("luamemo")
 memory.setup({
     db_table       = "lapis_memory",
     embedder_local = "hash",
@@ -24,7 +18,7 @@ memory.setup({
     auth_fn        = function() return true end,
 })
 
-db_shim.query("DELETE FROM lapis_memory WHERE scope = 'tune_test'")
+db.query("DELETE FROM lapis_memory WHERE scope = 'tune_test'")
 
 local memos = {
     { "Docker compose deployment", "Run docker compose up -d to start the application stack on production." },
@@ -46,11 +40,11 @@ local memos = {
     { "Ontario surtax brackets", "Ontario applies 20% and 36% surtax on top of provincial tax over thresholds." },
     { "Hybrid search vector + FTS", "Combine pgvector cosine with tsvector ranking using configured weights." },
     { "Brute-force backend no pgvector", "REAL[] column with Lua cosine when extension absent, autodetect on setup." },
-    { "Web UI memory inspector", "lapis_memory.web mounts admin routes for browsing scopes and tags." },
+    { "Web UI memory inspector", "luamemo.web mounts admin routes for browsing scopes and tags." },
     { "Decay half-life days", "Score decays as exp(-ln2 * age_days / half_life), default half_life 30 days." },
     { "Dedup near-duplicate merge", "On write, search top-3 in scope; if cosine > 0.92 merge bodies and bump." },
     { "Summarizer rollup oldest", "Run summarizer cycle daily, rolls oldest N rows in scope into one summary." },
-    { "MCP server stdio JSONRPC", "lapis-memory MCP exposes write/search/get over JSONRPC stdio for agent tools." },
+    { "MCP server stdio JSONRPC", "luamemo MCP exposes write/search/get over JSONRPC stdio for agent tools." },
     { "Importance scoring 1 to 5", "Importance multiplies decayed score; user can override via metadata.importance." },
     { "ngx.shared scopes per worker", "shared dicts are shared across all OpenResty worker processes via mmap." },
     { "Lapis route module pattern", "Group routes per file under routes/ and require them from app.lua." },
@@ -70,5 +64,5 @@ for _, m in ipairs(memos) do
     if not row then error("seed insert failed: " .. tostring(err)) end
 end
 
-local n = db_shim.query("SELECT count(*) AS c FROM lapis_memory WHERE scope = 'tune_test'")
+local n = db.query("SELECT count(*) AS c FROM lapis_memory WHERE scope = 'tune_test'")
 print("seeded tune_test rows:", n[1].c)

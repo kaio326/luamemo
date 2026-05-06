@@ -1,6 +1,6 @@
 -- Minimal `resty.http` shim for plain `lua5.1` eval harnesses.
 -- Wraps LuaSocket (`socket.http`) and LuaSec (`ssl.https`) to expose just
--- enough of the lua-resty-http surface that `lapis_memory.embed.http_embed`
+-- enough of the lua-resty-http surface that `luamemo.embed.http_embed`
 -- needs:
 --
 --     local httpc = require("resty.http").new()

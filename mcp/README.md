@@ -1,19 +1,24 @@
-# lapis-memory MCP server
+# luamemo MCP server
 
 A pure-Lua [Model Context Protocol](https://modelcontextprotocol.io/) stdio
 server that bridges MCP clients (Claude Desktop, Cursor, Continue.dev,
-Copilot Agent Mode, …) to a running `lapis-memory` HTTP API.
+Copilot Agent Mode, …) to a running `luamemo` HTTP API.
 
-Once installed, your AI assistant can call six tools:
+Once installed, your AI assistant can call eleven tools:
 
 | Tool | Purpose |
 |---|---|
-| `memory_write`  | Store a memory (decision, fact, plan, snippet, …). Optional `importance` (0..10) and `decay_rate` (0..1/day) control search ranking. |
-| `memory_search` | Hybrid vector + full-text search, weighted by importance × time-decay. `ignore_decay=true` disables weighting (debug). |
-| `memory_recent` | List most recent memories in a scope |
-| `memory_get`    | Fetch a single memory by ID |
-| `memory_update` | Update title / body / tags / metadata / importance / decay_rate |
-| `memory_delete` | Permanently delete a memory |
+| `memory_write`   | Store a memory (decision, fact, plan, snippet, …). Optional `importance` (0..10) and `decay_rate` (0..1/day) control search ranking. |
+| `memory_search`  | Hybrid vector + full-text search, weighted by importance × time-decay. `ignore_decay=true` disables weighting (debug). |
+| `memory_recent`  | List most recent memories in a scope. |
+| `memory_get`     | Fetch a single memory by ID. |
+| `memory_update`  | Update title / body / tags / metadata / importance / decay_rate. |
+| `memory_delete`  | Permanently delete a memory. |
+| `memory_promote` | Roll a hot session scope into a long-term scope (session-continuity). |
+| `secret_list`    | List stored secrets — names and metadata only, **no values**. |
+| `secret_store`   | Encrypt and store an API key or token. **Use from terminal only** — never call this from the chat window. |
+| `secret_delete`  | Permanently delete a stored secret. |
+| `secret_execute` | Make an HTTP request with `{secret}` substituted server-side; only the response body is returned to the agent. |
 
 These survive chat-session crashes, IDE restarts, device switches, and the
 VS Code "Invalid string length" overflow on very long sessions.
@@ -25,22 +30,23 @@ VS Code "Invalid string length" overflow on very long sessions.
 - **Lua 5.1+** or **LuaJIT** (whichever is on your `$PATH` as `lua`)
 - **lua-cjson** (`luarocks install lua-cjson`)
 - **curl** — preinstalled on macOS, Linux, modern Windows
-- A reachable `lapis-memory` HTTP API (see the project root README)
+- A reachable `luamemo` HTTP API (see the project root README)
 
-> ### Lua-First note
-> The server is 100% Lua except for the HTTP transport, which shells out to
-> `curl`. There is currently no ubiquitous, dependency-free, pure-Lua HTTPS
-> client suitable for a self-contained CLI. When `lua-http-mini` (or
-> equivalent) is built, `http_request()` in `server.lua` can be swapped to
-> a native client and `curl` will no longer be required.
+> ### HTTP transport note
+> The MCP server shells out to `curl` for its HTTP calls to the
+> `luamemo` API. `curl` is preinstalled on macOS, Linux, and modern
+> Windows. The library itself uses `luamemo.http` (LuaSocket-backed in
+> plain Lua) for embedder/reranker calls, but the MCP server keeps the
+> separate `curl` path to avoid requiring `luasocket` as a hard dependency
+> for users who only want the MCP server.
 
 ---
 
 ## Install
 
 ```bash
-git clone https://github.com/yourorg/lapis-memory.git ~/lapis-memory
-chmod +x ~/lapis-memory/mcp/server.lua
+git clone https://github.com/kaio326/lapis-memory.git ~/luamemo
+chmod +x ~/luamemo/mcp/server.lua
 luarocks install lua-cjson    # if not already installed
 ```
 
@@ -48,7 +54,7 @@ Verify:
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  | MEMO_URL=http://localhost:8080/api/memory lua ~/lapis-memory/mcp/server.lua
+  | MEMO_URL=http://localhost:8080/api/memory lua ~/luamemo/mcp/server.lua
 ```
 
 You should get a one-line JSON response containing `serverInfo` and
@@ -69,9 +75,9 @@ Edit `claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "lapis-memory": {
+    "luamemo": {
       "command": "lua",
-      "args": ["/absolute/path/to/lapis-memory/mcp/server.lua"],
+      "args": ["/absolute/path/to/luamemo/mcp/server.lua"],
       "env": {
         "MEMO_URL":   "https://app.example.com/api/memory",
         "MEMO_TOKEN": "your-bearer-token",
@@ -82,7 +88,7 @@ Edit `claude_desktop_config.json`:
 }
 ```
 
-Restart Claude Desktop. The six `memory_*` tools will appear in the tool list.
+Restart Claude Desktop. The eleven memory and secret tools will appear in the tool list.
 
 ### Cursor
 
@@ -99,7 +105,7 @@ experimental:
     - transport:
         type: stdio
         command: lua
-        args: ["/absolute/path/to/lapis-memory/mcp/server.lua"]
+        args: ["/absolute/path/to/luamemo/mcp/server.lua"]
         env:
           MEMO_URL:   https://app.example.com/api/memory
           MEMO_TOKEN: your-bearer-token
@@ -113,10 +119,10 @@ Add to `.vscode/mcp.json` in your workspace:
 ```json
 {
   "servers": {
-    "lapis-memory": {
+    "luamemo": {
       "type": "stdio",
       "command": "lua",
-      "args": ["/absolute/path/to/lapis-memory/mcp/server.lua"],
+      "args": ["/absolute/path/to/luamemo/mcp/server.lua"],
       "env": {
         "MEMO_URL":   "https://app.example.com/api/memory",
         "MEMO_TOKEN": "your-bearer-token",
@@ -133,7 +139,7 @@ Add to `.vscode/mcp.json` in your workspace:
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `MEMO_URL`   | yes | Base URL of the lapis-memory HTTP API |
+| `MEMO_URL`   | yes | Base URL of the luamemo HTTP API |
 | `MEMO_TOKEN` | no  | Bearer token sent as `Authorization: Bearer <token>` |
 | `MEMO_SCOPE` | no  | Default scope used when a tool call omits `scope` |
 | `MEMO_DEBUG` | no  | Set to `1` to log raw JSON-RPC frames to stderr |
@@ -146,7 +152,7 @@ that bucket without the model having to remember.
 
 ## Per-project scopes
 
-Run multiple MCP server instances pointing at the same `lapis-memory`
+Run multiple MCP server instances pointing at the same `luamemo`
 backend, each scoped to a different project:
 
 ```jsonc
@@ -176,7 +182,7 @@ The model sees them as two independent tool sets.
 isn't being applied. Check the client's MCP logs (Claude Desktop has a
 `Developer → MCP` panel).
 
-**"empty response from server"** — Your `lapis-memory` API isn't reachable.
+**"empty response from server"** — Your `luamemo` API isn't reachable.
 Test with `curl $MEMO_URL/recent` first.
 
 **"invalid JSON response"** — The API returned HTML or plain text (likely

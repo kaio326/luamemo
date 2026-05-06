@@ -28,15 +28,8 @@
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
-local db_shim = require("_smoke_lapis_db")
-db_shim._connect({
-    host     = os.getenv("PGHOST") or "127.0.0.1",
-    port     = tonumber(os.getenv("PGPORT") or "5432"),
-    database = os.getenv("PGDATABASE") or "lm_bruteforce_test",
-    user     = os.getenv("PGUSER") or "postgres",
-    password = os.getenv("PGPASSWORD") or "postgres",
-})
-package.loaded["lapis.db"] = db_shim
+-- luamemo.db creates a pgmoon connection automatically from
+-- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
 
 -- --- arg parsing ----------------------------------------------------------
 local args = { scope = nil, batch = 100, dry_run = false }
@@ -51,9 +44,9 @@ do
     end
 end
 
-local memory = require("lapis_memory")
-local db     = require("lapis.db")
-local embed  = require("lapis_memory.embed")
+local memory = require("luamemo")
+local db     = require("luamemo.db")
+local embed  = require("luamemo.embed")
 
 memory.setup({
     db_table         = "lapis_memory",

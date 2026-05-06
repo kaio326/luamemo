@@ -1,7 +1,7 @@
 -- Phase 16.6 — ConvoMem bench runner.
 --
 -- End-to-end retrieval-side run of a ConvoMem-style dataset through
--- lapis-memory. Same shape as the LoCoMo runner but reads from the
+-- luamemo. Same shape as the LoCoMo runner but reads from the
 -- `convomem` loader (whose schema is documented in
 -- eval/datasets/convomem.lua and eval/sidecars/convomem.md). Cross-
 -- dataset agreement between this runner and `locomo_run.lua` is the
@@ -66,18 +66,11 @@ if not fh then
 end
 fh:close()
 
-local db_shim = require("_smoke_lapis_db")
-db_shim._connect({
-    host     = os.getenv("PGHOST") or "127.0.0.1",
-    port     = tonumber(os.getenv("PGPORT") or "5432"),
-    database = os.getenv("PGDATABASE") or "lm_bruteforce_test",
-    user     = os.getenv("PGUSER") or "postgres",
-    password = os.getenv("PGPASSWORD") or "postgres",
-})
-package.loaded["lapis.db"] = db_shim
+-- luamemo.db creates a pgmoon connection automatically from
+-- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
 
-local memory   = require("lapis_memory")
-local db       = require("lapis.db")
+local memory   = require("luamemo")
+local db       = require("luamemo.db")
 local convomem = require("convomem")
 
 local setup_opts = {

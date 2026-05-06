@@ -1,7 +1,7 @@
 -- Roadmap Item 14 — Real LongMemEval bench runner.
 --
 -- End-to-end retrieval-side run of the LongMemEval `oracle` split through
--- lapis-memory. For every row we:
+-- luamemo. For every row we:
 --
 --   1. Wipe scope `lme:<embedder>:<question_id>`.
 --   2. Write every `(session_id, turns)` in `haystack_sessions` as a
@@ -11,7 +11,7 @@
 --            `answer_session_ids`. Rank = position of the first such hit.
 --
 -- This is **retrieval-side only** — we do not score generated answers.
--- The metric isolates lapis-memory's contribution from the downstream LLM.
+-- The metric isolates luamemo's contribution from the downstream LLM.
 --
 -- Usage:
 --   PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
@@ -27,6 +27,10 @@
 -- AND a per-`question_type` breakdown.
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;eval/datasets/?.lua;" .. package.path
+-- resty.http shim: lets luamemo.http use LuaSocket-backed HTTP in
+-- plain lua5.1 (outside OpenResty). Without this, luamemo.http falls
+-- back to socket.http directly which also works, but keeping the shim avoids
+-- a second pcall round-trip inside http.lua.
 package.preload["resty.http"] = function() return require("_resty_http_shim") end
 
 local cjson = require("cjson.safe")
@@ -93,19 +97,12 @@ if not fh then
 end
 fh:close()
 
--- --- pgmoon shim ---------------------------------------------------------
-local db_shim = require("_smoke_lapis_db")
-db_shim._connect({
-    host     = os.getenv("PGHOST") or "127.0.0.1",
-    port     = tonumber(os.getenv("PGPORT") or "5432"),
-    database = os.getenv("PGDATABASE") or "lm_bruteforce_test",
-    user     = os.getenv("PGUSER") or "postgres",
-    password = os.getenv("PGPASSWORD") or "postgres",
-})
-package.loaded["lapis.db"] = db_shim
-
-local memory     = require("lapis_memory")
-local db         = require("lapis.db")
+-- --- db / library --------------------------------------------------------
+-- luamemo.db detects the absence of `ngx` and creates a pgmoon
+-- connection automatically using PGHOST / PGDATABASE / PGUSER / PGPASSWORD
+-- env vars. No separate shim or package.loaded injection needed.
+local memory     = require("luamemo")
+local db         = require("luamemo.db")
 local longmemev  = require("longmemeval")
 
 -- --- embedder config (kept in sync with recall_bench.lua) ----------------

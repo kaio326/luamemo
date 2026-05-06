@@ -1,8 +1,8 @@
--- Minimal Lapis app demonstrating lapis-memory integration.
+-- Minimal Lapis app demonstrating luamemo integration.
 -- Run with: lapis server
 
 local lapis  = require("lapis")
-local memory = require("lapis_memory")
+local memory = require("luamemo")
 
 local app = lapis.Application()
 
@@ -22,6 +22,6 @@ memory.setup({
 
 memory.routes.register(app, { prefix = "/api/memory" })
 
-app:get("/", function() return "lapis-memory demo OK" end)
+app:get("/", function() return "luamemo demo OK" end)
 
 return app

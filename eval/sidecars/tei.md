@@ -1,6 +1,6 @@
 # TEI sidecar — `bge-reranker-v2-m3` for `cross_encoder` rerank adapter
 
-The `lapis_memory.rerankers.cross_encoder` adapter requires an
+The `luamemo.rerankers.cross_encoder` adapter requires an
 external rerank service (Ollama does not host cross-encoder models
 as of 0.23.x). The reference target is HuggingFace's
 [`text-embeddings-inference`](https://github.com/huggingface/text-embeddings-inference)
@@ -65,10 +65,10 @@ curl -s -X POST http://127.0.0.1:8082/rerank \
 # -> [{"index":0,"score":0.99},{"index":2,"score":0.71},{"index":1,"score":0.01}]
 ```
 
-## Wiring into `lapis-memory`
+## Wiring into `luamemo`
 
 ```lua
-local memory = require("lapis_memory")
+local memory = require("luamemo")
 memory.setup({
     -- ... regular config ...
     rerank_url   = "http://127.0.0.1:8082/rerank",
@@ -122,7 +122,7 @@ See `eval/results/longmemeval.md` § Phase 16.3 for full analysis.
 
 ## Part 2 — Embed sidecar (`bge-m3`, port 8081)
 
-The `lapis_memory.adapters.tei` embedder adapter targets a TEI
+The `luamemo.adapters.tei` embedder adapter targets a TEI
 sidecar hosting `BAAI/bge-m3` (1024-dim, 8192-token context, 100+
 languages). Reason this exists: Ollama's `bge-m3` path returns NaN
 embeddings on inputs >~600 chars (upstream bug). TEI hosts the same
@@ -172,7 +172,7 @@ services:
 Pull and start (standalone compose):
 
 ```bash
-cd lapis-memory
+cd luamemo
 docker compose -f eval/sidecars/docker-compose.yml up -d tei-embed
 docker compose -f eval/sidecars/docker-compose.yml logs -f tei-embed   # wait for "Ready"
 ```
@@ -197,10 +197,10 @@ curl -s -X POST http://127.0.0.1:8081/embed \
 # -> 1024
 ```
 
-### Wiring into `lapis-memory`
+### Wiring into `luamemo`
 
 ```lua
-local memory = require("lapis_memory")
+local memory = require("luamemo")
 memory.setup({
     -- ... regular config ...
     embedder_url     = "http://127.0.0.1:8081/embed",
@@ -223,7 +223,7 @@ memory.setup({
 ### Bench protocol (Phase 16.1)
 
 ```bash
-cd lapis-memory
+cd luamemo
 docker compose -f eval/sidecars/docker-compose.yml up -d tei-embed
 # wait for "Ready" in `docker compose logs tei-embed`
 

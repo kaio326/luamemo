@@ -1,4 +1,4 @@
-# Knowledge-graph layer (`lapis_memory.kg`)
+# Knowledge-graph layer (`luamemo.kg`)
 
 > Status: Phase 16.5 — shipped 2026-05-04. Adjunct to the vector memory
 > table. Not a replacement.
@@ -31,7 +31,7 @@ search handles poorly.
 
 ## Schema
 
-Migration: [`lapis_memory/migrations/003_kg.sql`](lapis_memory/migrations/003_kg.sql)
+Migration: [`luamemo/migrations/003_kg.sql`](luamemo/migrations/003_kg.sql)
 
 ```sql
 CREATE TABLE lm_kg_facts (
@@ -55,12 +55,12 @@ CREATE INDEX lm_kg_facts_current_idx ON lm_kg_facts (subject, predicate)
                                      WHERE valid_until IS NULL;     -- hot path
 ```
 
-`scope` mirrors `lapis_memory.scope` semantics — every query is
+`scope` mirrors `luamemo.scope` semantics — every query is
 implicitly scope-filtered, so multi-tenant deployments cannot leak
 across tenants.
 
 `source_memory_id` is the optional back-reference to the
-`lapis_memory` row that asserted this fact (e.g. the chat message or
+`luamemo` row that asserted this fact (e.g. the chat message or
 summary that contained it). `ON DELETE SET NULL` means deleting a
 memory does **not** delete the derived facts — useful for audit but
 worth knowing if you expect cascading cleanup.
@@ -188,7 +188,7 @@ the rest of the memory routes.
 ### Recipe 1 — Directive memory ("the CSP rule for inline styles")
 
 ```lua
-local kg = require("lapis_memory").kg
+local kg = require("luamemo").kg
 
 -- Day 1: the rule allows inline styles.
 kg.assert_fact({
@@ -267,15 +267,15 @@ answer, use the KG.
 ## Reproducing the smoke test
 
 ```bash
-cd lapis-memory
+cd luamemo
 
 # Reset DB and apply migrations
 docker exec -i <postgres-container> psql -U postgres -c \
   'DROP DATABASE IF EXISTS lm_bruteforce_test; CREATE DATABASE lm_bruteforce_test;'
 docker exec -i <postgres-container> psql -U postgres -d lm_bruteforce_test \
-  < lapis_memory/schema_bruteforce.sql
+  < luamemo/schema_bruteforce.sql
 docker exec -i <postgres-container> psql -U postgres -d lm_bruteforce_test \
-  < lapis_memory/migrations/003_kg.sql
+  < luamemo/migrations/003_kg.sql
 
 # Run the 6-test suite
 PGHOST=127.0.0.1 PGPORT=5432 PGDATABASE=lm_bruteforce_test \

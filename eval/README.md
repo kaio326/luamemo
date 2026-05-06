@@ -1,83 +1,178 @@
-# lapis-memory eval harness
+# luamemo eval harness
 
-Quantify how well lapis-memory retrieves the right session against the
+Quantify how well luamemo retrieves the right session against the
 [LongMemEval](https://huggingface.co/datasets/xiaoyangwu/longmemeval)
-benchmark (Lin et al., 2024). The harness is the only piece in the
-project that is not fully self-contained — it needs the published dataset
-file and a running pgvector instance.
+benchmark (Lin et al., 2024). The harness runs with plain `lua5.1` — no
+OpenResty or Lapis runtime required. All PostgreSQL access goes through
+`luamemo.db`, which falls back to a direct pgmoon connection when
+`ngx` is absent.
 
 ## What it measures
 
-- **Recall@k** for k ∈ {1, 5, 10}: a question is a "hit" at k when any of
-  its `answer_session_ids` appears in the top-k retrieved sessions.
-- Per `question_type` breakdown so you can tell where lexical similarity
-  shines (single-session-user, IDs) vs. where it falls down
-  (multi-session, knowledge-update).
+- **Recall@k** for k ∈ {1, 5, 10, 20}: a question is a "hit" at k when
+  any of its `answer_session_ids` appears in the top-k retrieved sessions.
+- **MRR** (Mean Reciprocal Rank).
+- Per `question_type` breakdown: `multi-session`, `single-session-user`,
+  `single-session-preference`.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `datasets/longmemeval.lua` | Pure-Lua dataset loader + session→memory flattener |
-| `run.lua` | Ingest + query loop; writes `results.json` |
-| `score.lua` | Reads `results.json`, prints R@k table |
-| `../scripts/download_eval.sh` | Curl the dataset from Hugging Face |
+| `longmemeval_run.lua` | Main eval entry point. Ingest + query loop; writes a JSON result file. |
+| `datasets/longmemeval.lua` | Pure-Lua dataset loader + session→memory flattener. |
+| `score.lua` | Reads a result JSON file, prints R@k / MRR table. |
+| `recall_bench.lua` | Synthetic recall benchmark (hash vs. HTTP embedder head-to-head). |
+| `_resty_http_shim.lua` | LuaSocket-backed `resty.http` shim. Preloaded by eval scripts so `luamemo.http`'s `resty.http` path works in plain Lua. |
+| `sidecars/` | Docker Compose file + docs for the TEI GPU sidecars (bge-m3 embedder, bge-reranker-v2-m3). |
+| `results/longmemeval.md` | Full phase-by-phase results, reproduce commands, and analysis. |
 
-## Recipe
+> **`_smoke_lapis_db.lua`** is a legacy file kept for reference only.
+> No current eval script uses it — `luamemo.db` now handles the
+> pgmoon path internally using `PGHOST` / `PGDATABASE` / `PGUSER` /
+> `PGPASSWORD` env vars when `ngx` is absent.
+
+## Quick start
+
+### Prerequisites
 
 ```bash
-# 1. Get the dataset (oracle subset is ~1 MB and enough for smoke tests)
-scripts/download_eval.sh eval/data
+# PostgreSQL reachable at 127.0.0.1:5432 with a test database
+PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test PGUSER=postgres PGPASSWORD=postgres \
+  psql -c "SELECT 1"
 
-# 2. Run the harness with the pure-Lua hash embedder (zero deps, fast)
-resty -I . eval/run.lua \
-    --dataset eval/data/longmemeval_oracle.json \
-    --out     eval/results/oracle_hash.json \
-    --embedder hash
+# Apply the bruteforce schema (one-time)
+PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test PGUSER=postgres PGPASSWORD=postgres \
+  psql < luamemo/schema_bruteforce.sql
 
-# 3. Score
-lua eval/score.lua eval/results/oracle_hash.json
-
-# 4. Compare against an HTTP embedder
-resty -I . eval/run.lua \
-    --dataset eval/data/longmemeval_oracle.json \
-    --out     eval/results/oracle_ollama.json \
-    --embedder ollama \
-    --embedder_url http://localhost:11434/api/embeddings \
-    --embedder_model nomic-embed-text \
-    --embed_dim 768
-
-lua eval/score.lua eval/results/oracle_ollama.json
+# Dataset (longmemeval_s.json, ~266 MB)
+# Download from HuggingFace if not present:
+# https://huggingface.co/datasets/xiaoyangwu/longmemeval
 ```
 
-## CLI flags (run.lua)
+### Run with the hash embedder (zero GPU, ~1 min for n=50)
+
+```bash
+cd /path/to/luamemo
+
+PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test PGUSER=postgres PGPASSWORD=postgres \
+  lua5.1 eval/longmemeval_run.lua --embedder hash \
+    --corpus eval/data/longmemeval_s.json --n 50 \
+    --out eval/results/smoke_hash.json
+
+lua5.1 eval/score.lua eval/results/smoke_hash.json
+```
+
+### Run with Ollama (nomic-embed-text, ~12 min for n=200)
+
+```bash
+PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test PGUSER=postgres PGPASSWORD=postgres \
+  OLLAMA_MODEL=nomic-embed-text OLLAMA_DIM=768 \
+  lua5.1 eval/longmemeval_run.lua --embedder ollama \
+    --corpus eval/data/longmemeval_s.json --n 200 \
+    --out eval/results/longmemeval_ollama_s_n200.json
+```
+
+### Run with bge-m3 via TEI GPU sidecar (~25 min for n=200)
+
+```bash
+# Bring up both TEI sidecars (requires NVIDIA GPU + Docker with GPU access)
+docker compose -f eval/sidecars/docker-compose.yml up -d
+
+# Wait for both sidecars to be ready
+docker compose -f eval/sidecars/docker-compose.yml logs tei-embed | grep -m1 Ready
+docker compose -f eval/sidecars/docker-compose.yml logs tei-reranker | grep -m1 Ready
+
+# Run
+PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test PGUSER=postgres PGPASSWORD=postgres \
+  TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
+  lua5.1 eval/longmemeval_run.lua --embedder tei \
+    --corpus eval/data/longmemeval_s.json \
+    --out eval/results/longmemeval_tei_bge-m3_s.json
+```
+
+See [sidecars/tei.md](sidecars/tei.md) for sidecar setup and resource requirements.
+
+## CLI flags (`longmemeval_run.lua`)
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--dataset` | `eval/data/longmemeval_oracle.json` | JSON dataset file |
-| `--out` | `eval/results/results.json` | Where to write results |
-| `--embedder` | `hash` | `hash` (in-process) or any HTTP adapter name |
-| `--embedder_url` | _none_ | Required for HTTP adapters |
-| `--embedder_model` | _none_ | Optional model name |
-| `--embed_dim` | `384` | Must match the embedder's output dim |
-| `--top_k` | `10` | How many candidates to retrieve per question |
-| `--limit` | _none_ | Cap N questions (smoke testing) |
+| `--embedder` | _(required)_ | `hash`, `ollama`, `tei`, `openai` |
+| `--corpus` | _(required)_ | Path to `longmemeval_s.json` |
+| `--out` | _(required)_ | Output JSON path |
+| `--n` | all | Cap to N questions (for smoke runs) |
+| `--k-max` | `20` | Max candidates to retrieve per question |
+| `--rerank` | off | Enable reranker pass |
+| `--rerank-adapter` | `noop` | `noop`, `ollama`, `openai`, `cross_encoder` |
+| `--rerank-top-n` | `20` | Candidates passed to the reranker |
+| `--sweep-weights` | off | Comma-separated vector weights (e.g. `"0.25,0.5,0.75"`) |
+
+Environment variables used:
+
+| Var | Purpose |
+|---|---|
+| `PGHOST` / `PGDATABASE` / `PGUSER` / `PGPASSWORD` | PostgreSQL connection (read by `luamemo.db`) |
+| `OLLAMA_URL` / `OLLAMA_MODEL` / `OLLAMA_DIM` | Ollama embedder config |
+| `TEI_URL` / `TEI_DIM` / `TEI_MODEL` | TEI embedder config |
+| `RERANK_URL` / `RERANK_MODEL` / `RERANK_API_KEY` | Cross-encoder reranker config |
+| `EMBED_MAX_CHARS` | Truncate session bodies at this length (default 6000) |
+| `INGEST_BATCH_SIZE` | INSERT chunk size for `write_many` (default 50) |
+| `INGEST_MODE=perrow` | Fall back to per-row `write` loop (A/B speedup measurement) |
+
+## Benchmark results summary
+
+Full analysis in [results/longmemeval.md](results/longmemeval.md).
+
+| Embedder | n | R@1 | R@5 | R@10 | R@20 | MRR | Phase |
+|---|---|---|---|---|---|---|---|
+| hash (in-process, lexical) | 200 | ~40% | ~60% | ~70% | ~80% | ~0.50 | — |
+| nomic-embed-text 768d (Ollama) | 200 | 62.0% | 81.5% | 87.5% | 92.5% | 0.706 | 15.3 |
+| bge-m3 1024d (TEI), n=200 slice | 200 | 80.0% | 93.5% | 96.5% | 99.5% | 0.862 | 16.1 |
+| **bge-m3 1024d (TEI), full corpus** | **500** | **85.2%** | **96.0%** | **97.8%** | **99.4%** | **0.900** | **17.1** |
+
+### Comparison to MemPalace
+
+[MemPalace](https://arxiv.org/abs/2410.07983) reports **96.6% R@5** on
+LongMemEval-S using a custom LLM-summarisation pipeline. Our best result
+(**bge-m3 + bruteforce backend, no reranker, no LLM summarisation, n=500**) is
+**96.0% R@5** — a **0.6 pp gap** achieved with a pure-retrieval pipeline
+that is significantly simpler and cheaper to operate.
+
+The earlier n=200 comparison showed a 3.1 pp gap because that slice
+contained only the three harder question types (`multi-session`,
+`single-session-preference`, `single-session-user`). The full 500-question
+corpus includes three additional types (`knowledge-update`,
+`single-session-assistant`, `temporal-reasoning`) where bge-m3 scores
+100% R@5 on the first two, bringing the overall mean up to 96.0%.
+
+Key observations:
+
+- **The embedder is the dominant accuracy lever.** Switching
+  `nomic-embed-text` → `bge-m3` adds +14.5 pp R@5 (n=500) with zero
+  other changes.
+- **Full-corpus results are more representative.** The n=200 slice
+  contained only 3 of 6 question types, all on the harder end. At
+  n=500, `single-session-assistant` (100% R@5) and `knowledge-update`
+  (100% R@5) lift the overall mean and close the MemPalace gap.
+- **Cross-encoder reranking with same-family models adds nothing.** When
+  the bi-encoder (`bge-m3`) and the reranker (`bge-reranker-v2-m3`) share
+  the same model family, the reranker agrees with the bi-encoder ordering
+  and produces no measurable recall improvement (Phase 16.3).
+- **Rerank=noop regresses R@1.** The `noop` adapter retrieves `top_n=20`
+  before the pass; with a stronger embedder the extra candidates introduce
+  ordering noise. Recommended: no reranker with bge-m3.
+- **3 misses in 500** (all outside top-20). One persistent `single-session-user`
+  truncation case; two in `temporal-reasoning`. These are the hard ceiling
+  for the current single-stage retrieval path.
 
 ## Notes & limitations
 
 - Decay weighting is bypassed in eval (`ignore_decay = true`) so all
   candidates are scored on raw hybrid similarity.
 - Dedup is disabled; every haystack session must land as its own row.
-- Each question gets its own scope (`longmemeval:<question_id>`) so the
-  table can be reused across questions without cross-contamination.
-- The harness uses a dedicated `lapis_memory_eval` table that is
-  `TRUNCATE`'d at the start of every run.
-
-## Comparing to MemPalace
-
-MemPalace publishes 96.6% R@5 on LongMemEval-S using a custom
-LLM-summarisation pipeline. Our hybrid (vector + FTS, no LLM) baseline
-should land in the 50–80% range with the hash embedder and 80–90% with a
-proper sentence-transformer embedder, depending on the subset. Numbers
-will be filled in once the harness is run end-to-end against a real
-pgvector instance.
+- Each question gets its own scope (`lme:<embedder>:<question_id>`) so
+  rows are isolated across questions and across embedder runs.
+- ~30–40 sessions per full run fail with
+  `ERROR: invalid byte sequence for encoding "UTF8"` from pgmoon on
+  corpus rows with mixed-encoding bytes. Failed sessions are skipped;
+  recall numbers are over the surviving population.

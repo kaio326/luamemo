@@ -1,6 +1,6 @@
 -- eval/run.lua
 --
--- Run a retrieval evaluation of lapis-memory against LongMemEval.
+-- Run a retrieval evaluation of luamemo against LongMemEval.
 --
 -- Pipeline:
 --   1. Load dataset rows (eval.datasets.longmemeval.load).
@@ -10,7 +10,7 @@
 --   4. Record the ranked session_ids alongside the gold `answer_session_ids`.
 --   5. Write a results JSON file. Pipe it into `eval/score.lua` to get R@k.
 --
--- Usage (from a Lapis app shell or `resty` REPL with cwd=lapis-memory):
+-- Usage (from a Lapis app shell or `resty` REPL with cwd=luamemo):
 --
 --   resty -I . eval/run.lua \
 --      --dataset eval/data/longmemeval_oracle.json \
@@ -22,7 +22,7 @@
 -- with the hash embedder need no extra services; ollama / openai do.
 
 local cjson    = require("cjson.safe")
-local memory   = require("lapis_memory")
+local memory   = require("luamemo")
 local dataset  = require("eval.datasets.longmemeval")
 
 local function parse_args(argv)
