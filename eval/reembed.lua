@@ -1,4 +1,4 @@
--- Phase 10.3 runner: re-embed every row in `lapis_memory` against the
+-- Phase 10.3 runner: re-embed every row in `lm_memories` against the
 -- currently-configured embedder. Use this when:
 --   * you switched embedders (hash → ollama, openai → voyage, etc.)
 --   * you increased / decreased `embed_dim`
@@ -49,7 +49,7 @@ local db     = require("luamemo.db")
 local embed  = require("luamemo.embed")
 
 memory.setup({
-    db_table         = "lapis_memory",
+    db_table         = "lm_memories",
     embedder_local   = os.getenv("EMBEDDER_LOCAL") or "hash",
     embedder_url     = os.getenv("EMBEDDER_URL"),
     embedder_adapter = os.getenv("EMBEDDER_ADAPTER") or "generic",
@@ -63,7 +63,7 @@ memory.setup({
 
 local cfg_dim   = tonumber(os.getenv("EMBED_DIM") or "384")
 local backend   = memory.store.backend()
-local table_nm  = "lapis_memory"
+local table_nm  = "lm_memories"
 
 local where = "TRUE"
 if args.scope then
@@ -88,7 +88,7 @@ local trigger_disabled = false
 if not args.dry_run then
     local ok = pcall(function()
         db.query("ALTER TABLE " .. table_nm ..
-                 " DISABLE TRIGGER lapis_memory_touch_updated_at_trg")
+                 " DISABLE TRIGGER lm_memories_touch_updated_at_trg")
     end)
     trigger_disabled = ok
     if ok then print("(updated_at trigger disabled for the duration)") end
@@ -98,7 +98,7 @@ local function reenable_trigger()
     if trigger_disabled then
         pcall(function()
             db.query("ALTER TABLE " .. table_nm ..
-                     " ENABLE TRIGGER lapis_memory_touch_updated_at_trg")
+                     " ENABLE TRIGGER lm_memories_touch_updated_at_trg")
         end)
     end
 end

@@ -4,7 +4,7 @@
 --
 -- Pipeline:
 --   1. Load dataset rows (eval.datasets.longmemeval.load).
---   2. Configure a fresh lapis_memory_eval table with the chosen embedder.
+--   2. Configure a fresh lm_memories_eval table with the chosen embedder.
 --   3. Per question: write the haystack sessions (one memory per session,
 --      scoped to that question), then run search(question, top_k=10).
 --   4. Record the ranked session_ids alongside the gold `answer_session_ids`.
@@ -47,7 +47,7 @@ end
 local function setup_memory(opts)
     -- Use a dedicated table so the eval cannot pollute production data.
     local cfg = {
-        db_table       = "lapis_memory_eval",
+        db_table       = "lm_memories_eval",
         embedder_local = (opts.embedder == "hash") and "hash" or nil,
         embedder_url   = opts.embedder_url,
         embedder_adapter = (opts.embedder ~= "hash") and opts.embedder or "generic",
@@ -62,7 +62,7 @@ end
 
 local function reset_table()
     local db = require("lapis.db")
-    db.query("TRUNCATE TABLE lapis_memory_eval RESTART IDENTITY")
+    db.query("TRUNCATE TABLE lm_memories_eval RESTART IDENTITY")
 end
 
 local function run(opts)

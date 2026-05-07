@@ -10,7 +10,7 @@ package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 local db     = require("luamemo.db")
 local memory = require("luamemo")
 memory.setup({
-    db_table       = "lapis_memory",
+    db_table       = "lm_memories",
     embedder_local = "hash",
     embed_dim      = 384,
     backend        = "auto",
@@ -18,7 +18,7 @@ memory.setup({
     auth_fn        = function() return true end,
 })
 
-db.query("DELETE FROM lapis_memory WHERE scope = 'tune_test'")
+db.query("DELETE FROM lm_memories WHERE scope = 'tune_test'")
 
 local memos = {
     { "Docker compose deployment", "Run docker compose up -d to start the application stack on production." },
@@ -64,5 +64,5 @@ for _, m in ipairs(memos) do
     if not row then error("seed insert failed: " .. tostring(err)) end
 end
 
-local n = db.query("SELECT count(*) AS c FROM lapis_memory WHERE scope = 'tune_test'")
+local n = db.query("SELECT count(*) AS c FROM lm_memories WHERE scope = 'tune_test'")
 print("seeded tune_test rows:", n[1].c)

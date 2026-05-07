@@ -6,10 +6,10 @@
 -- Safe to re-run.
 
 -- ---------------------------------------------------------------------------
--- 001: base schema  (lapis_memory/schema_bruteforce.sql)
+-- 001: base schema  (lm_memories/schema_bruteforce.sql)
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS lapis_memory (
+CREATE TABLE IF NOT EXISTS lm_memories (
     id            BIGSERIAL   PRIMARY KEY,
     scope         TEXT        NOT NULL,
     kind          TEXT        NOT NULL,
@@ -31,19 +31,19 @@ CREATE TABLE IF NOT EXISTS lapis_memory (
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS lapis_memory_scope_idx
-    ON lapis_memory (scope);
+CREATE INDEX IF NOT EXISTS lm_memories_scope_idx
+    ON lm_memories (scope);
 
-CREATE INDEX IF NOT EXISTS lapis_memory_kind_idx
-    ON lapis_memory (kind);
+CREATE INDEX IF NOT EXISTS lm_memories_kind_idx
+    ON lm_memories (kind);
 
-CREATE INDEX IF NOT EXISTS lapis_memory_tags_idx
-    ON lapis_memory USING GIN (tags);
+CREATE INDEX IF NOT EXISTS lm_memories_tags_idx
+    ON lm_memories USING GIN (tags);
 
-CREATE INDEX IF NOT EXISTS lapis_memory_fts_idx
-    ON lapis_memory USING GIN (fts);
+CREATE INDEX IF NOT EXISTS lm_memories_fts_idx
+    ON lm_memories USING GIN (fts);
 
-CREATE OR REPLACE FUNCTION lapis_memory_touch_updated_at()
+CREATE OR REPLACE FUNCTION lm_memories_touch_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = now();
@@ -51,26 +51,26 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS lapis_memory_touch_updated_at_trg ON lapis_memory;
-CREATE TRIGGER lapis_memory_touch_updated_at_trg
-    BEFORE UPDATE ON lapis_memory
+DROP TRIGGER IF EXISTS lm_memories_touch_updated_at_trg ON lm_memories;
+CREATE TRIGGER lm_memories_touch_updated_at_trg
+    BEFORE UPDATE ON lm_memories
     FOR EACH ROW
-    EXECUTE FUNCTION lapis_memory_touch_updated_at();
+    EXECUTE FUNCTION lm_memories_touch_updated_at();
 
 -- ---------------------------------------------------------------------------
 -- 002: importance + decay_rate constraints (columns already in schema above)
 -- ---------------------------------------------------------------------------
 
-ALTER TABLE lapis_memory
-    DROP CONSTRAINT IF EXISTS lapis_memory_importance_range;
-ALTER TABLE lapis_memory
-    ADD CONSTRAINT lapis_memory_importance_range
+ALTER TABLE lm_memories
+    DROP CONSTRAINT IF EXISTS lm_memories_importance_range;
+ALTER TABLE lm_memories
+    ADD CONSTRAINT lm_memories_importance_range
     CHECK (importance >= 0.0 AND importance <= 10.0);
 
-ALTER TABLE lapis_memory
-    DROP CONSTRAINT IF EXISTS lapis_memory_decay_rate_range;
-ALTER TABLE lapis_memory
-    ADD CONSTRAINT lapis_memory_decay_rate_range
+ALTER TABLE lm_memories
+    DROP CONSTRAINT IF EXISTS lm_memories_decay_rate_range;
+ALTER TABLE lm_memories
+    ADD CONSTRAINT lm_memories_decay_rate_range
     CHECK (decay_rate >= 0.0 AND decay_rate <= 1.0);
 
 -- ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS lm_kg_facts (
     object           TEXT        NOT NULL,
     valid_from       TIMESTAMPTZ NOT NULL DEFAULT now(),
     valid_until      TIMESTAMPTZ,
-    source_memory_id BIGINT      REFERENCES lapis_memory(id) ON DELETE SET NULL,
+    source_memory_id BIGINT      REFERENCES lm_memories(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -109,6 +109,6 @@ ALTER TABLE lm_kg_facts
 -- 004: was_truncated flag (no-op: column already in schema above)
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX IF NOT EXISTS lapis_memory_was_truncated_idx
-    ON lapis_memory (was_truncated)
+CREATE INDEX IF NOT EXISTS lm_memories_was_truncated_idx
+    ON lm_memories (was_truncated)
     WHERE was_truncated = TRUE;

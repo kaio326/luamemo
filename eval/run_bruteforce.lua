@@ -8,9 +8,9 @@ package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
 local db = require("luamemo.db")
 
--- Ensure the eval table exists (separate from the main lapis_memory table).
+-- Ensure the eval table exists (separate from the main lm_memories table).
 db.query([[
-CREATE TABLE IF NOT EXISTS lapis_memory_eval (LIKE lapis_memory INCLUDING ALL);
+CREATE TABLE IF NOT EXISTS lm_memories_eval (LIKE lm_memories INCLUDING ALL);
 ]])
 
 -- Hand off to run.lua.

@@ -17,7 +17,7 @@
 --   object                TEXT NOT NULL   — the value (free-form)
 --   valid_from            TIMESTAMPTZ NOT NULL DEFAULT now()
 --   valid_until           TIMESTAMPTZ              — NULL = currently valid
---   source_memory_id      BIGINT REFERENCES lapis_memory(id) ON DELETE SET NULL
+--   source_memory_id      BIGINT REFERENCES lm_memories(id) ON DELETE SET NULL
 --   created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 --
 -- Indexes:
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS lm_kg_facts (
     object           TEXT        NOT NULL,
     valid_from       TIMESTAMPTZ NOT NULL DEFAULT now(),
     valid_until      TIMESTAMPTZ,
-    source_memory_id BIGINT      REFERENCES lapis_memory(id) ON DELETE SET NULL,
+    source_memory_id BIGINT      REFERENCES lm_memories(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

@@ -15,7 +15,7 @@ local db     = require("luamemo.db")
 local memory = require("luamemo")
 
 memory.setup({
-    db_table       = "lapis_memory",
+    db_table       = "lm_memories",
     embedder_local = "hash",
     embed_dim      = 384,
     backend        = "auto",   -- should resolve to bruteforce
@@ -30,7 +30,7 @@ print("resolved backend =", memory.store.backend())
 assert(memory.store.backend() == "bruteforce", "expected bruteforce")
 
 -- Clean slate.
-db.query("TRUNCATE lapis_memory")
+db.query("TRUNCATE lm_memories")
 
 header("write 5 unrelated memories")
 local seeds = {

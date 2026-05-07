@@ -74,7 +74,7 @@ local db       = require("luamemo.db")
 local convomem = require("convomem")
 
 local setup_opts = {
-    db_table         = "lapis_memory",
+    db_table         = "lm_memories",
     backend          = "auto",
     auth_fn          = function() return true end,
     skip_embed_probe = true,
@@ -171,7 +171,7 @@ for ri, r in ipairs(rows) do
     local dlg_id = tostring(r.dialogue_id or ("row_" .. ri))
     local scope  = "convomem:" .. args.embedder .. ":" .. dlg_id
 
-    db.query("DELETE FROM lapis_memory WHERE scope = " .. db.escape_literal(scope))
+    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(scope))
 
     local n_haystack = 0
     local batch = {}

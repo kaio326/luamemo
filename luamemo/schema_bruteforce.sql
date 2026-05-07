@@ -13,7 +13,7 @@
 -- a length at the column level; the embedder dispatcher in embed.lua
 -- validates it on every call.
 
-CREATE TABLE IF NOT EXISTS lapis_memory (
+CREATE TABLE IF NOT EXISTS lm_memories (
     id          BIGSERIAL PRIMARY KEY,
     scope       TEXT NOT NULL,
     kind        TEXT NOT NULL,
@@ -39,24 +39,24 @@ CREATE TABLE IF NOT EXISTS lapis_memory (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS lapis_memory_scope_idx
-    ON lapis_memory (scope);
+CREATE INDEX IF NOT EXISTS lm_memories_scope_idx
+    ON lm_memories (scope);
 
-CREATE INDEX IF NOT EXISTS lapis_memory_kind_idx
-    ON lapis_memory (kind);
+CREATE INDEX IF NOT EXISTS lm_memories_kind_idx
+    ON lm_memories (kind);
 
-CREATE INDEX IF NOT EXISTS lapis_memory_tags_idx
-    ON lapis_memory USING GIN (tags);
+CREATE INDEX IF NOT EXISTS lm_memories_tags_idx
+    ON lm_memories USING GIN (tags);
 
-CREATE INDEX IF NOT EXISTS lapis_memory_fts_idx
-    ON lapis_memory USING GIN (fts);
+CREATE INDEX IF NOT EXISTS lm_memories_fts_idx
+    ON lm_memories USING GIN (fts);
 
 -- No vector index: the brute-force backend computes cosine in Lua over a
 -- candidate set pre-filtered by scope/kind/FTS. Install pgvector and use
 -- schema.sql instead when you outgrow the brute-force crossover.
 
 -- Auto-update updated_at on UPDATE.
-CREATE OR REPLACE FUNCTION lapis_memory_touch_updated_at()
+CREATE OR REPLACE FUNCTION lm_memories_touch_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = now();
@@ -64,8 +64,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS lapis_memory_touch_updated_at_trg ON lapis_memory;
-CREATE TRIGGER lapis_memory_touch_updated_at_trg
-    BEFORE UPDATE ON lapis_memory
+DROP TRIGGER IF EXISTS lm_memories_touch_updated_at_trg ON lm_memories;
+CREATE TRIGGER lm_memories_touch_updated_at_trg
+    BEFORE UPDATE ON lm_memories
     FOR EACH ROW
-    EXECUTE FUNCTION lapis_memory_touch_updated_at();
+    EXECUTE FUNCTION lm_memories_touch_updated_at();

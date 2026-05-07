@@ -400,7 +400,7 @@ function M.register(app, opts)
         local db    = require("lapis.db")
         local cjson = require("cjson.safe")
         local cfg   = get_cfg()
-        local tbl   = cfg.db_table or "lapis_memory"
+        local tbl   = cfg.db_table or "lm_memories"
 
         -- Distinct scopes for the dropdown (cap to keep page light).
         local scope_rows = db.query(

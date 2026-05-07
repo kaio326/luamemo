@@ -32,7 +32,7 @@ benefiting from pgvector's HNSW index for fast top-K filtering.
 | Cloud / highest quality    | `openai` (`text-embedding-3-small`) | paid |
 
 You can swap tiers at any time **without re-creating the table** — just
-re-embed existing rows by running `UPDATE lapis_memory SET body = body`
+re-embed existing rows by running `UPDATE lm_memories SET body = body`
 through your app, or call `memory.update(id, {body = row.body})` for each row.
 
 ## Setup

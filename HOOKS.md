@@ -46,7 +46,7 @@ All four return the same `(row, err)` tuple as `store.write`.
 local memory = require("luamemo")
 local hooks  = require("luamemo.hooks")   -- or memory.hooks
 
-memory.setup({ db_table = "lapis_memory", embedder_local = "ollama" })
+memory.setup({ db_table = "lm_memories", embedder_local = "ollama" })
 
 -- per-turn, in your chat loop:
 hooks.capture_user_message{

@@ -10,9 +10,9 @@
 --
 -- Safe to re-run.
 
-ALTER TABLE lapis_memory
+ALTER TABLE lm_memories
     ADD COLUMN IF NOT EXISTS was_truncated BOOLEAN NOT NULL DEFAULT FALSE;
 
-CREATE INDEX IF NOT EXISTS lapis_memory_was_truncated_idx
-    ON lapis_memory (was_truncated)
+CREATE INDEX IF NOT EXISTS lm_memories_was_truncated_idx
+    ON lm_memories (was_truncated)
     WHERE was_truncated = TRUE;

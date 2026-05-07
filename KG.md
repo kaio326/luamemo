@@ -42,7 +42,7 @@ CREATE TABLE lm_kg_facts (
     object           TEXT        NOT NULL,
     valid_from       TIMESTAMPTZ NOT NULL DEFAULT now(),
     valid_until      TIMESTAMPTZ,                          -- NULL = currently valid
-    source_memory_id BIGINT      REFERENCES lapis_memory(id) ON DELETE SET NULL,
+    source_memory_id BIGINT      REFERENCES lm_memories(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT lm_kg_facts_validity_window
         CHECK (valid_until IS NULL OR valid_until >= valid_from)

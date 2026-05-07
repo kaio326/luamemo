@@ -40,7 +40,7 @@ the HNSW index. The trigger, FTS column, and CHECK constraints are unchanged.
 local memory = require("luamemo")
 
 memory.setup({
-    db_table       = "lapis_memory",
+    db_table = "lm_memories",
     embedder_local = "hash",        -- or your model of choice
     embed_dim      = 384,
     backend        = "auto",        -- "auto" | "pgvector" | "bruteforce"

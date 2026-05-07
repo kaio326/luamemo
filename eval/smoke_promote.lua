@@ -19,7 +19,7 @@ local memory = require("luamemo")
 local db     = require("luamemo.db")
 
 memory.setup({
-    db_table          = "lapis_memory",
+    db_table          = "lm_memories",
     embedder_local    = "hash",
     embed_dim         = 384,
     backend           = "auto",
@@ -32,7 +32,7 @@ local FROM = "session:phase12"
 local TO   = "user:phase12:lt"
 
 -- --- arrange --------------------------------------------------------------
-db.query("DELETE FROM lapis_memory WHERE scope IN ("
+db.query("DELETE FROM lm_memories WHERE scope IN ("
     .. db.escape_literal(FROM) .. ", " .. db.escape_literal(TO) .. ")")
 
 local seed_bodies = {
@@ -50,7 +50,7 @@ for _, b in ipairs(seed_bodies) do
     assert(row and row.id, "seed write failed: " .. tostring(b))
 end
 
-local seeded = db.query("SELECT count(*) AS n FROM lapis_memory WHERE scope = "
+local seeded = db.query("SELECT count(*) AS n FROM lm_memories WHERE scope = "
     .. db.escape_literal(FROM))[1]
 assert(tonumber(seeded.n) == 5, "expected 5 seed rows, got " .. tostring(seeded.n))
 print("seeded 5 rows in " .. FROM)
@@ -65,7 +65,7 @@ assert(r1.promoted == 1, "dry_run: expected promoted=1, got " .. tostring(r1.pro
 assert(r1.dry_run == true, "dry_run flag missing")
 assert(#r1.source_ids == 5, "dry_run source_ids mismatch")
 
-local after_dry = db.query("SELECT count(*) AS n FROM lapis_memory WHERE scope = "
+local after_dry = db.query("SELECT count(*) AS n FROM lm_memories WHERE scope = "
     .. db.escape_literal(TO))[1]
 assert(tonumber(after_dry.n) == 0, "dry_run wrote rows to to_scope!")
 print("PASS case 1: dry_run promoted=1, no DB mutation")
@@ -80,7 +80,7 @@ assert(r2.promoted == 1, "case2: promoted=" .. tostring(r2.promoted))
 assert(r2.summary_id, "case2: missing summary_id")
 assert(r2.deleted_source == false, "case2: deleted_source should be false")
 
-local sum = db.query("SELECT title, kind, metadata FROM lapis_memory WHERE id = "
+local sum = db.query("SELECT title, kind, metadata FROM lm_memories WHERE id = "
     .. tostring(r2.summary_id))[1]
 assert(sum.kind == "summary", "case2: expected kind=summary, got " .. tostring(sum.kind))
 assert(sum.title:sub(1, 11) == "[promoted] ",
@@ -97,7 +97,7 @@ assert(meta.promoted_from == FROM,
 assert(type(meta.source_ids) == "table" and #meta.source_ids == 5,
     "case2: metadata.source_ids should be 5 ids")
 
-local src_after = db.query("SELECT count(*) AS n FROM lapis_memory WHERE scope = "
+local src_after = db.query("SELECT count(*) AS n FROM lm_memories WHERE scope = "
     .. db.escape_literal(FROM) .. " AND kind != 'summary'")[1]
 assert(tonumber(src_after.n) == 5,
     "case2: source rows should be preserved, got " .. tostring(src_after.n))
@@ -112,12 +112,12 @@ local r3 = memory.promote({
 assert(r3.promoted == 1, "case3: promoted=" .. tostring(r3.promoted))
 assert(r3.deleted_source == true, "case3: deleted_source should be true")
 
-local src_gone = db.query("SELECT count(*) AS n FROM lapis_memory WHERE scope = "
+local src_gone = db.query("SELECT count(*) AS n FROM lm_memories WHERE scope = "
     .. db.escape_literal(FROM))[1]
 assert(tonumber(src_gone.n) == 0,
     "case3: source rows should be gone, got " .. tostring(src_gone.n))
 
-local target_count = db.query("SELECT count(*) AS n FROM lapis_memory WHERE scope = "
+local target_count = db.query("SELECT count(*) AS n FROM lm_memories WHERE scope = "
     .. db.escape_literal(TO))[1]
 assert(tonumber(target_count.n) == 2,
     "case3: target should have 2 summaries (case2 + case3), got " .. tostring(target_count.n))
@@ -144,7 +144,7 @@ assert(r6.promoted == 0 and r6.errors and r6.errors[1]:find("from_scope == to_sc
 print("PASS case 6: from_scope == to_scope rejected")
 
 -- --- cleanup --------------------------------------------------------------
-db.query("DELETE FROM lapis_memory WHERE scope IN ("
+db.query("DELETE FROM lm_memories WHERE scope IN ("
     .. db.escape_literal(FROM) .. ", " .. db.escape_literal(TO) .. ")")
 
 print("\nAll 6 promote smoke cases pass.")

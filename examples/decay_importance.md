@@ -108,7 +108,7 @@ Quick sanity check:
 SELECT title, importance, decay_rate,
        ROUND((importance * exp(-decay_rate *
               (EXTRACT(EPOCH FROM (now() - updated_at))/86400.0)))::numeric, 4) AS weight
-FROM lapis_memory
+FROM lm_memories
 ORDER BY weight DESC
 LIMIT 20;
 ```

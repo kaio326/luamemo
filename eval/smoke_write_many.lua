@@ -17,7 +17,7 @@ local db     = require("luamemo.db")
 local memory = require("luamemo")
 
 memory.setup({
-    db_table        = "lapis_memory",
+    db_table        = "lm_memories",
     embedder_local  = "hash",
     embed_dim       = 384,
     backend         = "auto",
@@ -31,7 +31,7 @@ local function header(s) print("\n=== " .. s .. " ===") end
 
 assert(memory.store.backend() == "bruteforce", "expected bruteforce backend")
 
-db.query("DELETE FROM lapis_memory WHERE scope LIKE 'smoke_wm%'")
+db.query("DELETE FROM lm_memories WHERE scope LIKE 'smoke_wm%'")
 
 -- 1. Happy path -----------------------------------------------------------
 header("happy path: 5 rows in single chunk")
@@ -56,7 +56,7 @@ print("  OK (5/5 inserted, order preserved)")
 
 -- 2. Multi-chunk ----------------------------------------------------------
 header("multi-chunk: 12 rows with batch_size=5")
-db.query("DELETE FROM lapis_memory WHERE scope = 'smoke_wm'")
+db.query("DELETE FROM lm_memories WHERE scope = 'smoke_wm'")
 local big = {}
 for i = 1, 12 do
     big[i] = { scope = "smoke_wm", kind = "fact",
@@ -73,7 +73,7 @@ print("  OK (12/12 inserted across 3 chunks, order preserved)")
 
 -- 3. Mixed validation error -----------------------------------------------
 header("mixed: bad row in middle does not abort batch")
-db.query("DELETE FROM lapis_memory WHERE scope = 'smoke_wm'")
+db.query("DELETE FROM lm_memories WHERE scope = 'smoke_wm'")
 local mixed = {
     { scope = "smoke_wm", kind = "fact", title = "good 1", body = "alpha aaa" },
     { scope = "smoke_wm", kind = "fact", title = "",       body = "" },  -- bad
@@ -98,7 +98,7 @@ print("  OK (3 inserted, 3 errored)")
 
 -- 4. Optional dedup ("skip") ---------------------------------------------
 header("dedup_strategy=skip catches near-duplicates without aborting")
-db.query("DELETE FROM lapis_memory WHERE scope = 'smoke_wm'")
+db.query("DELETE FROM lm_memories WHERE scope = 'smoke_wm'")
 -- Seed an existing row.
 local seed = memory.write({ scope = "smoke_wm", kind = "fact",
     title = "Postgres backup strategy",

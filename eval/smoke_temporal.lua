@@ -17,7 +17,7 @@ local memory = require("luamemo")
 local db     = require("luamemo.db")
 
 memory.setup({
-    db_table       = "lapis_memory",
+    db_table       = "lm_memories",
     embedder_local = "hash",
     embed_dim      = 384,
     backend        = "auto",
@@ -27,26 +27,26 @@ memory.setup({
 
 -- --- arrange --------------------------------------------------------------
 -- Disable the touch trigger so backdating sticks.
-db.query("ALTER TABLE lapis_memory DISABLE TRIGGER lapis_memory_touch_updated_at_trg")
+db.query("ALTER TABLE lm_memories DISABLE TRIGGER lm_memories_touch_updated_at_trg")
 
 -- Reset all rows to "now" first (in case of leftover state from prior runs).
-db.query("UPDATE lapis_memory SET updated_at = now() WHERE scope = 'tune_test'")
+db.query("UPDATE lm_memories SET updated_at = now() WHERE scope = 'tune_test'")
 
 -- Backdate the 10 lowest-id rows by 60 days.
 db.query([[
-    UPDATE lapis_memory SET updated_at = now() - interval '60 days'
-     WHERE id IN (SELECT id FROM lapis_memory WHERE scope = 'tune_test'
+    UPDATE lm_memories SET updated_at = now() - interval '60 days'
+     WHERE id IN (SELECT id FROM lm_memories WHERE scope = 'tune_test'
                   ORDER BY id LIMIT 10)
 ]])
 
-db.query("ALTER TABLE lapis_memory ENABLE TRIGGER lapis_memory_touch_updated_at_trg")
+db.query("ALTER TABLE lm_memories ENABLE TRIGGER lm_memories_touch_updated_at_trg")
 
 -- Sanity-check the split.
 local counts = db.query([[
     SELECT
       sum(CASE WHEN updated_at >= now() - interval '30 days' THEN 1 ELSE 0 END) AS recent,
       sum(CASE WHEN updated_at <  now() - interval '30 days' THEN 1 ELSE 0 END) AS old
-    FROM lapis_memory WHERE scope = 'tune_test'
+    FROM lm_memories WHERE scope = 'tune_test'
 ]])[1]
 print(("backdated split: recent=%s  old=%s"):format(counts.recent, counts.old))
 assert(tonumber(counts.recent) == 20, "expected 20 recent rows")

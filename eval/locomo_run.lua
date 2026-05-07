@@ -78,7 +78,7 @@ local locomo  = require("locomo")
 
 -- --- embedder config (mirrors longmemeval_run.lua) -----------------------
 local setup_opts = {
-    db_table         = "lapis_memory",
+    db_table         = "lm_memories",
     backend          = "auto",
     auth_fn          = function() return true end,
     skip_embed_probe = true,
@@ -180,7 +180,7 @@ for ri, r in ipairs(rows) do
     local scope     = "locomo:" .. args.embedder .. ":" .. sample_id
 
     -- 1. wipe + ingest haystack once per sample
-    db.query("DELETE FROM lapis_memory WHERE scope = " .. db.escape_literal(scope))
+    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(scope))
 
     local n_haystack = 0
     local batch = {}

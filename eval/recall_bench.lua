@@ -132,7 +132,7 @@ end
 
 -- --- embedder config -----------------------------------------------------
 local setup_opts = {
-    db_table         = "lapis_memory",
+    db_table         = "lm_memories",
     backend          = "auto",
     auth_fn          = function() return true end,
     skip_embed_probe = true,
@@ -238,7 +238,7 @@ local t_start = os.time()
 for qi, q in ipairs(rows) do
     local scope = "bench:" .. args.embedder .. ":" .. tostring(q.question_id)
     -- Wipe scope so reruns are deterministic.
-    db.query("DELETE FROM lapis_memory WHERE scope = " .. db.escape_literal(scope))
+    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(scope))
 
     -- Write every haystack session as one memory.
     for sid, turns in pairs(q.haystack_sessions or {}) do

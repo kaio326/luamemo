@@ -14,7 +14,7 @@ local M = {}
 -- Default configuration. Overridden by setup().
 -- ---------------------------------------------------------------------------
 M.config = {
-    db_table       = "lapis_memory",
+    db_table       = "lm_memories",
     -- HTTP embedder config (used when embedder_local is nil):
     embedder_url   = nil,
     embedder_adapter = "generic",          -- "generic" | "ollama" | "openai" | "tei" | "voyage" | "cohere"

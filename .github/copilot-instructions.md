@@ -124,7 +124,7 @@ Columns: `id`, `name` (UNIQUE), `ciphertext`, `description`, `created_at`, `upda
 
 ## Migrations Pattern
 - `migrations/001_init.sql` runs `\i schema.sql` for fresh installs
-- `schema.sql` / `schema_bruteforce.sql` define only the base `lapis_memory` table
+- `schema.sql` / `schema_bruteforce.sql` define only the base `lm_memories` table
 - All addons (KG, secrets, …) live in numbered migration files
 - Migrations must be idempotent (`IF NOT EXISTS`, `IF EXISTS`)
 - Apply sequentially: `psql -d mydb < luamemo/migrations/005_lm_secrets.sql`

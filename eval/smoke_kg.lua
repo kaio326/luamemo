@@ -18,7 +18,7 @@ package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 local db     = require("luamemo.db")
 local memory = require("luamemo")
 memory.setup({
-    db_table       = "lapis_memory",
+    db_table       = "lm_memories",
     embedder_local = "hash",
     embed_dim      = 384,
     backend        = "auto",
