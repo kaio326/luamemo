@@ -668,6 +668,149 @@ function M.recent(args)
 end
 
 -- ---------------------------------------------------------------------------
+-- find_decayed
+-- Finds memories whose effective importance (importance × exp(−decay_rate ×
+-- days_since_updated)) has fallen below `decay_threshold` (default 0.05).
+-- When `apply` is true (the default), sets their importance to 0 so they
+-- drop out of future searches without being hard-deleted.
+-- Returns (ids, err).
+-- ---------------------------------------------------------------------------
+function M.find_decayed(opts)
+    opts = opts or {}
+    local threshold = tonumber(opts.decay_threshold) or 0.05
+    local max_rows  = math.min(tonumber(opts.max_rows) or 500, 5000)
+    local apply     = opts.apply ~= false   -- default true
+
+    local conds = {
+        "decay_rate > 0",
+        "importance > 0",
+        ("(importance * exp(-decay_rate * (EXTRACT(EPOCH FROM (now() - updated_at)) / 86400.0))) < "
+            .. db.escape_literal(threshold)),
+    }
+    if opts.scope then
+        table.insert(conds, "scope = " .. db.escape_literal(opts.scope))
+    end
+
+    local sql = ([[
+        SELECT id FROM %s
+        WHERE %s
+        ORDER BY updated_at ASC
+        LIMIT %d
+    ]]):format(tbl(), table.concat(conds, " AND "), max_rows)
+
+    local rows, qerr = db.query(sql)
+    if not rows then return nil, "find_decayed: db error: " .. tostring(qerr) end
+
+    local ids = {}
+    for _, r in ipairs(rows) do table.insert(ids, r.id) end
+
+    if apply and #ids > 0 then
+        local id_list = table.concat(ids, ",")
+        local _, uerr = db.query(
+            "UPDATE " .. tbl() .. " SET importance = 0 WHERE id IN (" .. id_list .. ")")
+        if uerr then
+            return nil, "find_decayed: update failed: " .. tostring(uerr)
+        end
+    end
+
+    return ids, nil
+end
+
+-- ---------------------------------------------------------------------------
+-- find_clusters
+-- Fetches up to `max_rows` memories for the given scope (importance > 0) and
+-- groups them by cosine similarity using union-find (O(N²) pairwise, capped
+-- at max_rows = 500 by default). Returns only multi-member clusters.
+-- Embeddings are stripped from the returned members.
+--
+-- Works on both backends:
+--   bruteforce — embedding is REAL[]; fetched directly.
+--   pgvector   — embedding is vector(N); cast to REAL[] in the SELECT so
+--                the Lua driver returns a parseable array.
+--
+-- Returns (clusters, err) where each cluster is:
+--   { ids={...}, titles={...}, members=[{row without embedding}] }
+-- ---------------------------------------------------------------------------
+function M.find_clusters(opts)
+    opts = opts or {}
+    local threshold = tonumber(opts.similarity_threshold) or 0.85
+    local max_rows  = math.min(tonumber(opts.max_rows) or 500, 5000)
+
+    -- Cast vector → REAL[] on the pgvector backend so Lua gets a Lua array.
+    local emb_col = (_backend == "pgvector")
+        and "embedding::REAL[] AS embedding"
+        or  "embedding"
+
+    local conds = { "importance > 0" }
+    if opts.scope then
+        table.insert(conds, "scope = " .. db.escape_literal(opts.scope))
+    end
+
+    local sql = ([[
+        SELECT %s, %s
+        FROM %s
+        WHERE %s
+        ORDER BY importance DESC, updated_at DESC
+        LIMIT %d
+    ]]):format(RETURN_COLS, emb_col, tbl(), table.concat(conds, " AND "), max_rows)
+
+    local rows, qerr = db.query(sql)
+    if not rows then return nil, "find_clusters: db error: " .. tostring(qerr) end
+    if #rows == 0 then return {}, nil end
+
+    -- Union-Find with path compression.
+    local parent = {}
+    for i = 1, #rows do parent[i] = i end
+
+    local function find(i)
+        while parent[i] ~= i do
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        end
+        return i
+    end
+
+    -- O(N²) pairwise similarity. Default cap (500 rows) keeps this < 1s
+    -- in plain Lua 5.1 at 384 dimensions.
+    for i = 1, #rows do
+        for j = i + 1, #rows do
+            if _cosine(rows[i].embedding, rows[j].embedding) >= threshold then
+                local ri, rj = find(i), find(j)
+                if ri ~= rj then parent[ri] = rj end
+            end
+        end
+    end
+
+    -- Group indices by root.
+    local groups = {}
+    for i = 1, #rows do
+        local root = find(i)
+        groups[root] = groups[root] or {}
+        table.insert(groups[root], i)
+    end
+
+    -- Build result: only multi-member groups; strip embeddings.
+    local result = {}
+    for _, indices in pairs(groups) do
+        if #indices > 1 then
+            local ids, titles, members = {}, {}, {}
+            for _, idx in ipairs(indices) do
+                local m = rows[idx]
+                table.insert(ids, m.id)
+                table.insert(titles, m.title)
+                local mc = {}
+                for k, v in pairs(m) do if k ~= "embedding" then mc[k] = v end end
+                table.insert(members, mc)
+            end
+            table.sort(ids)
+            table.insert(result, { ids = ids, titles = titles, members = members })
+        end
+    end
+
+    return result, nil
+end
+
+-- ---------------------------------------------------------------------------
 -- list_by_scope
 -- Returns up to `limit` rows from the given scope, oldest first (so the
 -- summarizer sees them in conversational order). Used by promote().

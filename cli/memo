@@ -14,6 +14,12 @@
 #   memo delete  ID
 #   memo summarize [--scope S] [--dry-run] [--weight-threshold F] [--retention-days N]
 #   memo promote --from FROM_SCOPE --to TO_SCOPE [--delete-source] [--dry-run] [--limit N]
+#   memo context QUERY [--scope SCOPE] [--limit N] [--no-kg] [--format text|json]
+#   memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
+#                    [--decay-threshold F] [--max-rows N]
+#   memo calibrate [--scope SCOPE] [--root DIR] [--no-git] [--no-comments] [--dry-run]
+#                  [--probe-only] [--multilingual] [--long] [--hosted] [--allow-hash]
+#                  [--write PATH]
 #   memo secret-store  NAME [--desc DESCRIPTION] [--file PATH]
 #   memo secret-list
 #   memo secret-delete NAME
@@ -21,7 +27,6 @@
 #                               [--form FIELD=VALUE]... [--form-file FIELD:PATH]
 #                               [--timeout-ms N]
 #   memo migrate         Print all luamemo migration SQL to stdout (pipe to psql)
-#   memo init    [--non-interactive] [--multilingual] [--long] [--hosted] [--allow-hash] [--write PATH] [--root DIR]
 #   memo doctor  [--setup PATH] [--json]
 
 set -euo pipefail
@@ -408,7 +413,272 @@ cmd_promote() {
         -d "$json" | jq .
 }
 
-# Find a Lua interpreter for local subcommands (init, doctor) that bypass
+# memo context QUERY [--scope SCOPE] [--limit N] [--no-kg] [--format text|json]
+# Assembles a compact, prompt-injection-ready context block from search results
+# and optional KG ground-truth facts. All processing is local — no cloud calls.
+cmd_context() {
+    require_jq
+    local q="${1:-}"
+    if [[ -z "$q" ]]; then
+        echo "Usage: memo context QUERY [--scope SCOPE] [--limit N] [--no-kg] [--format text|json]" >&2
+        exit 1
+    fi
+    shift
+
+    local scope="" limit=10 no_kg=false format="text"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scope)  scope="$2";  shift 2 ;;
+            --limit)  limit="$2";  shift 2 ;;
+            --no-kg)  no_kg=true;  shift   ;;
+            --format) format="$2"; shift 2 ;;
+            *) echo "memo context: unknown arg: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    local search_args=(--data-urlencode "q=$q" --data-urlencode "limit=$limit")
+    [[ -n "$scope" ]] && search_args+=(--data-urlencode "scope=$scope")
+
+    local mem_json
+    mem_json=$(curl -sS -G "${MEMO_URL}/search" "${TOKEN_HEADER[@]}" "${search_args[@]}")
+
+    local kg_json=""
+    if [[ "$no_kg" == "false" ]] && [[ -n "$scope" ]]; then
+        kg_json=$(curl -sS -G "${MEMO_URL}/kg/query" "${TOKEN_HEADER[@]}" \
+            --data-urlencode "scope=$scope" \
+            --data-urlencode "limit=20" 2>/dev/null) || kg_json='{"ok":false}'
+    fi
+
+    if [[ "$format" == "json" ]]; then
+        jq -n \
+            --argjson mem "$mem_json" \
+            --argjson kg "${kg_json:-null}" \
+            '{memories: ($mem.results // []), kg_facts: (if $kg then ($kg.results // []) else [] end)}'
+        return
+    fi
+
+    # Text format: compact, prompt-injection-ready block.
+    echo "=== MEMORY CONTEXT ==="
+    [[ -n "$scope" ]] && echo "scope: $scope"
+    echo "query: \"$q\""
+    echo ""
+
+    local mem_list
+    mem_list=$(printf '%s' "$mem_json" | jq -r '
+        (.results // []) |
+        if type == "array" then . else [.[]] end |
+        to_entries[] |
+        "[" + ((.key + 1) | tostring) + "] " + (.value.kind // "?") +
+        " \u2014 " + (.value.title // "") + "\n" + (.value.body // "") + "\n"
+    ' 2>/dev/null)
+
+    if [[ -n "$mem_list" ]]; then
+        echo "$mem_list"
+    else
+        echo "(no memories found)"
+        echo ""
+    fi
+
+    if [[ -n "$kg_json" ]] && [[ "$kg_json" != '{"ok":false}' ]]; then
+        local facts
+        facts=$(printf '%s' "$kg_json" | jq -r '
+            (.results // []) |
+            if type == "array" then . else [.[]] end |
+            .[] |
+            "\u2022 " + .subject + " " + .predicate + " " + .object
+        ' 2>/dev/null)
+        if [[ -n "$facts" ]]; then
+            echo "=== GROUND TRUTH (knowledge graph) ==="
+            echo "$facts"
+            echo ""
+        fi
+    fi
+
+    echo "=== END CONTEXT ==="
+}
+
+# memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
+#                  [--decay-threshold F] [--max-rows N]
+cmd_consolidate() {
+    require_jq
+    local json='{}'
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                json=$(printf '%s' "$json" | jq '. + {dry_run: true}')
+                shift
+                ;;
+            --*)
+                local key="${1#--}"; key="${key//-/_}"
+                local val="$2"
+                json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+                shift 2
+                ;;
+            *) echo "memo consolidate: unknown arg: $1" >&2; exit 1 ;;
+        esac
+    done
+    curl -sS -X POST "${MEMO_URL}/consolidate" \
+        "${TOKEN_HEADER[@]}" \
+        -H "Content-Type: application/json" \
+        -d "$json" | jq .
+}
+
+# memo calibrate — three-phase host probe, corpus health check, and codebase ingest.
+# Probe phase runs without MEMO_URL. Ingest phase requires a running API.
+cmd_calibrate() {
+    require_jq
+    local root="." scope="" dry_run=false no_git=false no_comments=false probe_only=false
+    local lua_extra_flags=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --root)        root="$2";        shift 2 ;;
+            --scope)       scope="$2";       shift 2 ;;
+            --dry-run)     dry_run=true;     shift   ;;
+            --no-git)      no_git=true;      shift   ;;
+            --no-comments) no_comments=true; shift   ;;
+            --probe-only)  probe_only=true;  shift   ;;
+            --non-interactive|--multilingual|--long|--hosted|--allow-hash)
+                lua_extra_flags+="[==[${1}]==],"; shift ;;
+            --write)
+                lua_extra_flags+="[==[--write]==],[==[${2}]==],"; shift 2 ;;
+            *) echo "memo calibrate: unknown arg: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    local lua; lua=$(find_lua) || {
+        echo "memo: no Lua interpreter found (tried lua5.1, luajit, lua5.3, lua5.4, lua)" >&2
+        exit 1
+    }
+
+    # ── Phase 1: host probe + embedder recommendation (no server required) ──
+    "$lua" -e "require('luamemo.cli.calibrate').run({[==[--root]==],[==[${root}]==],${lua_extra_flags}})"
+    [[ "$probe_only" == true ]] && return 0
+
+    # ── Phases 2+3: resolve MEMO_URL ────────────────────────────────────────
+    # Resolution order:
+    #   1. --url flag or $MEMO_URL env var (already in env from ~/.memorc load)
+    #   2. Auto-probe localhost:8765 (standard luamemo Docker Compose port)
+    #   3. Prompt once, save to ~/.memorc
+
+    local _auto_token_generated=false
+
+    if [[ -z "${MEMO_URL:-}" ]]; then
+        # Try the standard local dev port silently
+        local _probe_url="http://localhost:8765/api/memory"
+        if curl -sf --connect-timeout 1 "${_probe_url}/recent?limit=1" \
+                ${TOKEN_HEADER[@]+"${TOKEN_HEADER[@]}"} -o /dev/null 2>/dev/null; then
+            MEMO_URL="$_probe_url"
+            echo ""
+            echo "  Auto-detected server at $_probe_url"
+        else
+            echo ""
+            echo "  No server found at localhost:8765."
+            echo ""
+            echo -n "  Enter your MEMO_URL (e.g. http://localhost:8765/api/memory): "
+            read -r MEMO_URL
+            if [[ -z "$MEMO_URL" ]]; then
+                echo ""
+                echo "  ⚠  No server configured — memories will NOT be saved."
+                echo "     Re-run: memo calibrate"
+                return 0
+            fi
+            # Auto-generate a token if none set
+            if [[ -z "${MEMO_TOKEN:-}" ]]; then
+                MEMO_TOKEN=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40 2>/dev/null \
+                             || cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | head -c 40)
+                TOKEN_HEADER=(-H "Authorization: Bearer ${MEMO_TOKEN}")
+                _auto_token_generated=true
+            fi
+            # Persist to ~/.memorc
+            {
+                printf '\nMEMO_URL=%s\n' "$MEMO_URL"
+                [[ "$_auto_token_generated" == true ]] && printf 'MEMO_TOKEN=%s\n' "$MEMO_TOKEN"
+            } >> "$HOME/.memorc"
+            echo ""
+            echo "  Saved to ~/.memorc — future runs need no configuration."
+            [[ "$_auto_token_generated" == true ]] && \
+                echo "  Auto-generated token: $MEMO_TOKEN  (add to your app's auth_fn)"
+        fi
+    fi
+
+    # Auto-detect scope
+    if [[ -z "$scope" ]]; then
+        if [[ -n "${MEMO_SCOPE:-}" ]]; then
+            scope="$MEMO_SCOPE"
+        else
+            local remote; remote=$(git -C "$root" remote get-url origin 2>/dev/null || echo "")
+            if [[ -n "$remote" ]]; then
+                scope="repo:$(basename "$remote" .git)"
+            else
+                scope="repo:$(basename "$(cd "$root" && pwd)")"
+            fi
+        fi
+    fi
+
+    echo ""
+    echo "Ingesting codebase → scope: $scope"
+
+    # Get last calibrated commit for incremental git scanning
+    local since_sha=""
+    since_sha=$(curl -sS -G "${MEMO_URL}/kg/query" "${TOKEN_HEADER[@]}" \
+        --data-urlencode "scope=$scope" \
+        --data-urlencode "subject=calibrate" \
+        --data-urlencode "predicate=last_commit" 2>/dev/null | \
+        jq -r '(.results // []) | if type=="array" then .[0] else ."1" end | .object // empty' \
+        2>/dev/null || echo "")
+    [[ -n "$since_sha" ]] && echo "  (incremental: commits since ${since_sha:0:7})"
+
+    # Build Lua flags for the scan phase
+    local scan_flags="[==[--scan]==],[==[--scope]==],[==[${scope}]==],[==[--root]==],[==[${root}]==],"
+    [[ -n "$since_sha" ]] && scan_flags+="[==[--since-commit]==],[==[${since_sha}]==],"
+    [[ "$no_git" == true      ]] && scan_flags+="[==[--no-git]==],"
+    [[ "$no_comments" == true ]] && scan_flags+="[==[--no-comments]==],"
+
+    # ── Phase 3: scan → POST /write ─────────────────────────────────────────
+    local count=0 errors=0
+    while IFS= read -r mem_line; do
+        [[ -z "$mem_line" ]] && continue
+        if [[ "$dry_run" == true ]]; then
+            local title; title=$(printf '%s' "$mem_line" | jq -r '.title // "(no title)"' 2>/dev/null)
+            echo "  [dry-run] $title"
+            (( count++ )) || true
+        else
+            local resp
+            resp=$(curl -sS -X POST "${MEMO_URL}/write" \
+                "${TOKEN_HEADER[@]}" \
+                -H "Content-Type: application/json" \
+                -d "$mem_line" 2>/dev/null)
+            if printf '%s' "$resp" | jq -e '.ok' >/dev/null 2>&1; then
+                local title; title=$(printf '%s' "$resp" | jq -r '.result.title // "(ok)"' 2>/dev/null)
+                echo "  + $title"
+                (( count++ )) || true
+            else
+                (( errors++ )) || true
+            fi
+        fi
+    done < <("$lua" -e "require('luamemo.cli.calibrate').run({${scan_flags}})")
+
+    echo ""
+    if [[ "$dry_run" == true ]]; then
+        echo "  [dry-run] Would write $count memories. Re-run without --dry-run to apply."
+    else
+        echo "  Done: $count memories written ($errors errors) to scope=$scope"
+    fi
+
+    # Update KG cursor so next calibrate only processes new commits
+    if [[ "$dry_run" != true ]] && [[ "$no_git" != true ]]; then
+        local head_sha; head_sha=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo "")
+        if [[ -n "$head_sha" ]]; then
+            curl -sS -X POST "${MEMO_URL}/kg/assert" "${TOKEN_HEADER[@]}" \
+                -H "Content-Type: application/json" \
+                -d "{\"scope\":\"${scope}\",\"subject\":\"calibrate\",\"predicate\":\"last_commit\",\"object\":\"${head_sha}\",\"supersede\":true}" \
+                >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+# Find a Lua interpreter for local subcommands (calibrate, doctor) that bypass
 # the HTTP API and load the library modules directly.
 find_lua() {
     for cand in lua5.1 luajit lua5.3 lua5.4 lua; do
@@ -435,16 +705,16 @@ cmd_local_lua() {
 }
 
 usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
 }
 
 [[ $# -lt 1 ]] && usage
 sub="$1"; shift
 
-# init/doctor/migrate are local subcommands and don't use MEMO_URL.
+# calibrate/doctor/migrate: probe phase doesn't need MEMO_URL.
 case "$sub" in
-    init|doctor|migrate) ;;
+    calibrate|doctor|migrate) ;;
     *) : "${MEMO_URL:?MEMO_URL is not set}" ;;
 esac
 
@@ -457,12 +727,14 @@ case "$sub" in
     delete) cmd_delete "$@" ;;
     summarize) cmd_summarize "$@" ;;
     promote) cmd_promote "$@" ;;
+    context) cmd_context "$@" ;;
+    consolidate) cmd_consolidate "$@" ;;
+    calibrate) cmd_calibrate "$@" ;;
     secret-store)   cmd_secret_store   "$@" ;;
     secret-list)    cmd_secret_list         ;;
     secret-delete)  cmd_secret_delete  "$@" ;;
     secret-execute) cmd_secret_execute "$@" ;;
     migrate) cmd_migrate ;;
-    init)    cmd_local_lua init   "$@" ;;
     doctor)  cmd_local_lua doctor "$@" ;;
     -h|--help|help) usage ;;
     *) echo "memo: unknown subcommand: $sub" >&2; usage ;;

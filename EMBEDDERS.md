@@ -8,11 +8,11 @@
 This guide shows the recommended setup and the gotchas. Every path
 ends with the same `memory.setup({...})` snippet — pick one and paste.
 
-> **Don't want to read?** Run `memo init` from your project root. It
-> probes your host (GPU, Docker, Ollama, RAM), asks two questions
-> (multilingual? long rows?), and prints a ready-to-paste `setup({...})`
-> snippet tailored to your hardware. After ingesting some rows, run
-> `memo doctor` to verify the fit (truncation count, p95 row size,
+> **Don't want to read?** Run `memo calibrate` from your project root. It
+> probes your host (GPU, Docker, Ollama, RAM) and prints a ready-to-paste
+> `setup({...})` snippet tailored to your hardware. On subsequent runs it
+> also ingests architectural decisions into the memory store. After
+> ingesting some rows, run `memo doctor` to verify the fit (truncation count, p95 row size,
 > backend scale).
 
 ---
@@ -54,7 +54,7 @@ docker exec -it ollama ollama pull nomic-embed-text
 
 ```lua
 require("luamemo").setup({
-    db_table = "lm_memories",
+    db_table         = "lapis_memory",
     embedder_url     = "http://localhost:11434/api/embeddings",
     embedder_adapter = "ollama",
     embedder_model   = "nomic-embed-text",
@@ -109,7 +109,7 @@ and the operator notes are at
 
 ```lua
 require("luamemo").setup({
-    db_table = "lm_memories",
+    db_table         = "lapis_memory",
     embedder_url     = "http://localhost:8081/embed",
     embedder_adapter = "tei",
     embedder_model   = "BAAI/bge-m3",
@@ -138,7 +138,7 @@ tokens, well-understood quality.
 
 ```lua
 require("luamemo").setup({
-    db_table = "lm_memories",
+    db_table         = "lapis_memory",
     embedder_url     = "https://api.openai.com/v1/embeddings",
     embedder_adapter = "openai",
     embedder_model   = "text-embedding-3-small",
@@ -223,7 +223,7 @@ or, worse, silently truncates without telling you. Setting
 | `voyage-3`                | 90000                         |
 | `embed-english-v3.0`      | 1500                          |
 
-`memo init` writes the right value into the snippet automatically.
+`memo calibrate` writes the right value into the snippet automatically.
 
 ---
 
@@ -243,12 +243,12 @@ If the data is regenerable (test data, scratch scope, etc.):
 
 ```sql
 -- pgvector backend: column type encodes dim, must be re-created
-DROP TABLE lm_memories;
+DROP TABLE lapis_memory;
 -- then re-run luamemo/schema_pgvector.sql with the new VECTOR(N)
 ```
 
 For the brute-force backend (`REAL[]`) the column has no fixed dim so
-you can just `TRUNCATE lm_memories` and re-write your data.
+you can just `TRUNCATE lapis_memory` and re-write your data.
 
 ### Option B — re-embed in place (preserves data)
 

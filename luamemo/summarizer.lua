@@ -237,4 +237,93 @@ function M.promote(opts)
     }
 end
 
+-- ---------------------------------------------------------------------------
+-- consolidate
+-- Three-phase maintenance run:
+--   Phase 1 — Expire decayed: memories whose effective importance has fallen
+--              below decay_threshold get importance = 0; they stop appearing
+--              in search results without being hard-deleted.
+--   Phase 2 — Cluster near-duplicates: fetch up to max_rows memories,
+--              pairwise cosine comparison, union-find grouping. Returns the
+--              cluster report even on dry_run (read-only diagnosis).
+--   Phase 3 — Merge clusters: if summarizer adapter ≠ "noop" and dry_run is
+--              false, call adapter.summarize() per cluster, write the merged
+--              memory, delete the originals via replace_with_summary().
+--
+-- @param opts table  scope, dry_run, similarity_threshold, decay_threshold,
+--                    max_rows
+-- @return table  { expired={ids}, clusters=[{ids,titles}],
+--                  merged={old_ids}, new_ids={new_ids}, errors={...} }
+-- ---------------------------------------------------------------------------
+function M.consolidate(opts)
+    opts = opts or {}
+    if not cfg then
+        return { expired = {}, clusters = {}, merged = {}, new_ids = {},
+                 errors = { "consolidate: not configured" } }
+    end
+
+    local dry_run = opts.dry_run and true or false
+    local result  = { expired = {}, clusters = {}, merged = {}, new_ids = {}, errors = {} }
+
+    -- Phase 1: expire decayed memories.
+    local expired, eerr = store.find_decayed({
+        scope           = opts.scope,
+        decay_threshold = opts.decay_threshold,
+        max_rows        = opts.max_rows,
+        apply           = not dry_run,
+    })
+    if not expired then
+        table.insert(result.errors, "phase1: " .. tostring(eerr))
+    else
+        result.expired = expired
+    end
+
+    -- Phase 2: find near-duplicate clusters.
+    local clusters, cerr = store.find_clusters({
+        scope                = opts.scope,
+        similarity_threshold = opts.similarity_threshold,
+        max_rows             = opts.max_rows,
+    })
+    if not clusters then
+        table.insert(result.errors, "phase2: " .. tostring(cerr))
+        return result
+    end
+
+    for _, c in ipairs(clusters) do
+        table.insert(result.clusters, { ids = c.ids, titles = c.titles })
+    end
+
+    -- Phase 3: merge clusters via adapter (skip when noop or dry_run).
+    local adapter_name = cfg.summarizer_adapter or "noop"
+    if not dry_run and adapter_name ~= "noop" then
+        local adapter, aerr = load_adapter(adapter_name)
+        if not adapter then
+            table.insert(result.errors, "phase3: " .. tostring(aerr))
+            return result
+        end
+
+        for _, c in ipairs(clusters) do
+            local sum, serr = adapter.summarize(c.members, cfg)
+            if not sum then
+                table.insert(result.errors,
+                    "merge [" .. table.concat(c.ids, ",") .. "]: " .. tostring(serr))
+            else
+                sum.scope = c.members[1].scope
+                local row, rerr = store.replace_with_summary(c.ids, sum)
+                if not row then
+                    table.insert(result.errors,
+                        "replace [" .. table.concat(c.ids, ",") .. "]: " .. tostring(rerr))
+                else
+                    table.insert(result.new_ids, row.id)
+                    for _, id in ipairs(c.ids) do
+                        table.insert(result.merged, id)
+                    end
+                end
+            end
+        end
+    end
+
+    return result
+end
+
 return M

@@ -181,6 +181,21 @@ function M.register(app, opts)
         return json(status, { ok = status == 200, result = result })
     end)
 
+    -- POST /consolidate  (maintenance: expire decayed + cluster dupes + merge)
+    app:post(prefix .. "/consolidate", function(self)
+        local denied = authorise(self); if denied then return denied end
+        local p = decode_body(self)
+        local summarizer = require("luamemo.summarizer")
+        local result = summarizer.consolidate({
+            scope                = p.scope,
+            dry_run              = p.dry_run == true or p.dry_run == "1" or p.dry_run == "true",
+            similarity_threshold = tonumber(p.similarity_threshold),
+            decay_threshold      = tonumber(p.decay_threshold),
+            max_rows             = tonumber(p.max_rows),
+        })
+        return json(200, { ok = true, result = result })
+    end)
+
     -- ---------------------------------------------------------------
     -- Knowledge-graph layer (Phase 16.5)
     -- ---------------------------------------------------------------

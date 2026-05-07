@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.2.4 — 2026-05-07
+
+- **`memo context QUERY`** — new CLI subcommand that assembles a compact,
+  prompt-injection-ready context block from `memory_search` + optional KG
+  facts in a single call. Zero cloud dependency: uses the already-configured
+  local embedder. Supports `--scope`, `--limit`, `--no-kg`, and
+  `--format text|json`.
+- **KG facts injected into `session_start` prompt** — `prompts/get` now
+  fetches live facts from `/kg/query` for the requested scope and prepends
+  a "Ground truth facts (knowledge graph — treat as authoritative)" block
+  before the free-text memory guidance. Degrades silently when no facts exist
+  or the KG table has not been migrated.
+- **`memo consolidate`** — new CLI subcommand backed by `POST /consolidate`
+  and `memory_consolidate` MCP tool. Runs three maintenance phases:
+  - Phase 1 (always): set `importance = 0` on memories whose effective
+    importance (after decay) has fallen below `decay_threshold` (default 0.05).
+  - Phase 2 (always): fetch up to `max_rows` memories, compute pairwise cosine
+    similarity via union-find, report near-duplicate clusters
+    (`similarity_threshold` default 0.85).
+  - Phase 3 (only if a non-noop summarizer is configured): merge each cluster
+    into a single summary row via `replace_with_summary`.
+  Use `--dry-run` to inspect without applying any changes.
+- `store.find_decayed(opts)` and `store.find_clusters(opts)` added.
+- `summarizer.consolidate(opts)` added.
+- **MCP `prompts` capability** added to `mcp/server.lua`. Advertises
+  `prompts: {}` in `initialize` capabilities and implements `prompts/list`
+  and `prompts/get`. A single built-in prompt, `session_start`, gives any
+  MCP client (Claude Desktop, Cursor, Copilot Agent Mode, …) a standard
+  hook to load persistent context at the start of every session and write
+  key decisions as work progresses. Accepts optional `scope` and `project`
+  arguments; defaults to `MEMO_SCOPE` env var.
+- **Tighter tool descriptions**: `memory_search`, `memory_write`, and
+  `memory_recent` now include explicit guidance on *when* to call them
+  so clients that don't invoke `session_start` still get nudged correctly.
+- `SERVER_VERSION` bumped to `"0.2.4"` to match library version.
+- **`memo calibrate`** replaces `memo init` entirely. Three-phase command:
+  - Phase 1 (no server required): host probe (GPU, Docker, Ollama, RAM) +
+    embedder recommendation + ready-to-paste `setup({...})` snippet.
+  - Phase 2: corpus health check (requires `MEMO_URL`).
+  - Phase 3: codebase ingest — automatically scans agent instruction files
+    (`.github/copilot-instructions.md`, `AGENTS.md`, `.cursorrules`, …),
+    ADR/decision documents, top-level markdown (`README`, `ARCHITECTURE`, …),
+    tagged source comments (`ARCH:`, `DECISION:`, `DESIGN:`), and recent git
+    commits. Uses `dedup_strategy = "update"` so reruns refresh content
+    without duplicating. KG cursor (`calibrate last_commit`) makes git
+    scanning incremental on subsequent runs. Scope auto-detected from
+    `MEMO_SCOPE` → git remote basename → directory name.
+  `luamemo.cli.init` removed; `luamemo.cli.calibrate` added to rockspec.
+
+---
+
 ## 0.2.3 — 2026-05-07
 
 - **Remove web UI** (`luamemo/web.lua` deleted). The `memo` CLI already

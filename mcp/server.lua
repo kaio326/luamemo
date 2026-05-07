@@ -41,7 +41,7 @@ local DEBUG      = os.getenv("MEMO_DEBUG") == "1"
 
 local PROTOCOL_VERSION = "2024-11-05"
 local SERVER_NAME      = "luamemo"
-local SERVER_VERSION   = "0.2.0"
+local SERVER_VERSION   = "0.2.4"
 
 -- ===========================================================================
 -- Logging (stderr only — stdout is reserved for JSON-RPC frames)
@@ -189,8 +189,10 @@ local Tools = {}
 
 Tools.memory_write = {
     description = "Store a new memory in the persistent vector store. "
-        .. "Use this to record decisions, facts, plans, or snippets the "
-        .. "agent should remember across sessions.",
+        .. "Call this whenever you make an architectural decision, resolve a bug, "
+        .. "choose a design pattern, or establish any fact that should survive to "
+        .. "the next session. Also call at the end of a session to write a brief "
+        .. "summary of what was done and what comes next.",
     inputSchema = {
         type = "object",
         properties = {
@@ -223,7 +225,10 @@ Tools.memory_write = {
 Tools.memory_search = {
     description = "Hybrid search (vector + full-text) across stored memories. "
         .. "Returns top-K matches ordered by blended score, weighted by each "
-        .. "memory's importance and time-decay.",
+        .. "memory's importance and time-decay. "
+        .. "CALL THIS AT THE START OF EVERY SESSION with a broad query such as "
+        .. "'recent decisions and context' to reload what was decided in prior "
+        .. "sessions before starting any work.",
     inputSchema = {
         type = "object",
         properties = {
@@ -260,7 +265,9 @@ Tools.memory_search = {
 }
 
 Tools.memory_recent = {
-    description = "List the most recently created memories in a scope.",
+    description = "List the most recently created memories in a scope. "
+        .. "Use at session start alongside memory_search to quickly orient "
+        .. "yourself on the latest stored context.",
     inputSchema = {
         type = "object",
         properties = {
@@ -369,6 +376,38 @@ Tools.memory_promote = {
     },
     handler = function(args)
         return http_request("POST", "/promote", nil, args)
+    end,
+}
+
+Tools.memory_consolidate = {
+    description = "Maintenance: expire fully-decayed memories, detect near-duplicate clusters, "
+        .. "and optionally merge them via the configured summarizer. "
+        .. "Run periodically to keep the store compact and retrieval quality high. "
+        .. "With dry_run=true, reports what would change without modifying anything.",
+    inputSchema = {
+        type = "object",
+        properties = {
+            scope = { type = "string", description = "Scope to consolidate. Omit to consolidate all scopes." },
+            dry_run = {
+                type = "boolean",
+                description = "Report changes without applying them (default false).",
+            },
+            similarity_threshold = {
+                type = "number", minimum = 0.5, maximum = 1.0,
+                description = "Cosine similarity above which two memories are near-duplicates (default 0.85).",
+            },
+            decay_threshold = {
+                type = "number", minimum = 0, maximum = 1,
+                description = "Effective importance below which a decayed memory is expired (default 0.05).",
+            },
+            max_rows = {
+                type = "integer", minimum = 1, maximum = 5000,
+                description = "Max memories to inspect per run (default 500).",
+            },
+        },
+    },
+    handler = function(args)
+        return http_request("POST", "/consolidate", nil, args)
     end,
 }
 
@@ -493,6 +532,30 @@ Tools.secret_execute = {
 }
 
 -- ===========================================================================
+-- Prompts  (MCP prompts capability — session workflow guidance)
+-- ===========================================================================
+local Prompts = {}
+
+Prompts.session_start = {
+    description = "Load persistent memory context at the start of a session. "
+        .. "Instructs the agent to search stored memories before starting work, "
+        .. "write key decisions as it goes, and summarise at the end.",
+    arguments = {
+        {
+            name        = "scope",
+            description = "Memory scope to load (e.g. 'repo:myproject', 'global'). "
+                .. "Defaults to MEMO_SCOPE env var.",
+            required    = false,
+        },
+        {
+            name        = "project",
+            description = "Short project or task name used to focus the search query.",
+            required    = false,
+        },
+    },
+}
+
+-- ===========================================================================
 -- JSON-RPC framing
 -- ===========================================================================
 local function send(msg)
@@ -525,7 +588,8 @@ function Methods.initialize(_, _)
             version = SERVER_VERSION,
         },
         capabilities = {
-            tools = {},  -- presence of the key advertises tool support
+            tools   = {},  -- presence of the key advertises tool support
+            prompts = {},  -- presence of the key advertises prompt support
         },
     }
 end
@@ -567,6 +631,96 @@ Methods["tools/call"] = function(params, _)
     return {
         isError = false,
         content = { { type = "text", text = pretty } },
+    }
+end
+
+Methods["prompts/list"] = function(_, _)
+    local list = {}
+    for name, def in pairs(Prompts) do
+        local entry = { name = name, description = def.description }
+        if def.arguments then entry.arguments = def.arguments end
+        list[#list + 1] = entry
+    end
+    return { prompts = list }
+end
+
+Methods["prompts/get"] = function(params, _)
+    local name = params and params.name
+    local args = (params and params.arguments) or {}
+    if not (name and Prompts[name]) then
+        return nil, { code = -32602, message = "Unknown prompt: " .. tostring(name) }
+    end
+
+    local scope   = args.scope   or MEMO_SCOPE or "global"
+    local project = args.project or scope
+
+    -- Fetch KG ground-truth facts for the scope (best-effort; fails silently
+    -- when the lm_kg_facts table does not exist or the scope has no entries).
+    local kg_section = ""
+    local kg_result  = http_request("GET", "/kg/query",
+        { scope = scope, limit = "20" }, nil)
+    if kg_result and kg_result.ok and kg_result.results then
+        local facts = kg_result.results
+        -- results can be an array or an empty object (cjson empty-table quirk).
+        local fact_list = {}
+        if type(facts) == "table" then
+            if #facts > 0 then
+                fact_list = facts
+            else
+                for _, v in pairs(facts) do
+                    if type(v) == "table" then table.insert(fact_list, v) end
+                end
+            end
+        end
+        if #fact_list > 0 then
+            local lines = {
+                "",
+                "Ground truth facts (knowledge graph — treat as authoritative):",
+            }
+            for _, f in ipairs(fact_list) do
+                local line = string.format("- %s %s %s",
+                    tostring(f.subject   or "?"),
+                    tostring(f.predicate or "?"),
+                    tostring(f.object    or "?"))
+                if f.valid_from then
+                    line = line .. " [since " .. tostring(f.valid_from):sub(1, 10) .. "]"
+                end
+                table.insert(lines, line)
+            end
+            kg_section = table.concat(lines, "\n")
+        end
+    end
+
+    local text = table.concat({
+        "You are starting a new working session. Before doing anything else:",
+        "",
+        "1. Call memory_search with query=\"recent decisions and context\" "
+            .. "and scope=\"" .. scope .. "\" to reload what was decided in previous sessions.",
+        "2. Call memory_recent with scope=\"" .. scope .. "\" and limit=10 "
+            .. "to see the latest stored memories.",
+        "",
+        "As you work:",
+        "- Call memory_write whenever you make an architectural decision, fix a bug root-cause, "
+            .. "choose a design pattern, or establish any fact that should survive to the next session.",
+        "- Use kind=\"decision\" for choices made, kind=\"fact\" for established truths, "
+            .. "kind=\"plan\" for future work.",
+        "- Set importance 3-7 for things that matter; leave the default (1) for routine notes.",
+        "",
+        "At the end of the session:",
+        "- Call memory_write with a brief session summary: what was done, what was decided, what is next.",
+        "- If working in a temporary scope (e.g. session:<id>), call memory_promote to "
+            .. "roll it into a long-term scope so the next session can find it.",
+        "",
+        "Scope for this session: " .. scope,
+        "Project: "              .. project,
+        kg_section,
+    }, "\n")
+
+    return {
+        description = Prompts[name].description,
+        messages = {
+            { role = "user", content = { type = "text", text = text } },
+        },
     }
 end
 

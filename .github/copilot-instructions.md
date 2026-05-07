@@ -11,8 +11,8 @@ It is **not** a runnable app by itself — it is consumed by a host app or eval 
 
 - **GitHub**: https://github.com/kaio326/luamemo
 - **LuaRocks package name**: `luamemo`
-- **Current version**: `0.2.3-1` (tag `v0.2.3`)
-- **Primary consumer**: the `portfolio` app at https://github.com/kaio326/portfolio
+- **Current version**: `0.2.4-1` (tag `v0.2.4`)
+- **Primary consumers**: any Lua application or AI agent that needs persistent semantic memory — Lapis/OpenResty apps, standalone Lua scripts, MCP-bridged agents (Claude Desktop, Cursor, Copilot Agent Mode), and eval harnesses
 
 ## Stack
 - **Language**: Lua 5.1 / LuaJIT (OpenResty or plain Lua 5.1+)
@@ -40,14 +40,14 @@ luamemo/           Core library modules
   embedders/            hash (pure-Lua, zero-deps)
   rerankers/            noop, ollama, openai, cross_encoder
   summarizers/          noop, ollama, openai
-  cli/                  memo init / memo doctor support modules
+  cli/                  memo calibrate / memo doctor support modules
   migrations/           Idempotent SQL migrations (001–005)
 mcp/
   server.lua            Standalone CLI stdio MCP server (11 tools)
 cli/
-  memo                  Shell entrypoint (memo init, memo doctor, memo run)
+  memo                  Shell entrypoint (memo calibrate, memo doctor, memo run)
 examples/               Usage documentation
-luamemo-0.2.3-1.rockspec
+luamemo-0.2.4-1.rockspec
 ```
 
 ## Architecture
@@ -73,6 +73,9 @@ Config via env vars: `MEMO_URL` (required), `MEMO_TOKEN`, `MEMO_SCOPE`, `MEMO_DE
 Tools table (each entry: `{ description, inputSchema, handler }`):
 - `memory_write`, `memory_search`, `memory_recent`, `memory_get`, `memory_update`, `memory_delete`, `memory_promote`
 - `secret_list`, `secret_store`, `secret_delete`, `secret_execute` ← NEW in 0.1.2
+
+Prompts table (each entry: `{ description, arguments?, text-builder }`):
+- `session_start` — instructs the agent to load context at session start, write decisions during work, and summarise at end. Accepts optional `scope` and `project` arguments.
 
 ### Config (`M.setup(config)`)
 All config keys set on `M.config`. `M.setup()` is called once by the host app at startup. Key fields:
@@ -140,13 +143,13 @@ Write `{secret}` anywhere in `url`, header values, or `body` — it is substitut
 - All new `luamemo/*.lua` modules must be added to `build.modules`
 - After creating a new rockspec: `git tag v<version> && git push origin v<version>`, then `luarocks upload luamemo-<version>-<revision>.rockspec`
 
-## Consumer App Wiring (portfolio)
-The portfolio app (`helpers/memory.lua`) calls `M.setup()` wrapped in `pcall` — failures log to `ngx.ERR` and never block app startup. To enable secrets in the portfolio:
+## Example Consumer Wiring (Lapis/OpenResty app)
+A Lapis app calls `M.setup()` wrapped in `pcall` — failures log to `ngx.ERR` and never block app startup. To enable secrets:
 1. Add `secrets_file = "/app/data/lm_secrets.json"` and `master_key_path = "/run/secrets/lm_master_key"` to the `setup({})` call in `helpers/memory.lua`
 2. Generate key: `openssl rand -hex 32 > secrets/lm_master_key.txt`
 3. Add `lm_master_key` to `docker-compose.yml` secrets section
 4. Mount a persistent volume for `/app/data/` so the secrets file survives container restarts
-5. Bump `luarocks-5.1 install luamemo` version in portfolio's `Dockerfile` to `0.2.3-1`
+5. Bump `luarocks-5.1 install luamemo` version in your `Dockerfile` to `0.2.3-1`
 
 ## Implementation Philosophy
 When making changes to this codebase, always build things the right way — no shortcuts, no deferred abstractions, no "we'll fix it later." If a component needs to be rewritten to be correct, rewrite it. Leaving known technical debt in place is never acceptable. The goal is a codebase that does not need to be revisited for the same problem twice.
@@ -156,6 +159,12 @@ When making changes to this codebase, always build things the right way — no s
 # The library has no runnable dev server — test via a host Lapis app.
 # For quick Lua syntax checks:
 luac -p luamemo/secrets.lua
+
+# Calibrate (host probe + codebase ingest) — run whenever the codebase changes:
+MEMO_URL=http://localhost:8765/api/memory MEMO_TOKEN=dev-token \
+  memo calibrate --scope repo:luamemo
+# First run (no server): probe-only mode (prints config snippet)
+memo calibrate --probe-only
 
 # Push a new version
 git tag v0.2.X && git push origin main v0.2.X
@@ -184,7 +193,8 @@ Types: `feat`, `fix`, `refactor`, `chore`, `docs`.
 | `luamemo/crypto.lua` | Pure-Lua AES-256-CBC + HMAC-SHA256 + CSPRNG |
 | `luamemo/secrets.lua` | AES-256-CBC secret storage (JSON file) + execute_with_secret |
 | `luamemo/kg.lua` | Knowledge-graph fact store |
+| `luamemo/cli/calibrate.lua` | Host probe + embedder recommendation + codebase ingest (replaces init) |
 | `mcp/server.lua` | Standalone MCP stdio server (11 tools) |
-| `cli/memo` | CLI entrypoint (memo init, doctor, run, and all HTTP-API commands) |
-| `luamemo-0.2.3-1.rockspec` | Current LuaRocks package spec |
+| `cli/memo` | CLI entrypoint (memo calibrate, doctor, and all HTTP-API commands) |
+| `luamemo-0.2.4-1.rockspec` | Current LuaRocks package spec |
 | `CHANGELOG.md` | Release notes |
