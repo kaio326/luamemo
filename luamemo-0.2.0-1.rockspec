@@ -85,6 +85,7 @@ build = {
         ["luamemo.kg"]                 = "luamemo/kg.lua",
         ["luamemo.rerank"]             = "luamemo/rerank.lua",
         ["luamemo.secrets"]            = "luamemo/secrets.lua",
+        ["luamemo.crypto"]             = "luamemo/crypto.lua",
         ["luamemo.summarizer"]         = "luamemo/summarizer.lua",
         ["luamemo.tune_weights"]       = "luamemo/tune_weights.lua",
         ["luamemo.util"]               = "luamemo/util.lua",
