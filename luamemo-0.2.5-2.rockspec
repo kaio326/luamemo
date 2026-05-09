@@ -1,6 +1,6 @@
 rockspec_format = "3.0"
 package = "luamemo"
-version = "0.2.5-1"
+version = "0.2.5-2"
 
 source = {
     url = "git+https://github.com/kaio326/luamemo.git",
