@@ -36,6 +36,7 @@ local _crypto = require("luamemo.crypto")
 
 local cjson = require("cjson.safe")
 local http  = require("luamemo.http")
+local util  = require("luamemo.util")
 
 local M = {}
 
@@ -63,13 +64,7 @@ local function from_hex(s)
     end))
 end
 
-local function _read_file(path)
-    local f = io.open(path, "r")
-    if not f then return nil end
-    local s = f:read("*all")
-    f:close()
-    return s
-end
+local _read_file = util.read_file
 
 -- Parse a raw key string into a 32-byte binary key.
 -- Accepts: 64-char hex string OR a raw 32-byte string.
@@ -82,7 +77,7 @@ local function parse_key(raw)
     if #raw == 32 then
         return raw, nil
     end
-    return nil, ("master key must be 32 bytes (raw) or 64 hex chars, got %d chars"):format(#raw)
+    return nil, "master_key: invalid format (must be 32-byte raw or 64-char hex)"
 end
 
 local function _log_warn(msg)
@@ -126,12 +121,19 @@ local function save_store(store)
     f:write(data)
     f:close()
     -- Restrict permissions before renaming into place so the file is never
-    -- world-readable, even transiently. Works on all POSIX systems where
-    -- OpenResty runs; silently ignored on Windows.
+    -- world-readable, even transiently. Works on all POSIX systems; on
+    -- Windows (no chmod) the call fails silently — secure the directory
+    -- via NTFS ACLs instead.
     -- Shell-quote the path to prevent command injection if secrets_file
     -- contains spaces or shell metacharacters.
-    local quoted = "'" .. tostring(tmp):gsub("'", "'\\''" ) .. "'"
-    os.execute("chmod 600 " .. quoted)
+    local chmod_ok = os.execute("chmod 600 " .. util.shell_quote(tmp))
+    -- os.execute returns an integer (0=success) in Lua 5.1 and a boolean in 5.2+.
+    local chmod_failed = (chmod_ok == false)
+        or (type(chmod_ok) == "number" and chmod_ok ~= 0)
+    if chmod_failed and package.config:sub(1,1) ~= "\\" then
+        -- Non-Windows and chmod still failed — warn but do not abort.
+        _log_warn("chmod 600 failed for secrets temp file: " .. tmp)
+    end
     local ok = os.rename(tmp, _file_path)
     if not ok then
         return nil, "secrets: rename failed (" .. tmp .. " -> " .. _file_path .. ")"
@@ -254,8 +256,6 @@ local function _decrypt(stored)
     if not _key then return nil, "secrets: master key not configured" end
 
     -- Format: iv_hex:ct_hex:mac_hex
-
-    -- Format: iv_hex:ct_hex:mac_hex
     local iv_hex, ct_hex, mac_hex = stored:match(
         "^([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9a-fA-F]+)$")
     if not iv_hex or not ct_hex or not mac_hex then
@@ -266,12 +266,13 @@ local function _decrypt(stored)
     local expected, merr = _hmac_sha256(_key, iv_hex .. ":" .. ct_hex)
     if not expected then return nil, "secrets: " .. tostring(merr) end
     local expected_hex = to_hex(expected)
-    -- Constant-time comparison to prevent timing side-channel on the MAC.
+    -- Constant-time comparison: always iterate the full expected length so
+    -- an attacker cannot distinguish a wrong-length MAC from a wrong-content
+    -- MAC via response-time differences (timing side-channel).
     local mismatch = (#mac_hex ~= #expected_hex) and 1 or 0
-    for i = 1, math.min(#mac_hex, #expected_hex) do
-        if mac_hex:byte(i) ~= expected_hex:byte(i) then
-            mismatch = mismatch + 1
-        end
+    for i = 1, #expected_hex do
+        local got = (i <= #mac_hex) and mac_hex:byte(i) or 0
+        if got ~= expected_hex:byte(i) then mismatch = mismatch + 1 end
     end
     if mismatch ~= 0 then
         return nil, "secrets: authentication failed (ciphertext may be corrupt or tampered)"
@@ -407,6 +408,10 @@ local function _substitute(template, secret_value)
     -- Use a function replacement to prevent Lua from interpreting %0/%1-9
     -- sequences inside secret_value as gsub capture references, which would
     -- produce wrong output (%0 → "{secret}") or raise a runtime error (%1-9).
+    -- NOTE: {secret} substitution is intentionally plain-text replacement.
+    -- When the destination field is a JSON body, the caller must ensure the
+    -- secret value does not contain unescaped quotes/backslashes that would
+    -- break JSON structure.  Use headers or URL fields when in doubt.
     return (template:gsub("{secret}", function() return secret_value end))
 end
 
@@ -415,10 +420,9 @@ end
 -- String values have {secret} substituted.  File contents are read as-is.
 -- Returns body_string, content_type_header_value, err.
 local function _build_multipart(fields, secret_value)
-    -- Use enough entropy in the boundary to make collisions astronomically
-    -- unlikely without a crypto dependency.
-    local boundary = string.format("luamemoBoundary%08x%08x",
-        math.random(0, 0x7fffffff), math.random(0, 0x7fffffff))
+    -- Use CSPRNG for the boundary to guarantee both uniqueness and
+    -- resistance to boundary-injection attacks via attacker-controlled content.
+    local boundary = "luamemoBoundary" .. to_hex(_crypto.random_bytes(8))
 
     local parts = {}
     for field_name, spec in pairs(fields) do
@@ -426,6 +430,29 @@ local function _build_multipart(fields, secret_value)
         if type(spec) == "table" and spec.file then
             -- File upload part
             local fpath = spec.file
+            -- Path traversal guard: reject absolute paths and any path
+            -- component containing ".." to prevent reading arbitrary files.
+            if type(fpath) ~= "string" or fpath == ""
+                or fpath:find("..", 1, true)
+                or fpath:sub(1, 1) == "/"
+                or fpath:sub(1, 1) == "\\"
+                or fpath:match("^%a:") then
+                return nil, nil,
+                    "secrets: multipart: file path must be relative and cannot contain '..'"
+            end
+            -- Reject symlinks: a symlink could point outside the intended
+            -- directory tree (e.g. ./uploads/x -> /etc/passwd).
+            -- os.execute returns 0/true on POSIX when the file is NOT a
+            -- symlink; any non-zero / false result is treated as "is or may
+            -- be a symlink" — fail-closed on Windows too (no `test` command).
+            local symlink_check = os.execute(
+                "test ! -L " .. util.shell_quote(fpath) .. " 2>/dev/null")
+            local is_symlink = (symlink_check == false)
+                or (type(symlink_check) == "number" and symlink_check ~= 0)
+            if is_symlink then
+                return nil, nil,
+                    "secrets: multipart: symlinks are not allowed for field '" .. field_name .. "'"
+            end
             local f = io.open(fpath, "rb")
             if not f then
                 return nil, nil,
@@ -473,12 +500,50 @@ function M.execute_with_secret(name, opts)
         return nil, "secrets: body and multipart are mutually exclusive"
     end
 
-    -- SSRF guard: only allow http:// and https:// schemes to prevent requests
-    -- to cloud metadata services (169.254.169.254), internal hosts, or
-    -- non-HTTP protocols (file://, gopher://, dict://, …).
+    -- SSRF guard: only allow http:// and https:// schemes; also block known
+    -- internal/metadata IP ranges that cannot be reached from a user context.
     local scheme = opts.url:match("^([%w+%-%.]-)://")
     if scheme ~= "http" and scheme ~= "https" then
         return nil, "secrets: execute_with_secret only allows http:// and https:// URLs"
+    end
+    local host = opts.url:match("^https?://([^/:?#]+)")
+    if host then
+        local blocked = host == "localhost"
+            or host == "::1"
+            or host:match("^127%.")
+            or host:match("^169%.254%.")
+            or host:match("^10%.")
+            or host:match("^192%.168%.")
+            or host:match("^172%.1[6-9]%.")
+            or host:match("^172%.2%d%.")
+            or host:match("^172%.3[0-1]%.")
+        if blocked then
+            return nil, "secrets: SSRF blocked: disallowed host " .. host
+        end
+        -- DNS rebinding / split-horizon bypass guard.
+        -- Resolve the hostname and re-check the resulting IP against the
+        -- same private-range list.  Fail-closed: if DNS lookup fails or
+        -- returns nothing, the request is blocked.
+        local dns_ok, resolved_ip = pcall(function()
+            local sock = require("socket")
+            return sock.dns.toip(host)
+        end)
+        if not dns_ok or not resolved_ip then
+            return nil, "secrets: SSRF blocked: could not resolve host " .. host
+        end
+        local ip_blocked = resolved_ip == "127.0.0.1"
+            or resolved_ip == "::1"
+            or resolved_ip:match("^127%.")
+            or resolved_ip:match("^169%.254%.")
+            or resolved_ip:match("^10%.")
+            or resolved_ip:match("^192%.168%.")
+            or resolved_ip:match("^172%.1[6-9]%.")
+            or resolved_ip:match("^172%.2%d%.")
+            or resolved_ip:match("^172%.3[0-1].")
+        if ip_blocked then
+            return nil, "secrets: SSRF blocked: " .. host
+                .. " resolves to disallowed IP " .. resolved_ip
+        end
     end
 
     local store, serr = load_store()
@@ -516,7 +581,20 @@ function M.execute_with_secret(name, opts)
         req_body = opts.body and _substitute(opts.body, value) or nil
     end
 
-    value = nil  -- zero out before any I/O
+    -- Overwrite the local variable holding the plaintext secret.
+    -- NOTE: In Lua 5.1 strings are immutable and interned, so this
+    -- assignment does NOT securely erase memory — the backing bytes
+    -- remain live until the GC collects the string object, and may
+    -- persist in swap or core dumps afterward.
+    -- OS-level mitigations (deployment-agnostic):
+    --   ulimit -c 0          — disable core dumps so plaintext cannot
+    --                           be extracted from a crash file
+    --   swapoff -a           — disable swap so pages are never written
+    --                           to disk; or use an encrypted swap device
+    --   mlock / mlockall     — pin process memory (requires CAP_IPC_LOCK)
+    -- Short-lived process / container lifetime is the most practical
+    -- defence: the secret exists in RAM only for the duration of this call.
+    value = nil  -- clear reference; GC will reclaim when no other refs remain
 
     -- Update usage tracking (best-effort).
     local now = now_iso()

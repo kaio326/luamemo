@@ -2,46 +2,38 @@
 -- luamemo MCP stdio server (pure Lua, single-file)
 --
 -- Implements the Model Context Protocol (https://modelcontextprotocol.io/)
--- stdio transport: newline-delimited JSON-RPC 2.0 over stdin/stdout. Bridges
--- MCP clients (Claude Desktop, Cursor, Continue.dev, Copilot Agent Mode,
--- ...) to a running luamemo HTTP API.
---
--- Lua-First Policy
--- ----------------
--- This file is 100% Lua except for the HTTP transport, which shells out to
--- `curl` (see `http_request` below). See LIMITATION block there for the
--- reason and a future-work pointer.
+-- stdio transport: newline-delimited JSON-RPC 2.0 over stdin/stdout. Connects
+-- directly to PostgreSQL via pgmoon — no HTTP intermediary required.
 --
 -- Configuration (env vars)
 -- ------------------------
---   MEMO_URL     REQUIRED  Base URL of the luamemo HTTP API,
---                          e.g. https://app.example.com/api/memory
---   MEMO_TOKEN   optional  Bearer token sent as Authorization header
---   MEMO_SCOPE   optional  Default scope applied when a tool call omits it
---   MEMO_DEBUG   optional  If "1", logs raw JSON-RPC frames to stderr
+--   MEMO_DB_URL       REQUIRED  PostgreSQL connection URL,
+--                               e.g. postgresql://user:pass@localhost:5432/luamemo
+--                               (Individual PG* vars also accepted; see luamemo.db)
+--   MEMO_SCOPE        optional  Default scope applied when a tool call omits it
+--   MEMO_SECRETS_FILE optional  Path to the JSON secrets file
+--   MEMO_MASTER_KEY   optional  64-hex-char master key for the secrets module
+--   MEMO_DEBUG        optional  If "1", logs raw JSON-RPC frames to stderr
 --
 -- Run manually for testing:
 --   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
---     | MEMO_URL=http://localhost:8080/api/memory lua mcp/server.lua
+--     | MEMO_DB_URL=postgresql://postgres:@127.0.0.1:5432/luamemo lua mcp/server.lua
 
 local cjson = require("cjson.safe")
+local util  = require("luamemo.util")
 
--- Seed the PRNG once at startup.  Seeding inside a function (as was done
--- previously) resets the sequence on every call; two requests within the
--- same second would produce identical temp filenames.
 math.randomseed(os.time() + math.floor(os.clock() * 1e6))
 
 -- ===========================================================================
 -- Config
 -- ===========================================================================
-local MEMO_URL   = os.getenv("MEMO_URL")
-local MEMO_TOKEN = os.getenv("MEMO_TOKEN")
-local MEMO_SCOPE = os.getenv("MEMO_SCOPE")
-local DEBUG      = os.getenv("MEMO_DEBUG") == "1"
+local MEMO_DB_URL = os.getenv("MEMO_DB_URL")
+local MEMO_SCOPE  = os.getenv("MEMO_SCOPE")
+local DEBUG       = os.getenv("MEMO_DEBUG") == "1"
 
 local PROTOCOL_VERSION = "2024-11-05"
 local SERVER_NAME      = "luamemo"
-local SERVER_VERSION   = "0.2.4"
+local SERVER_VERSION   = "0.2.5"
 
 -- ===========================================================================
 -- Logging (stderr only — stdout is reserved for JSON-RPC frames)
@@ -64,119 +56,36 @@ local function fatal(msg)
 end
 
 -- ===========================================================================
--- HTTP transport
+-- Library bootstrap
 -- ===========================================================================
--- LIMITATION (Lua-First exception): There is no ubiquitous, dependency-free,
--- pure-Lua HTTPS client suitable for a self-contained CLI. Options reviewed:
---   * lua-resty-http  -- requires OpenResty cosocket; not available outside
---                        nginx workers.
---   * lua-socket + lua-sec  -- requires LuaSocket and LuaSec rocks; LuaSec
---                              additionally requires OpenSSL headers at
---                              install time. Not safe to assume on user
---                              laptops where MCP clients run.
---   * lua-http  -- requires LuaJIT or Lua 5.3+ and several rocks.
---
--- Until a "lua-http-mini" library exists that ships as a single file with
--- no native deps and supports HTTPS, this server shells out to `curl`,
--- which is preinstalled on macOS, Linux, and modern Windows. When such a
--- library is built, replace `http_request()` with a pure-Lua call and
--- delete this comment.
--- ---------------------------------------------------------------------------
-
-local function shell_quote(s)
-    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+local _setup_done = false
+local function ensure_setup()
+    if _setup_done then return end
+    _setup_done = true
+    local ok, luamemo = pcall(require, "luamemo")
+    if not ok then
+        fatal("luamemo library not found — install via: luarocks install luamemo\n" .. tostring(luamemo))
+    end
+    local cfg = {
+        embedder_local = os.getenv("MEMO_EMBEDDER") or "hash",
+    }
+    if MEMO_DB_URL and MEMO_DB_URL ~= "" then cfg.db_url = MEMO_DB_URL end
+    local master_key = os.getenv("MEMO_MASTER_KEY")
+    if master_key and master_key ~= "" then cfg.master_key = master_key end
+    local secrets_file = os.getenv("MEMO_SECRETS_FILE")
+    if secrets_file and secrets_file ~= "" then cfg.secrets_file = secrets_file end
+    local pok, perr = pcall(luamemo.setup, cfg)
+    if not pok then
+        io.stderr:write("[luamemo-mcp] setup warning: " .. tostring(perr) .. "\n")
+    end
 end
 
--- query: table of { key=value } pairs to URL-encode
-local function urlencode(s)
-    return (tostring(s):gsub("[^%w%-_%.~]", function(c)
-        return string.format("%%%02X", c:byte())
-    end))
-end
-
-local function build_query(tbl)
-    if not tbl or not next(tbl) then return "" end
-    local parts = {}
-    for k, v in pairs(tbl) do
-        if v ~= nil then
-            parts[#parts + 1] = urlencode(k) .. "=" .. urlencode(v)
-        end
-    end
-    if #parts == 0 then return "" end
-    return "?" .. table.concat(parts, "&")
-end
-
---- Make an HTTP request via curl.
--- @param method "GET" | "POST"
--- @param path   string  appended to MEMO_URL
--- @param query  table|nil  query params
--- @param body   table|nil  JSON body
--- @return decoded_body table | nil
--- @return err          string | nil
-local function http_request(method, path, query, body)
-    if not MEMO_URL then
-        return nil, "MEMO_URL env var is not set"
-    end
-
-    local url = MEMO_URL .. path .. build_query(query)
-    local cmd = { "curl", "-sS", "-X", method, "-H", "Accept: application/json" }
-    if MEMO_TOKEN and MEMO_TOKEN ~= "" then
-        table.insert(cmd, "-H")
-        table.insert(cmd, "Authorization: Bearer " .. MEMO_TOKEN)
-    end
-
-    -- Lua's stock io.popen is unidirectional, so when there is a body we
-    -- materialize it to a temp file and pass it to curl with --data-binary @file.
-    local tmpname
-    if body then
-        -- Build the temp path ourselves instead of using os.tmpname() to
-        -- avoid the TOCTOU window between os.tmpname() returning a path and
-        -- io.open() creating the file (a local attacker could plant a symlink
-        -- in that window on world-writable /tmp).
-        local tmpdir = os.getenv("TMPDIR") or "/tmp"
-        tmpname = tmpdir .. "/lm_mcp_"
-            .. tostring(os.time()) .. "_"
-            .. tostring(math.random(100000000, 999999999)) .. ".json"
-        local tmpf, terr = io.open(tmpname, "wb")
-        if not tmpf then return nil, "tempfile: " .. tostring(terr) end
-        tmpf:write(cjson.encode(body))
-        tmpf:close()
-        table.insert(cmd, "-H")
-        table.insert(cmd, "Content-Type: application/json")
-        table.insert(cmd, "--data-binary")
-        table.insert(cmd, "@" .. tmpname)
-    end
-    table.insert(cmd, url)
-
-    local quoted = {}
-    for _, arg in ipairs(cmd) do quoted[#quoted + 1] = shell_quote(arg) end
-    local shell_cmd = table.concat(quoted, " ") .. " 2>/dev/null"
-
-    log("HTTP " .. method .. " " .. url)
-
-    local rh, rerr = io.popen(shell_cmd, "r")
-    if not rh then
-        if tmpname then os.remove(tmpname) end
-        return nil, "popen failed: " .. tostring(rerr)
-    end
-    local resp = rh:read("*a")
-    rh:close()
-    if tmpname then os.remove(tmpname) end
-
-    if not resp or resp == "" then
-        return nil, "empty response from server"
-    end
-
-    local decoded, derr = cjson.decode(resp)
-    if not decoded then
-        return nil, "invalid JSON response: " .. tostring(derr)
-            .. " (raw: " .. resp:sub(1, 200) .. ")"
-    end
-    return decoded
-end
+-- Coerce "true"/"1" strings to booleans (tool input always comes as JSON,
+-- so this is mainly for robustness when values are passed as strings).
+local to_bool = util.to_bool
 
 -- ===========================================================================
--- Tool implementations (1:1 with HTTP API)
+-- Tool implementations — direct library calls
 -- ===========================================================================
 local function with_default_scope(args)
     if MEMO_SCOPE and (not args.scope or args.scope == "") then
@@ -218,7 +127,21 @@ Tools.memory_write = {
         required = { "title", "body" },
     },
     handler = function(args)
-        return http_request("POST", "/write", nil, with_default_scope(args))
+        ensure_setup()
+        local store = require("luamemo.store")
+        local row, err, action = store.write(with_default_scope({
+            scope          = args.scope,
+            kind           = args.kind,
+            title          = args.title,
+            body           = args.body,
+            tags           = args.tags,
+            metadata       = args.metadata,
+            importance     = tonumber(args.importance),
+            decay_rate     = tonumber(args.decay_rate),
+            dedup_strategy = args.dedup_strategy,
+        }))
+        if not row then return nil, err end
+        return { ok = true, memory = row, action = action }
     end,
 }
 
@@ -242,25 +165,30 @@ Tools.memory_search = {
             },
             since = {
                 type = "string",
-                description = "Only return memories with updated_at >= this bound. Accepts an ISO 8601 date (YYYY-MM-DD) or full RFC3339 timestamp. Use to ask 'what did we discuss this week' instead of all-time.",
+                description = "Only return memories with updated_at >= this bound. Accepts an ISO 8601 date (YYYY-MM-DD) or full RFC3339 timestamp.",
             },
             ["until"] = {
                 type = "string",
-                description = "Only return memories with updated_at < this bound. Same format as since. Half-open interval semantics: [since, until).",
+                description = "Only return memories with updated_at < this bound. Half-open interval [since, until).",
             },
         },
         required = { "query" },
     },
     handler = function(args)
-        local q = { q = args.query }
-        if args.scope then q.scope = args.scope
-        elseif MEMO_SCOPE then q.scope = MEMO_SCOPE end
-        if args.kind  then q.kind  = args.kind  end
-        if args.limit then q.limit = tostring(args.limit) end
-        if args.ignore_decay then q.ignore_decay = "1" end
-        if args.since then q.since = args.since end
-        if args["until"] then q["until"] = args["until"] end
-        return http_request("GET", "/search", q, nil)
+        ensure_setup()
+        local store = require("luamemo.store")
+        local scope = args.scope or MEMO_SCOPE
+        local rows, err = store.search({
+            query        = args.query,
+            scope        = scope,
+            kind         = args.kind,
+            limit        = tonumber(args.limit),
+            ignore_decay = to_bool(args.ignore_decay),
+            since        = args.since,
+            ["until"]    = args["until"],
+        })
+        if not rows then return nil, err end
+        return { ok = true, results = rows }
     end,
 }
 
@@ -276,11 +204,15 @@ Tools.memory_recent = {
         },
     },
     handler = function(args)
-        local q = {}
-        if args.scope then q.scope = args.scope
-        elseif MEMO_SCOPE then q.scope = MEMO_SCOPE end
-        if args.limit then q.limit = tostring(args.limit) end
-        return http_request("GET", "/recent", q, nil)
+        ensure_setup()
+        local store = require("luamemo.store")
+        local scope = args.scope or MEMO_SCOPE
+        local rows, err = store.recent({
+            scope = scope,
+            limit = tonumber(args.limit),
+        })
+        if not rows then return nil, err end
+        return { ok = true, results = rows }
     end,
 }
 
@@ -292,7 +224,11 @@ Tools.memory_get = {
         required = { "id" },
     },
     handler = function(args)
-        return http_request("GET", "/" .. tonumber(args.id), nil, nil)
+        ensure_setup()
+        local store = require("luamemo.store")
+        local row, err = store.get(tonumber(args.id))
+        if not row then return nil, err end
+        return { ok = true, memory = row }
     end,
 }
 
@@ -321,8 +257,21 @@ Tools.memory_update = {
         required = { "id" },
     },
     handler = function(args)
-        local id = tonumber(args.id); args.id = nil
-        return http_request("POST", "/" .. id .. "/update", nil, args)
+        ensure_setup()
+        local store = require("luamemo.store")
+        local id = tonumber(args.id)
+        local row, err = store.update(id, {
+            title      = args.title,
+            body       = args.body,
+            tags       = args.tags,
+            metadata   = args.metadata,
+            importance = tonumber(args.importance),
+            decay_rate = tonumber(args.decay_rate),
+            kind       = args.kind,
+            scope      = args.scope,
+        })
+        if not row then return nil, err end
+        return { ok = true, memory = row }
     end,
 }
 
@@ -334,7 +283,11 @@ Tools.memory_delete = {
         required = { "id" },
     },
     handler = function(args)
-        return http_request("POST", "/" .. tonumber(args.id) .. "/delete", nil, {})
+        ensure_setup()
+        local store = require("luamemo.store")
+        local ok, err = store.delete(tonumber(args.id))
+        if not ok then return nil, err end
+        return { ok = true }
     end,
 }
 
@@ -375,7 +328,19 @@ Tools.memory_promote = {
         required = { "from_scope", "to_scope" },
     },
     handler = function(args)
-        return http_request("POST", "/promote", nil, args)
+        ensure_setup()
+        local summarizer = require("luamemo.summarizer")
+        local result, err = summarizer.promote({
+            from_scope    = args.from_scope,
+            to_scope      = args.to_scope,
+            delete_source = to_bool(args.delete_source),
+            dry_run       = to_bool(args.dry_run),
+            limit         = tonumber(args.limit),
+            min_rows      = tonumber(args.min_rows),
+        })
+        if not result then return nil, err end
+        local ok_flag = (result.promoted == 1 or result.reason == "no_rows")
+        return { ok = ok_flag, result = result }
     end,
 }
 
@@ -407,15 +372,22 @@ Tools.memory_consolidate = {
         },
     },
     handler = function(args)
-        return http_request("POST", "/consolidate", nil, args)
+        ensure_setup()
+        local summarizer = require("luamemo.summarizer")
+        local result, err = summarizer.consolidate({
+            scope                = args.scope,
+            dry_run              = to_bool(args.dry_run),
+            similarity_threshold = tonumber(args.similarity_threshold),
+            decay_threshold      = tonumber(args.decay_threshold),
+            max_rows             = tonumber(args.max_rows),
+        })
+        if not result then return nil, err end
+        return { ok = true, result = result }
     end,
 }
 
 -- ===========================================================================
 -- Secrets tools
--- These tools manage encrypted API keys and other credentials stored server-
--- side. The raw secret value is NEVER returned to the LLM; use
--- secret_execute to make HTTP requests with it substituted server-side.
 -- ===========================================================================
 
 Tools.secret_list = {
@@ -427,7 +399,13 @@ Tools.secret_list = {
         properties = {},
     },
     handler = function(_)
-        return http_request("GET", "/secrets", nil, nil)
+        ensure_setup()
+        local secrets = require("luamemo.secrets")
+        if not secrets.enabled() then
+            return nil, "secrets: not configured (secrets_file or master_key not set)"
+        end
+        local rows = secrets.list()
+        return { ok = true, secrets = rows }
     end,
 }
 
@@ -455,7 +433,16 @@ Tools.secret_store = {
         required = { "name", "value" },
     },
     handler = function(args)
-        return http_request("POST", "/secrets", nil, args)
+        ensure_setup()
+        local secrets = require("luamemo.secrets")
+        if not secrets.enabled() then
+            return nil, "secrets: not configured (secrets_file or master_key not set)"
+        end
+        if not args.name or args.name == "" then return nil, "name is required" end
+        if not args.value or args.value == "" then return nil, "value is required" end
+        local row, err = secrets.store(args.name, args.value, args.description)
+        if not row then return nil, err end
+        return { ok = true, secret = row }
     end,
 }
 
@@ -469,8 +456,11 @@ Tools.secret_delete = {
         required = { "name" },
     },
     handler = function(args)
-        local name = tostring(args.name)
-        return http_request("POST", "/secrets/" .. name .. "/delete", nil, {})
+        ensure_setup()
+        local secrets = require("luamemo.secrets")
+        local ok, err = secrets.delete(tostring(args.name))
+        if not ok then return nil, err end
+        return { ok = true }
     end,
 }
 
@@ -511,8 +501,7 @@ Tools.secret_execute = {
                 description = "Multipart/form-data fields. Each key is a field name. "
                     .. "String values are plain fields (may contain {secret}). "
                     .. "File fields must be objects: { file = '/absolute/path', content_type? = '...' }. "
-                    .. "Mutually exclusive with body. Example: "
-                    .. "{ rockspec_file = { file = '/app/luamemo-0.2.0-1.rockspec' } }",
+                    .. "Mutually exclusive with body.",
                 additionalProperties = true,
             },
             timeout_ms = {
@@ -525,9 +514,19 @@ Tools.secret_execute = {
         required = { "name", "url" },
     },
     handler = function(args)
+        ensure_setup()
+        local secrets = require("luamemo.secrets")
         local name = tostring(args.name)
-        args.name  = nil
-        return http_request("POST", "/secrets/" .. name .. "/execute", nil, args)
+        local body, err = secrets.execute_with_secret(name, {
+            url        = args.url,
+            method     = args.method,
+            headers    = args.headers,
+            body       = args.body,
+            multipart  = args.multipart,
+            timeout_ms = tonumber(args.timeout_ms),
+        })
+        if not body then return nil, err end
+        return { ok = true, response = body }
     end,
 }
 
@@ -588,8 +587,8 @@ function Methods.initialize(_, _)
             version = SERVER_VERSION,
         },
         capabilities = {
-            tools   = {},  -- presence of the key advertises tool support
-            prompts = {},  -- presence of the key advertises prompt support
+            tools   = {},
+            prompts = {},
         },
     }
 end
@@ -599,8 +598,12 @@ function Methods.ping(_, _)
 end
 
 Methods["tools/list"] = function(_, _)
-    local list = {}
-    for name, def in pairs(Tools) do
+    local list  = {}
+    local names = {}
+    for name in pairs(Tools) do names[#names + 1] = name end
+    table.sort(names)
+    for _, name in ipairs(names) do
+        local def = Tools[name]
         list[#list + 1] = {
             name        = name,
             description = def.description,
@@ -626,7 +629,6 @@ Methods["tools/call"] = function(params, _)
         }
     end
 
-    -- MCP tools/call returns content array. Render the JSON for the model.
     local pretty = cjson.encode(result)
     return {
         isError = false,
@@ -635,8 +637,12 @@ Methods["tools/call"] = function(params, _)
 end
 
 Methods["prompts/list"] = function(_, _)
-    local list = {}
-    for name, def in pairs(Prompts) do
+    local list  = {}
+    local names = {}
+    for name in pairs(Prompts) do names[#names + 1] = name end
+    table.sort(names)
+    for _, name in ipairs(names) do
+        local def   = Prompts[name]
         local entry = { name = name, description = def.description }
         if def.arguments then entry.arguments = def.arguments end
         list[#list + 1] = entry
@@ -654,30 +660,18 @@ Methods["prompts/get"] = function(params, _)
     local scope   = args.scope   or MEMO_SCOPE or "global"
     local project = args.project or scope
 
-    -- Fetch KG ground-truth facts for the scope (best-effort; fails silently
-    -- when the lm_kg_facts table does not exist or the scope has no entries).
+    -- Fetch KG ground-truth facts for the scope (best-effort; fails silently).
     local kg_section = ""
-    local kg_result  = http_request("GET", "/kg/query",
-        { scope = scope, limit = "20" }, nil)
-    if kg_result and kg_result.ok and kg_result.results then
-        local facts = kg_result.results
-        -- results can be an array or an empty object (cjson empty-table quirk).
-        local fact_list = {}
-        if type(facts) == "table" then
-            if #facts > 0 then
-                fact_list = facts
-            else
-                for _, v in pairs(facts) do
-                    if type(v) == "table" then table.insert(fact_list, v) end
-                end
-            end
-        end
-        if #fact_list > 0 then
+    local ok, kg = pcall(require, "luamemo.kg")
+    if ok then
+        ensure_setup()
+        local facts, _ = kg.query({ scope = scope, limit = 20 })
+        if facts and type(facts) == "table" and #facts > 0 then
             local lines = {
                 "",
                 "Ground truth facts (knowledge graph — treat as authoritative):",
             }
-            for _, f in ipairs(fact_list) do
+            for _, f in ipairs(facts) do
                 local line = string.format("- %s %s %s",
                     tostring(f.subject   or "?"),
                     tostring(f.predicate or "?"),
@@ -745,7 +739,6 @@ local function dispatch(line)
     local id     = msg.id
     local params = msg.params
 
-    -- Notifications have no id and require no response.
     if id == nil then
         local nh = Notifications[method]
         if nh then nh(params) end
@@ -768,14 +761,21 @@ local function dispatch(line)
 end
 
 local function main()
-    if not MEMO_URL then
-        fatal("MEMO_URL env var is required")
+    local have_db = (MEMO_DB_URL and MEMO_DB_URL ~= "")
+        or os.getenv("PGHOST") or os.getenv("PGDATABASE")
+    if not have_db then
+        io.stderr:write("[luamemo-mcp] WARNING: no database config found. "
+            .. "Set MEMO_DB_URL=postgresql://user:pass@host:5432/db "
+            .. "or individual PGHOST/PGDATABASE/PGUSER/PGPASSWORD env vars.\n")
+        io.stderr:flush()
     end
-    log("started; MEMO_URL=" .. MEMO_URL
-        .. (MEMO_SCOPE and (" MEMO_SCOPE=" .. MEMO_SCOPE) or "")
-        .. (MEMO_TOKEN and " (token set)" or " (no token)"))
+    local db_display = MEMO_DB_URL
+        and MEMO_DB_URL:gsub(":[^:@]+@", ":***@")  -- redact password from URL
+        or nil
+    log("started"
+        .. (db_display and (" MEMO_DB_URL=" .. db_display) or "")
+        .. (MEMO_SCOPE  and (" MEMO_SCOPE=" .. MEMO_SCOPE)  or ""))
 
-    -- Line-delimited JSON over stdin.
     while true do
         local line = io.read("*l")
         if not line then break end

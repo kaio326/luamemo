@@ -1,0 +1,466 @@
+-- luamemo.cli.api
+-- Single-operation dispatcher for cli/memo and mcp/server.lua.
+--
+-- Usage:
+--   lua -e "require('luamemo.cli.api').dispatch('write')"    < input.json
+--   lua -e "require('luamemo.cli.api').dispatch('search')"   < input.json
+--
+-- Input:  one JSON object on stdin (or second arg[])
+-- Output: one JSON object on stdout
+--
+-- Config: MEMO_DB_URL or individual PG* env vars (see luamemo.db).
+--   Optional: MEMO_MASTER_KEY, MEMO_SECRETS_FILE  (for secret-* commands)
+--
+-- Commands:
+--   write            store.write(args)
+--   write-many       NDJSON stream from stdin → store.write per line
+--   search           store.search(args)
+--   recent           store.recent(args)
+--   get              store.get(id)
+--   update           store.update(id, patch)
+--   delete           store.delete(id)
+--   summarize        summarizer.run(args)
+--   promote          summarizer.promote(args)
+--   consolidate      summarizer.consolidate(args)
+--   kg-query         kg.query(args)
+--   kg-assert        kg.assert_fact(args)
+--   kg-invalidate    kg.invalidate(args)
+--   kg-timeline      kg.timeline(args)
+--   secret-list      secrets.list()
+--   secret-store     secrets.store(name, value, desc)
+--   secret-delete    secrets.delete(name)
+--   secret-execute   secrets.execute_with_secret(name, opts)
+--   context          composite: store.search + kg.query → formatted block
+
+local M = {}
+
+local cjson = require("cjson.safe")
+local util  = require("luamemo.util")
+
+-- ---------------------------------------------------------------------------
+-- Bootstrap: call luamemo.setup() with config from env vars.
+-- Must be called before any library functions.
+-- ---------------------------------------------------------------------------
+local _setup_done = false
+local function ensure_setup()
+    if _setup_done then return end
+    _setup_done = true
+    local ok, luamemo = pcall(require, "luamemo")
+    if not ok then
+        -- luamemo.init not strictly needed for db-only operations,
+        -- but it sets up config defaults. Silently skip if unavailable.
+        return
+    end
+    local cfg = {
+        -- Default to the zero-dependency hash embedder; MEMO_EMBEDDER overrides.
+        embedder_local = os.getenv("MEMO_EMBEDDER") or "hash",
+    }
+    -- Propagate MEMO_DB_URL into config so db.lua can read it from lib_cfg.
+    local db_url = os.getenv("MEMO_DB_URL")
+    if db_url and db_url ~= "" then cfg.db_url = db_url end
+    -- Secrets config from env vars.
+    local secrets_file = os.getenv("MEMO_SECRETS_FILE")
+    if secrets_file and secrets_file ~= "" then cfg.secrets_file = secrets_file end
+    local master_key_env = os.getenv("MEMO_MASTER_KEY_ENV")
+    if master_key_env then cfg.master_key_env = master_key_env end
+    local master_key = os.getenv("MEMO_MASTER_KEY")
+    if master_key and master_key ~= "" then cfg.master_key = master_key end
+    local ok2, err = pcall(luamemo.setup, cfg)
+    if not ok2 then
+        io.stderr:write("luamemo.setup warning: " .. tostring(err) .. "\n")
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- JSON helpers
+-- ---------------------------------------------------------------------------
+local function read_json_stdin()
+    local raw = io.read("*a")
+    if not raw or raw:match("^%s*$") then return {} end
+    local t, err = cjson.decode(raw)
+    if not t then
+        io.stderr:write("api: invalid JSON on stdin: " .. tostring(err) .. "\n")
+        return {}
+    end
+    return t
+end
+
+local function out(t)
+    io.write(cjson.encode(t) .. "\n")
+    io.flush()
+end
+
+local function err_out(msg)
+    out({ ok = false, error = tostring(msg) })
+end
+
+-- Coerce string "true"/"1" to true, "false"/"0" to false.
+local to_bool = util.to_bool
+
+-- ---------------------------------------------------------------------------
+-- Command handlers
+-- ---------------------------------------------------------------------------
+
+local handlers = {}
+
+-- write
+handlers["write"] = function(p)
+    local store = require("luamemo.store")
+    local row, err, action = store.write({
+        scope          = p.scope,
+        kind           = p.kind,
+        title          = p.title,
+        body           = p.body,
+        tags           = p.tags,
+        metadata       = p.metadata,
+        importance     = tonumber(p.importance),
+        decay_rate     = tonumber(p.decay_rate),
+        dedup_strategy = p.dedup_strategy,
+        embedding      = p.embedding,
+    })
+    if not row then return err_out(err) end
+    out({ ok = true, memory = row, action = action })
+end
+
+-- write-many: reads NDJSON from stdin, writes each line, streams results.
+-- Used by calibrate ingest loop.
+handlers["write-many"] = function(_p)
+    local store = require("luamemo.store")
+    local written, errors = 0, 0
+    for line in io.lines() do
+        line = line:match("^%s*(.-)%s*$") -- trim
+        if line ~= "" then
+            local p, jerr = cjson.decode(line)
+            if not p then
+                io.stderr:write("write-many: bad JSON line: " .. tostring(jerr) .. "\n")
+                errors = errors + 1
+            else
+                local row, werr, action = store.write({
+                    scope          = p.scope,
+                    kind           = p.kind,
+                    title          = p.title,
+                    body           = p.body,
+                    tags           = p.tags,
+                    metadata       = p.metadata,
+                    importance     = tonumber(p.importance),
+                    decay_rate     = tonumber(p.decay_rate),
+                    dedup_strategy = p.dedup_strategy,
+                    embedding      = p.embedding,
+                })
+                if not row then
+                    io.stderr:write("write-many: " .. tostring(werr) .. "\n")
+                    errors = errors + 1
+                else
+                    written = written + 1
+                    -- stream each result as NDJSON for progress reporting
+                    io.write(cjson.encode({ ok = true, memory = row, action = action }) .. "\n")
+                    io.flush()
+                end
+            end
+        end
+    end
+    -- final summary on stderr so the shell can display it
+    io.stderr:write("write-many: done — " .. written .. " written, " .. errors .. " errors\n")
+end
+
+-- search
+handlers["search"] = function(p)
+    local store = require("luamemo.store")
+    local rows, err = store.search({
+        query        = p.q or p.query,
+        scope        = p.scope,
+        limit        = tonumber(p.limit),
+        min_score    = tonumber(p.min_score),
+        kind         = p.kind,
+        tags         = p.tags,
+        fts_weight   = tonumber(p.fts_weight),
+        vec_weight   = tonumber(p.vec_weight),
+        decay_weight = tonumber(p.decay_weight),
+    })
+    if not rows then return err_out(err) end
+    out({ ok = true, results = rows })
+end
+
+-- recent
+handlers["recent"] = function(p)
+    local store = require("luamemo.store")
+    local rows, err = store.recent({
+        scope  = p.scope,
+        limit  = tonumber(p.limit),
+        kind   = p.kind,
+        offset = tonumber(p.offset),
+    })
+    if not rows then return err_out(err) end
+    out({ ok = true, results = rows })
+end
+
+-- get
+handlers["get"] = function(p)
+    local store = require("luamemo.store")
+    local id = p.id or p[1]
+    if not id then return err_out("get: id is required") end
+    local row, err = store.get(tonumber(id))
+    if not row then return err_out(err) end
+    out({ ok = true, memory = row })
+end
+
+-- update
+handlers["update"] = function(p)
+    local store = require("luamemo.store")
+    local id = p.id or p[1]
+    if not id then return err_out("update: id is required") end
+    local row, err = store.update(tonumber(id), {
+        title      = p.title,
+        body       = p.body,
+        tags       = p.tags,
+        metadata   = p.metadata,
+        importance = tonumber(p.importance),
+        decay_rate = tonumber(p.decay_rate),
+        kind       = p.kind,
+    })
+    if not row then return err_out(err) end
+    out({ ok = true, memory = row })
+end
+
+-- delete
+handlers["delete"] = function(p)
+    local store = require("luamemo.store")
+    local id = p.id or p[1]
+    if not id then return err_out("delete: id is required") end
+    local ok, err = store.delete(tonumber(id))
+    if not ok then return err_out(err) end
+    out({ ok = true })
+end
+
+-- summarize
+handlers["summarize"] = function(p)
+    local summarizer = require("luamemo.summarizer")
+    local result, err = summarizer.run({
+        scope          = p.scope,
+        dry_run        = to_bool(p.dry_run),
+        retention_days = tonumber(p.retention_days),
+        batch_size     = tonumber(p.batch_size),
+        max_batches    = tonumber(p.max_batches),
+    })
+    if not result then return err_out(err) end
+    out({ ok = true, result = result })
+end
+
+-- promote
+handlers["promote"] = function(p)
+    local summarizer = require("luamemo.summarizer")
+    local result, err = summarizer.promote({
+        from_scope    = p.from_scope,
+        to_scope      = p.to_scope,
+        delete_source = to_bool(p.delete_source),
+        dry_run       = to_bool(p.dry_run),
+        limit         = tonumber(p.limit),
+        min_rows      = tonumber(p.min_rows),
+    })
+    if not result then return err_out(err) end
+    local ok_flag = (result.promoted == 1 or result.reason == "no_rows")
+    out({ ok = ok_flag, result = result })
+end
+
+-- consolidate
+handlers["consolidate"] = function(p)
+    local summarizer = require("luamemo.summarizer")
+    local result, err = summarizer.consolidate({
+        scope                = p.scope,
+        dry_run              = to_bool(p.dry_run),
+        similarity_threshold = tonumber(p.similarity_threshold),
+        decay_threshold      = tonumber(p.decay_threshold),
+        max_rows             = tonumber(p.max_rows),
+    })
+    if not result then return err_out(err) end
+    out({ ok = true, result = result })
+end
+
+-- kg-query
+handlers["kg-query"] = function(p)
+    local kg = require("luamemo.kg")
+    local rows, err = kg.query({
+        scope               = p.scope,
+        subject             = p.subject,
+        predicate           = p.predicate,
+        object              = p.object,
+        at                  = p.at,
+        include_invalidated = to_bool(p.include_invalidated),
+        limit               = tonumber(p.limit),
+    })
+    if not rows then return err_out(err) end
+    out({ ok = true, results = rows })
+end
+
+-- kg-assert
+handlers["kg-assert"] = function(p)
+    local kg = require("luamemo.kg")
+    local row, err = kg.assert_fact({
+        scope            = p.scope,
+        subject          = p.subject,
+        predicate        = p.predicate,
+        object           = p.object,
+        valid_from       = p.valid_from,
+        source_memory_id = tonumber(p.source_memory_id),
+        supersede        = to_bool(p.supersede),
+    })
+    if not row then return err_out(err) end
+    out({ ok = true, fact = row })
+end
+
+-- kg-invalidate
+handlers["kg-invalidate"] = function(p)
+    local kg = require("luamemo.kg")
+    local n, err = kg.invalidate({
+        scope     = p.scope,
+        subject   = p.subject,
+        predicate = p.predicate,
+        object    = p.object,
+        at        = p.at,
+    })
+    if not n then return err_out(err) end
+    out({ ok = true, invalidated = n })
+end
+
+-- kg-timeline
+handlers["kg-timeline"] = function(p)
+    local kg = require("luamemo.kg")
+    local rows, err = kg.timeline({
+        scope     = p.scope,
+        subject   = p.subject,
+        predicate = p.predicate,
+    })
+    if not rows then return err_out(err) end
+    out({ ok = true, results = rows })
+end
+
+-- secret-list
+handlers["secret-list"] = function(_p)
+    local secrets = require("luamemo.secrets")
+    if not secrets.enabled() then
+        return err_out("secrets: not configured (secrets_file or master_key not set)")
+    end
+    local rows = secrets.list()
+    out({ ok = true, secrets = rows })
+end
+
+-- secret-store
+handlers["secret-store"] = function(p)
+    local secrets = require("luamemo.secrets")
+    if not secrets.enabled() then
+        return err_out("secrets: not configured (secrets_file or master_key not set)")
+    end
+    if not p.name or p.name == "" then return err_out("name is required") end
+    if not p.value or p.value == "" then return err_out("value is required") end
+    local row, err = secrets.store(p.name, p.value, p.description)
+    if not row then return err_out(err) end
+    out({ ok = true, secret = row })
+end
+
+-- secret-delete
+handlers["secret-delete"] = function(p)
+    local secrets = require("luamemo.secrets")
+    local name = p.name or p[1]
+    if not name or name == "" then return err_out("name is required") end
+    local ok, err = secrets.delete(name)
+    if not ok then return err_out(err) end
+    out({ ok = true })
+end
+
+-- secret-execute
+handlers["secret-execute"] = function(p)
+    local secrets = require("luamemo.secrets")
+    local name = p.name or p[1]
+    if not name or name == "" then return err_out("name is required") end
+    if not p.url or p.url == "" then return err_out("url is required") end
+    local body, err = secrets.execute_with_secret(name, {
+        url        = p.url,
+        method     = p.method,
+        headers    = p.headers,
+        body       = p.body,
+        multipart  = p.multipart,
+        timeout_ms = tonumber(p.timeout_ms),
+    })
+    if not body then return err_out(err) end
+    out({ ok = true, response = body })
+end
+
+-- context: composite search + kg-query → formatted block
+handlers["context"] = function(p)
+    local store = require("luamemo.store")
+    local kg    = require("luamemo.kg")
+    local q     = p.q or p.query or ""
+    local scope = p.scope
+    local limit = tonumber(p.limit) or 10
+    local no_kg = to_bool(p.no_kg) or false
+    local fmt   = p.format or "text"
+
+    local mem_rows, merr = store.search({
+        query = q,
+        scope = scope,
+        limit = limit,
+    })
+    if not mem_rows then mem_rows = {} end
+
+    local kg_rows = {}
+    if not no_kg and scope then
+        local rows, _ = kg.query({ scope = scope, limit = 20 })
+        if rows then kg_rows = rows end
+    end
+
+    if fmt == "json" then
+        out({ ok = true, memories = mem_rows, kg_facts = kg_rows })
+        return
+    end
+
+    -- Text format: compact, prompt-injection-ready block.
+    local lines = {}
+    lines[#lines+1] = "=== MEMORY CONTEXT ==="
+    if scope then lines[#lines+1] = "scope: " .. scope end
+    lines[#lines+1] = 'query: "' .. q .. '"'
+    lines[#lines+1] = ""
+
+    if #mem_rows > 0 then
+        for i, m in ipairs(mem_rows) do
+            lines[#lines+1] = "[" .. i .. "] " .. (m.kind or "?") .. " — " .. (m.title or "")
+            lines[#lines+1] = (m.body or "")
+            lines[#lines+1] = ""
+        end
+    else
+        lines[#lines+1] = "(no memories found)"
+        lines[#lines+1] = ""
+    end
+
+    if #kg_rows > 0 then
+        lines[#lines+1] = "=== GROUND TRUTH (knowledge graph) ==="
+        for _, f in ipairs(kg_rows) do
+            lines[#lines+1] = "• " .. (f.subject or "") .. " " .. (f.predicate or "") .. " " .. (f.object or "")
+        end
+        lines[#lines+1] = ""
+    end
+
+    lines[#lines+1] = "=== END CONTEXT ==="
+    -- Emit as JSON wrapper with a "text" field so cli/memo can extract it.
+    out({ ok = true, text = table.concat(lines, "\n") })
+end
+
+-- ---------------------------------------------------------------------------
+-- Public entry point
+-- ---------------------------------------------------------------------------
+
+function M.dispatch(cmd)
+    ensure_setup()
+    cmd = cmd or arg and arg[1] or os.getenv("MEMO_API_CMD") or ""
+    local handler = handlers[cmd]
+    if not handler then
+        err_out("api: unknown command: " .. tostring(cmd))
+        os.exit(1)
+    end
+    local p = read_json_stdin()
+    local ok, err = pcall(handler, p)
+    if not ok then
+        err_out("api: internal error in " .. cmd .. ": " .. tostring(err))
+    end
+end
+
+return M

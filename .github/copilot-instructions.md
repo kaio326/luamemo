@@ -11,13 +11,13 @@ It is **not** a runnable app by itself — it is consumed by a host app or eval 
 
 - **GitHub**: https://github.com/kaio326/luamemo
 - **LuaRocks package name**: `luamemo`
-- **Current version**: `0.2.4-1` (tag `v0.2.4`)
+- **Current version**: `0.2.5-1` (tag `v0.2.5`)
 - **Primary consumers**: any Lua application or AI agent that needs persistent semantic memory — Lapis/OpenResty apps, standalone Lua scripts, MCP-bridged agents (Claude Desktop, Cursor, Copilot Agent Mode), and eval harnesses
 
 ## Stack
 - **Language**: Lua 5.1 / LuaJIT (OpenResty or plain Lua 5.1+)
 - **Runtime APIs**: `luamemo.crypto` (pure-Lua AES-256-CBC + HMAC-SHA256), `luasocket`/`resty.http` (HTTP), `ngx.*` (OpenResty only)
-- **DB**: PostgreSQL 15 via `luamemo.db` — delegates to `lapis.db` in OpenResty; pgmoon outside
+- **DB**: PostgreSQL 15 via `luamemo.db` — pgmoon direct connection always; configured via `MEMO_DB_URL` URL or individual `PG*` env vars
 - **Protocol**: MCP (Model Context Protocol) stdio JSON-RPC 2.0 via `mcp/server.lua`
 - **No Node, no Python runtime** — pure Lua
 
@@ -26,9 +26,11 @@ It is **not** a runnable app by itself — it is consumed by a host app or eval 
 ```
 luamemo/           Core library modules
   init.lua              Entry point / M.setup() / re-exports
+  util.lua              Shared helpers (trim, read_file, to_bool, load_submodule,
+                          check_http, sql_id_list, clamp_check, clip, parse_scores)
   store.lua             Vector + FTS memory storage
   embed.lua             Embedder dispatch
-  db.lua                Portable PostgreSQL adapter (lapis.db in OpenResty; pgmoon outside)
+  db.lua                Portable PostgreSQL adapter (pgmoon only; MEMO_DB_URL or PG* env vars)
   http.lua              Portable HTTP client (resty.http in OpenResty; socket.http outside)
   routes.lua            Lapis HTTP route factory (M.register)
   kg.lua                Knowledge-graph (lm_kg_facts)
@@ -36,18 +38,20 @@ luamemo/           Core library modules
   secrets.lua           AES-256-CBC encrypted secret storage (pure-Lua via luamemo.crypto)
   crypto.lua            Pure-Lua AES-256-CBC + HMAC-SHA256 + CSPRNG (zero C deps)
   summarizer.lua        Background summarizer
+  async.lua             Pure-Lua coroutine scheduler (run_all, wait) for parallel embedding
+  lsh.lua               Random-hyperplane LSH index for bruteforce backend ANN acceleration
   adapters/             Embedder adapters (ollama, openai, tei, …)
   embedders/            hash (pure-Lua, zero-deps)
-  rerankers/            noop, ollama, openai, cross_encoder
-  summarizers/          noop, ollama, openai
-  cli/                  memo calibrate / memo doctor support modules
-  migrations/           Idempotent SQL migrations (001–005)
+  rerankers/            noop, ollama, openai, cross_encoder, _common (shared build_candidates)
+  summarizers/          noop, ollama, openai, _common (shared build_memory_lines)
+  cli/                  memo calibrate / memo doctor / api dispatcher support modules
+    api.lua               Single-operation Lua dispatcher (stdin JSON → lib call → stdout JSON)
 mcp/
-  server.lua            Standalone CLI stdio MCP server (11 tools)
+  server.lua            Standalone CLI stdio MCP server (11 tools, direct lib calls)
 cli/
-  memo                  Shell entrypoint (memo calibrate, memo doctor, memo run)
+  memo                  Shell entrypoint (all subcommands, no curl — uses luamemo.cli.api)
 examples/               Usage documentation
-luamemo-0.2.4-1.rockspec
+luamemo-0.2.5-1.rockspec
 ```
 
 ## Architecture
@@ -66,9 +70,9 @@ Route groups (all under `prefix`):
 | Secrets | `/secrets`, `/secrets/:name/delete`, `/secrets/:name/execute` |
 
 ### MCP server (`mcp/server.lua`)
-Standalone CLI process — JSON-RPC 2.0 over stdio. Bridges MCP clients (Claude Desktop, Cursor, Copilot Agent Mode) to the running luamemo HTTP API via `curl` shell-out.
+Standalone CLI process — JSON-RPC 2.0 over stdio. Calls `store.*`, `summarizer.*`, `secrets.*` directly via `require` — no HTTP intermediary.
 
-Config via env vars: `MEMO_URL` (required), `MEMO_TOKEN`, `MEMO_SCOPE`, `MEMO_DEBUG`.
+Config via env vars: `MEMO_DB_URL` (required), `MEMO_SCOPE`, `MEMO_MASTER_KEY`, `MEMO_SECRETS_FILE`, `MEMO_DEBUG`.
 
 Tools table (each entry: `{ description, inputSchema, handler }`):
 - `memory_write`, `memory_search`, `memory_recent`, `memory_get`, `memory_update`, `memory_delete`, `memory_promote`
@@ -93,6 +97,12 @@ All config keys set on `M.config`. `M.setup()` is called once by the host app at
 | `pg_password` | PostgreSQL password (plain-Lua only) |
 | `master_key_env` | Name of an env var containing the master key |
 | `master_key` | Explicit master key string (dev/CI only) |
+| `dedup_candidate_limit` | Max candidates fetched per scope for batch dedup in `write_many()` (default 1000) |
+| `lsh_enabled` | `false` to disable LSH globally (default `true`) |
+| `lsh_rebuild_at` | Row count per scope at which LSH index is built (default 10000) |
+| `lsh_tables` | LSH table count L — higher recall vs more memory (default 8) |
+| `lsh_bits` | LSH bits per key K — smaller buckets vs lower recall (default 12) |
+| `embed_dim` | Fallback embedding dimension for LSH when inference unavailable (default 384) |
 
 ## Secrets Module (`luamemo/secrets.lua`) — v0.2.1+
 
@@ -103,6 +113,10 @@ The raw secret value **never crosses the LLM context boundary**. Only the HTTP r
 - AES-256-CBC + HMAC-SHA256 via `luamemo.crypto` (pure Lua, zero C deps)
 - Secrets stored in a **JSON file on disk** (`secrets_file` config key). No database table.
 - Stored format per entry: `"<32-char iv_hex>:<ciphertext_hex>:<64-char mac_hex>"`
+- HMAC comparison is constant-time (always iterates the full expected length).
+- Multipart boundary generated via `luamemo.crypto.random_bytes` (CSPRNG, not `math.random`).
+- SSRF guard: `execute_with_secret` blocks non-http/https schemes **and** known private IP
+  ranges (`localhost`, `127.x`, `169.254.x`, `10.x`, `192.168.x`, `172.16-31.x`, `::1`).
 - Master key resolution order: `master_key_path` file → `master_key_env` env var → `master_key` explicit. If none set, module is disabled; all other library features continue to work.
 - No `get_secret` API exists — values cannot be retrieved through the HTTP or MCP layer
 
@@ -161,9 +175,9 @@ When making changes to this codebase, always build things the right way — no s
 luac -p luamemo/secrets.lua
 
 # Calibrate (host probe + codebase ingest) — run whenever the codebase changes:
-MEMO_URL=http://localhost:8765/api/memory MEMO_TOKEN=dev-token \
+MEMO_DB_URL=postgresql://postgres:@127.0.0.1:5432/luamemo_dev \
   memo calibrate --scope repo:luamemo
-# First run (no server): probe-only mode (prints config snippet)
+# First run (no DB): probe-only mode (prints config snippet)
 memo calibrate --probe-only
 
 # Push a new version
@@ -185,16 +199,22 @@ Types: `feat`, `fix`, `refactor`, `chore`, `docs`.
 
 ## Key Files
 | File | Purpose |
-|------|---------|
+|------|--------|
 | `luamemo/init.lua` | Entry point; `M.setup()`, config defaults, re-exports |
+| `luamemo/util.lua` | Shared helpers used across all modules (trim, read_file, to_bool, load_submodule, check_http, sql_id_list, clamp_check, clip) |
 | `luamemo/routes.lua` | HTTP route factory; `M.register(app, opts)` |
-| `luamemo/db.lua` | Portable PostgreSQL adapter (lapis.db → OpenResty; pgmoon → plain Lua) |
-| `luamemo/http.lua` | Portable HTTP client (resty.http → OpenResty; socket.http → plain Lua) |
+| `luamemo/db.lua` | Portable PostgreSQL adapter (pgmoon only) |
+| `luamemo/http.lua` | Portable HTTP client (resty.http → OpenResty; socket.http → plain Lua); `request_async` for non-blocking HTTP |
+| `luamemo/async.lua` | Coroutine scheduler: `run_all(tasks)` fans out N tasks concurrently; `wait(sock, event)` yields inside a coroutine |
+| `luamemo/lsh.lua` | Random-hyperplane LSH: `new(dim,L,K)`, `insert`, `remove` (lazy), `query`, `rebuild`; auto-activated by store.lua at >lsh_rebuild_at rows |
 | `luamemo/crypto.lua` | Pure-Lua AES-256-CBC + HMAC-SHA256 + CSPRNG |
 | `luamemo/secrets.lua` | AES-256-CBC secret storage (JSON file) + execute_with_secret |
 | `luamemo/kg.lua` | Knowledge-graph fact store |
+| `luamemo/rerankers/_common.lua` | Shared `build_candidates(hits, chunk_max)` used by ollama + openai rerankers |
+| `luamemo/summarizers/_common.lua` | Shared `build_memory_lines(memories, body_clip)` used by ollama + openai summarizers |
 | `luamemo/cli/calibrate.lua` | Host probe + embedder recommendation + codebase ingest (replaces init) |
+| `luamemo/cli/api.lua` | Single-operation Lua dispatcher (stdin JSON → lib call → stdout JSON) |
 | `mcp/server.lua` | Standalone MCP stdio server (11 tools) |
 | `cli/memo` | CLI entrypoint (memo calibrate, doctor, and all HTTP-API commands) |
-| `luamemo-0.2.4-1.rockspec` | Current LuaRocks package spec |
+| `luamemo-0.2.5-1.rockspec` | Current LuaRocks package spec |
 | `CHANGELOG.md` | Release notes |

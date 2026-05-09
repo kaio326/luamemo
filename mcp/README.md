@@ -198,5 +198,4 @@ terminal's). Use an absolute path like `/usr/local/bin/lua` if needed.
 ## See also
 
 - Project root: [`../README.md`](../README.md)
-- Comparison with MemPalace: [`../../research/lapis-memory-vs-mempalace.md`](../../research/lapis-memory-vs-mempalace.md)
 - MCP spec: <https://spec.modelcontextprotocol.io/>

@@ -45,14 +45,11 @@
 -- so callers can inspect or log failures.
 
 local store = require("luamemo.store")
+local util  = require("luamemo.util")
+
+local clip = util.clip   -- truncate to n chars with ellipsis (2-arg: clip(s, n))
 
 local M = {}
-
-local function trim(s, n)
-    if type(s) ~= "string" then return "" end
-    if #s <= n then return s end
-    return s:sub(1, n) .. "\xe2\x80\xa6"
-end
 
 local function nonempty(s)
     return type(s) == "string" and s ~= ""
@@ -113,7 +110,7 @@ function M.capture_user_message(opts)
     return _write({
         scope      = M.session_scope(opts.user_id, opts.session_id),
         kind       = "chat",
-        title      = "user: " .. trim(opts.content, 80),
+        title      = "user: " .. clip(opts.content, 80),
         body       = opts.content,
         tags       = { "chat", "user" },
         metadata   = meta,
@@ -139,7 +136,7 @@ function M.capture_assistant_message(opts)
     return _write({
         scope      = M.session_scope(opts.user_id, opts.session_id),
         kind       = "chat",
-        title      = "assistant: " .. trim(opts.content, 80),
+        title      = "assistant: " .. clip(opts.content, 80),
         body       = opts.content,
         tags       = { "chat", "assistant" },
         metadata   = meta,
@@ -170,8 +167,8 @@ function M.capture_tool_call(opts)
         "tool: %s\nsuccess: %s\nargs: %s\nresult: %s",
         opts.tool,
         tostring(meta.success),
-        trim(tostring(opts.args   or ""), 400),
-        trim(tostring(opts.result or ""), 400)
+        clip(tostring(opts.args   or ""), 400),
+        clip(tostring(opts.result or ""), 400)
     )
     return _write({
         scope      = M.session_scope(opts.user_id, opts.session_id),
@@ -203,7 +200,7 @@ function M.capture_decision(opts)
     return _write({
         scope      = M.long_term_scope(opts.user_id),
         kind       = "decision",
-        title      = opts.title or trim(opts.content, 80),
+        title      = opts.title or clip(opts.content, 80),
         body       = opts.content,
         tags       = opts.tags or { "decision" },
         metadata   = meta,

@@ -262,22 +262,25 @@ same-family `bge-m3` + `bge-reranker-v2-m3` pairing.
 
 ---
 
-## Footnote — `bruteforce_candidate_limit` is not in this list
+## Footnote — `bruteforce_candidate_limit` and LSH
 
 The brute-force backend has a `bruteforce_candidate_limit` config knob
 (default 5,000) that caps how many rows the in-Lua cosine pass
 considers. Tuning this knob is a **latency** decision, not an accuracy
 or token-cost decision.
 
-Specifically: it does not change the top-K the agent receives unless
-your scope is so large that the cap is being hit. If you have fewer
-rows than the cap, the cap is a no-op. If you exceed the cap, the
-correct fix is usually to install pgvector or to scope writes more
-narrowly — not to raise the cap and pay the CPU bill on every search.
+For corpora beyond ~10 000 rows per scope, `luamemo` automatically
+activates its built-in **LSH (Locality-Sensitive Hashing) index**
+(`luamemo.lsh`) which pre-filters the candidate pool to ≈100–300
+rows before cosine ranking, eliminating most of the I/O cost without
+changing the scoring or result shape. This is transparent — no config
+change needed. You can tune `lsh_rebuild_at` (default 10 000),
+`lsh_tables` (default 8), and `lsh_bits` (default 12), or set
+`lsh_enabled = false` to opt out.
 
-This is why the library does **not** ship a `calibrate` command for
-this knob. Calibrating CPU per row tells you nothing about whether
-your agent is finding the right answers.
+Beyond LSH, the correct fix for very large corpora is still to install
+pgvector (HNSW O(log N)) or to scope writes more narrowly — not to
+raise `bruteforce_candidate_limit` and pay the CPU bill on every search.
 
 ---
 
@@ -291,6 +294,7 @@ your agent is finding the right answers.
 | 4 | `tune_weights` hybrid blend | Medium                   | Trivial |
 | 5 | Reranker (built-in)         | Medium (+12pt R@1 noop)  | Trivial |
 | — | `bruteforce_candidate_limit`| Latency only             | n/a     |
+| — | LSH (auto at >10k rows)     | Latency only (automatic) | None    |
 
 Work top-down. Don't tune things below something you haven't done yet.
 

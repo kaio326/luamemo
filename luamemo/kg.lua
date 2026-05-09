@@ -43,6 +43,7 @@
 -- self-documenting. The argument table is never mutated.
 
 local cjson = require("cjson.safe")
+local util  = require("luamemo.util")
 
 local M = {}
 
@@ -63,12 +64,7 @@ end
 -- ---------------------------------------------------------------------------
 -- Validation helpers
 -- ---------------------------------------------------------------------------
-local function require_str(v, name)
-    if type(v) ~= "string" or v == "" then
-        return nil, name .. " is required (non-empty string)"
-    end
-    return v
-end
+local require_str = util.require_str
 
 local function ts_literal(v)
     -- Accept: nil (caller wants now()), number (unix epoch), string

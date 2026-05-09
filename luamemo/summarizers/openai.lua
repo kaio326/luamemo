@@ -9,17 +9,15 @@
 --
 -- Contract: summarize(memories, cfg) -> { title, body, metadata }, err
 
-local cjson = require("cjson.safe")
-local http  = require("luamemo.http")
+local cjson   = require("cjson.safe")
+local http    = require("luamemo.http")
+local util    = require("luamemo.util")
+local _common = require("luamemo.summarizers._common")
 
 local M = {}
 
 local function build_messages(memories)
-    local lines = { "Memories to summarise:" }
-    for i, m in ipairs(memories) do
-        lines[#lines + 1] = string.format("[%d] %s\n%s",
-            i, m.title or "", m.body or "")
-    end
+    local mem_lines = _common.build_memory_lines(memories, 1500)
     return {
         {
             role    = "system",
@@ -27,7 +25,7 @@ local function build_messages(memories)
                 .. "Preserve concrete facts (names, IDs, dates, decisions). "
                 .. "Reply ONLY with JSON: {\"title\":\"...\",\"body\":\"...\"}.",
         },
-        { role = "user", content = table.concat(lines, "\n") },
+        { role = "user", content = "Memories to summarise:\n" .. table.concat(mem_lines, "\n") },
     }
 end
 
@@ -52,10 +50,8 @@ function M.summarize(memories, cfg)
         method = "POST", body = req_body, headers = headers,
         timeout_ms = cfg.summarizer_timeout_ms or 60000,
     })
-    if not status then return nil, "openai.summarize: HTTP error: " .. tostring(err) end
-    if status >= 300 then
-        return nil, "openai.summarize: HTTP " .. status .. ": " .. tostring(body)
-    end
+    local ok, herr = util.check_http(status, body, err, "openai.summarize")
+    if not ok then return nil, herr end
 
     local payload = cjson.decode(body)
     if not payload or not payload.choices or not payload.choices[1] then

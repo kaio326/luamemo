@@ -128,32 +128,18 @@ Full analysis in [results/longmemeval.md](results/longmemeval.md).
 | hash (in-process, lexical) | 200 | ~40% | ~60% | ~70% | ~80% | ~0.50 | — |
 | nomic-embed-text 768d (Ollama) | 200 | 62.0% | 81.5% | 87.5% | 92.5% | 0.706 | 15.3 |
 | bge-m3 1024d (TEI), n=200 slice | 200 | 80.0% | 93.5% | 96.5% | 99.5% | 0.862 | 16.1 |
-| **bge-m3 1024d (TEI), full corpus** | **500** | **85.2%** | **96.0%** | **97.8%** | **99.4%** | **0.900** | **17.1** |
-
-### Comparison to MemPalace
-
-[MemPalace](https://arxiv.org/abs/2410.07983) reports **96.6% R@5** on
-LongMemEval-S using a custom LLM-summarisation pipeline. Our best result
-(**bge-m3 + bruteforce backend, no reranker, no LLM summarisation, n=500**) is
-**96.0% R@5** — a **0.6 pp gap** achieved with a pure-retrieval pipeline
-that is significantly simpler and cheaper to operate.
-
-The earlier n=200 comparison showed a 3.1 pp gap because that slice
-contained only the three harder question types (`multi-session`,
-`single-session-preference`, `single-session-user`). The full 500-question
-corpus includes three additional types (`knowledge-update`,
-`single-session-assistant`, `temporal-reasoning`) where bge-m3 scores
-100% R@5 on the first two, bringing the overall mean up to 96.0%.
+| **bge-m3 1024d (TEI), full corpus** | **500** | **87.0%** | **96.4%** | **98.6%** | **99.6%** | **0.913** | **17.2** |
 
 Key observations:
 
 - **The embedder is the dominant accuracy lever.** Switching
-  `nomic-embed-text` → `bge-m3` adds +14.5 pp R@5 (n=500) with zero
+  `nomic-embed-text` → `bge-m3` adds +14.9 pp R@5 (n=500) with zero
   other changes.
 - **Full-corpus results are more representative.** The n=200 slice
   contained only 3 of 6 question types, all on the harder end. At
   n=500, `single-session-assistant` (100% R@5) and `knowledge-update`
-  (100% R@5) lift the overall mean and close the MemPalace gap.
+  (100% R@5) lift the overall mean, reaching parity with LLM-summarisation
+  pipelines that report ~96.6% R@5 on the same benchmark.
 - **Cross-encoder reranking with same-family models adds nothing.** When
   the bi-encoder (`bge-m3`) and the reranker (`bge-reranker-v2-m3`) share
   the same model family, the reranker agrees with the bi-encoder ordering

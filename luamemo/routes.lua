@@ -1,7 +1,14 @@
 -- luamemo.routes
 -- Lapis route factory. Call routes.register(app, { prefix = "/api/memory" }).
+--
+-- Rate limiting and request throttling must be implemented in the host app
+-- via cfg.before_request(), which is called on every route before any
+-- processing. Example: use ngx.shared counters (OpenResty) or an external
+-- Redis-backed limiter. The library does not add a stateful dependency for
+-- this — it belongs in the deployment layer.
 
 local cjson = require("cjson.safe")
+local util  = require("luamemo.util")
 
 local M = {}
 
@@ -102,7 +109,7 @@ function M.register(app, opts)
             scope        = p.scope,
             kind         = p.kind,
             limit        = tonumber(p.limit),
-            ignore_decay = p.ignore_decay == "1" or p.ignore_decay == "true",
+            ignore_decay = util.to_bool(p.ignore_decay),
             -- Phase 11: temporal bounds. `until` is a Lua reserved word so
             -- we read the HTTP param as bracket syntax and pass on as
             -- `until_` to the store layer.
@@ -117,9 +124,12 @@ function M.register(app, opts)
     app:get(prefix .. "/recent", function(self)
         local denied = authorise(self); if denied then return denied end
         local p = self.params
+        local limit = tonumber(p.limit)
+        if not limit or limit < 1 then limit = 20 end
+        if limit > 100 then limit = 100 end
         local rows = store.recent({
             scope = p.scope,
-            limit = tonumber(p.limit),
+            limit = limit,
         })
         return json(200, { ok = true, results = rows })
     end)
@@ -155,7 +165,7 @@ function M.register(app, opts)
         local summarizer = require("luamemo.summarizer")
         local result = summarizer.run({
             scope            = p.scope,
-            dry_run          = p.dry_run == true or p.dry_run == "1" or p.dry_run == "true",
+            dry_run          = util.to_bool(p.dry_run),
             weight_threshold = tonumber(p.weight_threshold),
             retention_days   = tonumber(p.retention_days),
             batch_size       = tonumber(p.batch_size),
@@ -172,8 +182,8 @@ function M.register(app, opts)
         local result = summarizer.promote({
             from_scope    = p.from_scope,
             to_scope      = p.to_scope,
-            delete_source = p.delete_source == true or p.delete_source == "1" or p.delete_source == "true",
-            dry_run       = p.dry_run == true or p.dry_run == "1" or p.dry_run == "true",
+            delete_source = util.to_bool(p.delete_source),
+            dry_run       = util.to_bool(p.dry_run),
             limit         = tonumber(p.limit),
             min_rows      = tonumber(p.min_rows),
         })
@@ -188,7 +198,7 @@ function M.register(app, opts)
         local summarizer = require("luamemo.summarizer")
         local result = summarizer.consolidate({
             scope                = p.scope,
-            dry_run              = p.dry_run == true or p.dry_run == "1" or p.dry_run == "true",
+            dry_run              = util.to_bool(p.dry_run),
             similarity_threshold = tonumber(p.similarity_threshold),
             decay_threshold      = tonumber(p.decay_threshold),
             max_rows             = tonumber(p.max_rows),
@@ -212,7 +222,7 @@ function M.register(app, opts)
             object           = p.object,
             valid_from       = p.valid_from,
             source_memory_id = tonumber(p.source_memory_id),
-            supersede        = p.supersede == true or p.supersede == "1" or p.supersede == "true",
+            supersede        = util.to_bool(p.supersede),
         })
         if not row then return json(400, { error = err }) end
         return json(200, { ok = true, fact = row })
@@ -228,7 +238,7 @@ function M.register(app, opts)
             predicate           = p.predicate,
             object              = p.object,
             at                  = p.at,
-            include_invalidated = p.include_invalidated == "1" or p.include_invalidated == "true",
+            include_invalidated = util.to_bool(p.include_invalidated),
             limit               = tonumber(p.limit),
         })
         if not rows then return json(400, { error = err }) end

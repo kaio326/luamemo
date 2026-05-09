@@ -53,6 +53,11 @@ end
 -- ---------------------------------------------------------------------------
 -- socket.http / ssl.https adapter  (plain Lua / luasocket)
 -- ---------------------------------------------------------------------------
+-- NOTE: This call BLOCKS the Lua thread for the full HTTP round-trip
+-- (typically 10-2000 ms depending on the server and network).  In OpenResty
+-- all requests go through try_resty() above, which is non-blocking via nginx
+-- cosockets.  In plain Lua, use luamemo.async + M.request_async() when
+-- concurrent HTTP fan-out is needed (see store.write_many()).
 local function try_socket(url, opts)
     local scheme = url:match("^([%w+%-%.]+)://")
     local is_https = (scheme == "https")
@@ -129,6 +134,147 @@ end
 -- ---------------------------------------------------------------------------
 -- Public API
 -- ---------------------------------------------------------------------------
+
+--- Non-blocking HTTP request for use inside luamemo.async task coroutines.
+-- Supports HTTP only (not HTTPS) — HTTPS falls back to the synchronous path.
+-- Uses raw socket.tcp() in non-blocking mode; yields via wait_fn(sock, event)
+-- whenever the socket would block, allowing the async scheduler to interleave
+-- other tasks. Returns the same (status, body, err) triple as M.request().
+-- @param url     string    http:// URL (https:// falls back to sync)
+-- @param opts    table     same as M.request()
+-- @param wait_fn function  wait_fn(sock, event) from luamemo.async
+-- @return number|nil, string|nil, string|nil
+function M.request_async(url, opts, wait_fn)
+    opts = opts or {}
+
+    -- HTTPS is not supported in async mode — fall back to blocking.
+    local scheme = url:match("^([%w+%-%.]-)://")
+    if scheme ~= "http" then
+        return M.request(url, opts)
+    end
+
+    -- Parse URL into components.
+    local host, port_str, path = url:match("^https?://([^/:?#]+):?(%d*)(/[^%s]*)")
+    if not host then
+        -- Try without explicit path.
+        host, port_str = url:match("^https?://([^/:?#]+):?(%d*)$")
+        path = "/"
+    end
+    if not host then
+        return nil, nil, "http.request_async: could not parse URL: " .. url
+    end
+    path = (path == nil or path == "") and "/" or path
+    local port = tonumber(port_str) or 80
+
+    -- DNS lookup is synchronous in plain Lua — unavoidable without a
+    -- non-blocking resolver.  For local embedder URLs the OS caches the result.
+    local sock_mod = require("socket")
+    local ip, dns_err = sock_mod.dns.toip(host)
+    if not ip then
+        return nil, nil, "http.request_async: DNS failed for " .. host .. ": " .. tostring(dns_err)
+    end
+
+    local sock = sock_mod.tcp()
+    sock:settimeout(0)  -- non-blocking mode
+
+    -- Initiate connect; "timeout" is expected when the kernel is setting up
+    -- the TCP handshake in the background.
+    local _, cerr = sock:connect(ip, port)
+    if cerr and cerr ~= "timeout" then
+        sock:close()
+        return nil, nil, "http.request_async: connect error: " .. cerr
+    end
+    wait_fn(sock, "write")  -- wait for the connection to complete
+
+    -- Build the HTTP/1.1 request.
+    local method   = (opts.method or "GET"):upper()
+    local req_body = opts.body or ""
+    local hdr_lines = {
+        "Host: " .. host,
+        "Connection: close",
+        "Content-Length: " .. tostring(#req_body),
+    }
+    for k, v in pairs(opts.headers or {}) do
+        hdr_lines[#hdr_lines + 1] = k .. ": " .. v
+    end
+    local req_str = method .. " " .. path .. " HTTP/1.1\r\n"
+        .. table.concat(hdr_lines, "\r\n") .. "\r\n\r\n" .. req_body
+
+    -- Send the full request, yielding on partial writes.
+    local send_i = 1
+    local send_j = #req_str
+    while send_i <= send_j do
+        local last, serr, partial = sock:send(req_str, send_i, send_j)
+        if last then
+            break  -- all bytes sent
+        elseif serr == "timeout" then
+            send_i = (partial or send_i - 1) + 1
+            wait_fn(sock, "write")
+        else
+            sock:close()
+            return nil, nil, "http.request_async: send error: " .. tostring(serr)
+        end
+    end
+
+    -- Receive the response, yielding on partial reads.
+    -- Read until we have the complete header block (ending with \r\n\r\n).
+    local buf = ""
+    local CRLF2 = "\r\n\r\n"
+    while not buf:find(CRLF2, 1, true) do
+        local chunk, rerr, partial = sock:receive(4096)
+        if chunk then
+            buf = buf .. chunk
+        elseif rerr == "timeout" then
+            if partial and #partial > 0 then buf = buf .. partial end
+            wait_fn(sock, "read")
+        elseif rerr == "closed" then
+            if partial and #partial > 0 then buf = buf .. partial end
+            break
+        else
+            sock:close()
+            return nil, nil, "http.request_async: header receive error: " .. tostring(rerr)
+        end
+    end
+
+    -- Parse status code.
+    local status_code = tonumber(buf:match("^HTTP/%d+%.%d+ (%d+)"))
+    if not status_code then
+        sock:close()
+        return nil, nil, "http.request_async: invalid HTTP response"
+    end
+
+    -- Split headers from body prefix.
+    local hdr_end = buf:find(CRLF2, 1, true)
+    local raw_hdrs = buf:sub(1, hdr_end - 1)
+    local body_buf = buf:sub(hdr_end + 4)
+
+    -- Determine expected body length.
+    local content_length = tonumber(raw_hdrs:match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
+
+    -- Read remaining body bytes.
+    while true do
+        if content_length and #body_buf >= content_length then break end
+        local want = content_length
+            and math.min(4096, content_length - #body_buf)
+            or  4096
+        local chunk, rerr, partial = sock:receive(want)
+        if chunk then
+            body_buf = body_buf .. chunk
+        elseif rerr == "timeout" then
+            if partial and #partial > 0 then body_buf = body_buf .. partial end
+            wait_fn(sock, "read")
+        elseif rerr == "closed" then
+            if partial and #partial > 0 then body_buf = body_buf .. partial end
+            break  -- server closed cleanly (no Content-Length)
+        else
+            sock:close()
+            return nil, nil, "http.request_async: body receive error: " .. tostring(rerr)
+        end
+    end
+
+    sock:close()
+    return status_code, body_buf, nil
+end
 
 --- Make an HTTP/HTTPS request.
 -- @param url   string  Full URL including scheme

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# memo — CLI wrapper for luamemo HTTP API.
+# memo — CLI wrapper for luamemo library (direct DB access, no HTTP layer).
 #
 # Configuration (env vars or ~/.memorc):
-#   MEMO_URL    Base URL of the memory API, e.g. https://app.example.com/api/memory
-#   MEMO_TOKEN  Bearer token sent as Authorization header (optional)
+#   MEMO_DB_URL   PostgreSQL connection URL, e.g.
+#                 postgresql://user:pass@localhost:5432/luamemo
+#                 (Individual PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD also work)
 #
 # Usage:
 #   memo write   --scope SCOPE --kind KIND --title T --body B [--tags a,b,c]
@@ -37,15 +38,9 @@ if [[ -f "$HOME/.memorc" ]]; then
     source "$HOME/.memorc"
 fi
 
-# shellcheck disable=SC2034
-MEMO_URL_REQUIRED_DEFAULT=true
-if [[ -n "${MEMO_URL:-}" ]]; then
-    : # already set
-fi
-TOKEN_HEADER=()
-if [[ -n "${MEMO_TOKEN:-}" ]]; then
-    TOKEN_HEADER=(-H "Authorization: Bearer ${MEMO_TOKEN}")
-fi
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 require_jq() {
     if ! command -v jq >/dev/null; then
@@ -54,8 +49,30 @@ require_jq() {
     fi
 }
 
-# Build a JSON body from --key value pairs. --tags is split on commas.
+find_lua() {
+    for cand in lua5.1 luajit lua5.3 lua5.4 lua; do
+        if command -v "$cand" >/dev/null; then echo "$cand"; return 0; fi
+    done
+    return 1
+}
+
+# Run a single luamemo.cli.api command.
+# $1 = command name (e.g. "write", "search")
+# stdin = JSON input object
+# stdout = JSON result
+api_call() {
+    local cmd="$1"
+    local lua; lua=$(find_lua) || {
+        echo "memo: no Lua interpreter found (tried lua5.1, luajit, lua5.3, lua5.4, lua)" >&2
+        exit 1
+    }
+    "$lua" -e "package.path='./?/init.lua;'..package.path; require('luamemo.cli.api').dispatch('${cmd}')"
+}
+
+# Build a JSON object from --key value pairs passed as arguments.
+# --tags is split on commas into an array.
 build_json() {
+    require_jq
     local json='{}'
     while [[ $# -gt 0 ]]; do
         local key="${1#--}"
@@ -71,52 +88,55 @@ build_json() {
     printf '%s' "$json"
 }
 
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
 cmd_write() {
     require_jq
     local body; body=$(build_json "$@")
-    curl -sS -X POST "${MEMO_URL}/write" \
-        "${TOKEN_HEADER[@]}" \
-        -H "Content-Type: application/json" \
-        -d "$body" | jq .
+    printf '%s' "$body" | api_call write | jq .
 }
 
 cmd_search() {
     require_jq
     local q="$1"; shift
-    local args=(--data-urlencode "q=$q")
+    local json; json=$(jq -n --arg q "$q" '{q: $q}')
     while [[ $# -gt 0 ]]; do
-        args+=(--data-urlencode "${1#--}=$2"); shift 2
+        local key="${1#--}"; local val="$2"
+        json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+        shift 2
     done
-    curl -sS -G "${MEMO_URL}/search" "${TOKEN_HEADER[@]}" "${args[@]}" | jq .
+    printf '%s' "$json" | api_call search | jq .
 }
 
 cmd_recent() {
     require_jq
-    local args=()
+    local json='{}'
     while [[ $# -gt 0 ]]; do
-        args+=(--data-urlencode "${1#--}=$2"); shift 2
+        local key="${1#--}"; local val="$2"
+        json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+        shift 2
     done
-    curl -sS -G "${MEMO_URL}/recent" "${TOKEN_HEADER[@]}" "${args[@]}" | jq .
+    printf '%s' "$json" | api_call recent | jq .
 }
 
 cmd_get() {
     require_jq
-    curl -sS "${MEMO_URL}/$1" "${TOKEN_HEADER[@]}" | jq .
+    jq -n --argjson id "$1" '{id: $id}' | api_call get | jq .
 }
 
 cmd_update() {
     require_jq
     local id="$1"; shift
     local body; body=$(build_json "$@")
-    curl -sS -X POST "${MEMO_URL}/${id}/update" \
-        "${TOKEN_HEADER[@]}" \
-        -H "Content-Type: application/json" \
-        -d "$body" | jq .
+    body=$(printf '%s' "$body" | jq --argjson id "$id" '. + {id: $id}')
+    printf '%s' "$body" | api_call update | jq .
 }
 
 cmd_delete() {
     require_jq
-    curl -sS -X POST "${MEMO_URL}/$1/delete" "${TOKEN_HEADER[@]}" | jq .
+    jq -n --argjson id "$1" '{id: $id}' | api_call delete | jq .
 }
 
 cmd_summarize() {
@@ -126,36 +146,26 @@ cmd_summarize() {
         case "$1" in
             --dry-run)
                 json=$(printf '%s' "$json" | jq '. + {dry_run: true}')
-                shift
-                ;;
+                shift ;;
             --*)
                 local key="${1#--}"; key="${key//-/_}"
                 local val="$2"
                 json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
-                shift 2
-                ;;
+                shift 2 ;;
             *)
                 echo "memo summarize: unknown arg: $1" >&2; exit 1 ;;
         esac
     done
-    curl -sS -X POST "${MEMO_URL}/summarize" \
-        "${TOKEN_HEADER[@]}" \
-        -H "Content-Type: application/json" \
-        -d "$json" | jq .
+    printf '%s' "$json" | api_call summarize | jq .
 }
 
 # ---------------------------------------------------------------------------
 # Secrets subcommands
 # ---------------------------------------------------------------------------
-# SECURITY: secret-store reads the value from --file or a no-echo stdin
-# prompt. The value NEVER appears in shell arguments or chat context.
-# ---------------------------------------------------------------------------
 
 cmd_secret_store() {
     require_jq
-    local name=""
-    local desc=""
-    local file=""
+    local name="" desc="" file=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --desc)  desc="$2";  shift 2 ;;
@@ -172,9 +182,8 @@ cmd_secret_store() {
     if [[ -n "$file" ]]; then
         value=$(cat "$file")
     else
-        # Read without echo so the value never appears on screen or in logs.
         read -r -s -p "Secret value for \"${name}\": " value
-        echo >&2  # newline after the hidden input
+        echo >&2
     fi
     if [[ -z "$value" ]]; then
         echo "memo secret-store: value cannot be empty" >&2
@@ -185,17 +194,14 @@ cmd_secret_store() {
         --arg v "$value" \
         --arg d "$desc" \
         '{name: $n, value: $v, description: (if $d == "" then null else $d end)}')
-    # Zero the shell variable immediately after JSON encoding.
     value=""
-    curl -sS -X POST "${MEMO_URL}/secrets" \
-        "${TOKEN_HEADER[@]}" \
-        -H "Content-Type: application/json" \
-        -d "$body" | jq '{ok, secret: {id: .secret.id, name: .secret.name, description: .secret.description}}'
+    printf '%s' "$body" | api_call secret-store \
+        | jq '{ok, secret: {id: .secret.id, name: .secret.name, description: .secret.description}}'
 }
 
 cmd_secret_list() {
     require_jq
-    curl -sS "${MEMO_URL}/secrets" "${TOKEN_HEADER[@]}" \
+    printf '{}' | api_call secret-list \
         | jq '[.secrets[] | {id, name, description, used_count, last_used_at, updated_at}]'
 }
 
@@ -204,7 +210,7 @@ cmd_secret_delete() {
     if [[ -z "${1:-}" ]]; then
         echo "Usage: memo secret-delete NAME" >&2; exit 1
     fi
-    curl -sS -X POST "${MEMO_URL}/secrets/$1/delete" "${TOKEN_HEADER[@]}" | jq .
+    jq -n --arg name "$1" '{name: $name}' | api_call secret-delete | jq .
 }
 
 cmd_secret_execute() {
@@ -218,31 +224,25 @@ cmd_secret_execute() {
         exit 1
     fi
     local name="$1" url="$2"; shift 2
-    local method= timeout_ms= body= headers='{}'
-    local -a form_fields=()   # plain string fields
-    local -a form_files=()    # file fields
+    local method="" timeout_ms="" body="" headers='{}'
+    local -a form_fields=()
+    local -a form_files=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --method)     method="$2";     shift 2 ;;
             --timeout-ms) timeout_ms="$2"; shift 2 ;;
             --body)       body="$2";       shift 2 ;;
             --header)
-                # K:V  — add to the headers JSON object
                 local hkey="${2%%:*}" hval="${2#*:}"
                 headers=$(printf '%s' "$headers" | jq --arg k "$hkey" --arg v "$hval" '. + {($k): $v}')
                 shift 2 ;;
-            --form)
-                # FIELD=VALUE
-                form_fields+=("$2"); shift 2 ;;
-            --form-file)
-                # FIELD:PATH
-                form_files+=("$2"); shift 2 ;;
+            --form)       form_fields+=("$2"); shift 2 ;;
+            --form-file)  form_files+=("$2");  shift 2 ;;
             *) echo "memo secret-execute: unknown flag: $1" >&2; exit 1 ;;
         esac
     done
 
-    # Build the JSON payload.
-    local payload; payload=$(jq -n --arg url "$url" '{url: $url}')
+    local payload; payload=$(jq -n --arg name "$name" --arg url "$url" '{name: $name, url: $url}')
     [[ -n "$method"     ]] && payload=$(printf '%s' "$payload" | jq --arg v "$method"     '. + {method: $v}')
     [[ -n "$timeout_ms" ]] && payload=$(printf '%s' "$payload" | jq --argjson v "$timeout_ms" '. + {timeout_ms: $v}')
     [[ -n "$body"       ]] && payload=$(printf '%s' "$payload" | jq --arg v "$body"       '. + {body: $v}')
@@ -250,7 +250,6 @@ cmd_secret_execute() {
         payload=$(printf '%s' "$payload" | jq --argjson v "$headers" '. + {headers: $v}')
     fi
 
-    # Build multipart object when --form or --form-file flags are present.
     if [[ ${#form_fields[@]} -gt 0 ]] || [[ ${#form_files[@]} -gt 0 ]]; then
         local mp='{}'
         for kv in "${form_fields[@]}"; do
@@ -264,19 +263,11 @@ cmd_secret_execute() {
         payload=$(printf '%s' "$payload" | jq --argjson v "$mp" '. + {multipart: $v}')
     fi
 
-    curl -sS -X POST "${MEMO_URL}/secrets/${name}/execute" \
-        "${TOKEN_HEADER[@]}" \
-        -H "Content-Type: application/json" \
-        -d "$payload" | jq .
+    printf '%s' "$payload" | api_call secret-execute | jq .
 }
 
 # ---------------------------------------------------------------------------
-# memo migrate -- print all luamemo schema+migration SQL to stdout.
-#
-# Output is fully idempotent (IF NOT EXISTS / ADD COLUMN IF NOT EXISTS).
-# Pipe to psql to apply:
-#   memo migrate | psql -U postgres -d mydb
-#   memo migrate | docker exec -i mydb psql -U postgres -d mydb
+# memo migrate
 # ---------------------------------------------------------------------------
 cmd_migrate() {
     cat <<'MIGRATE_EOF'
@@ -383,39 +374,29 @@ cmd_promote() {
         case "$1" in
             --dry-run)
                 json=$(printf '%s' "$json" | jq '. + {dry_run: true}')
-                shift
-                ;;
+                shift ;;
             --delete-source)
                 json=$(printf '%s' "$json" | jq '. + {delete_source: true}')
-                shift
-                ;;
+                shift ;;
             --from)
                 json=$(printf '%s' "$json" | jq --arg v "$2" '. + {from_scope: $v}')
-                shift 2
-                ;;
+                shift 2 ;;
             --to)
                 json=$(printf '%s' "$json" | jq --arg v "$2" '. + {to_scope: $v}')
-                shift 2
-                ;;
+                shift 2 ;;
             --*)
                 local key="${1#--}"; key="${key//-/_}"
                 local val="$2"
                 json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
-                shift 2
-                ;;
+                shift 2 ;;
             *)
                 echo "memo promote: unknown arg: $1" >&2; exit 1 ;;
         esac
     done
-    curl -sS -X POST "${MEMO_URL}/promote" \
-        "${TOKEN_HEADER[@]}" \
-        -H "Content-Type: application/json" \
-        -d "$json" | jq .
+    printf '%s' "$json" | api_call promote | jq .
 }
 
 # memo context QUERY [--scope SCOPE] [--limit N] [--no-kg] [--format text|json]
-# Assembles a compact, prompt-injection-ready context block from search results
-# and optional KG ground-truth facts. All processing is local — no cloud calls.
 cmd_context() {
     require_jq
     local q="${1:-}"
@@ -436,65 +417,21 @@ cmd_context() {
         esac
     done
 
-    local search_args=(--data-urlencode "q=$q" --data-urlencode "limit=$limit")
-    [[ -n "$scope" ]] && search_args+=(--data-urlencode "scope=$scope")
+    local json; json=$(jq -n \
+        --arg q "$q" \
+        --arg scope "$scope" \
+        --argjson limit "$limit" \
+        --arg format "$format" \
+        '{q: $q, limit: $limit, format: $format}
+         | if $scope != "" then . + {scope: $scope} else . end')
+    [[ "$no_kg" == true ]] && json=$(printf '%s' "$json" | jq '. + {no_kg: true}')
 
-    local mem_json
-    mem_json=$(curl -sS -G "${MEMO_URL}/search" "${TOKEN_HEADER[@]}" "${search_args[@]}")
-
-    local kg_json=""
-    if [[ "$no_kg" == "false" ]] && [[ -n "$scope" ]]; then
-        kg_json=$(curl -sS -G "${MEMO_URL}/kg/query" "${TOKEN_HEADER[@]}" \
-            --data-urlencode "scope=$scope" \
-            --data-urlencode "limit=20" 2>/dev/null) || kg_json='{"ok":false}'
-    fi
-
+    local result; result=$(printf '%s' "$json" | api_call context)
     if [[ "$format" == "json" ]]; then
-        jq -n \
-            --argjson mem "$mem_json" \
-            --argjson kg "${kg_json:-null}" \
-            '{memories: ($mem.results // []), kg_facts: (if $kg then ($kg.results // []) else [] end)}'
-        return
-    fi
-
-    # Text format: compact, prompt-injection-ready block.
-    echo "=== MEMORY CONTEXT ==="
-    [[ -n "$scope" ]] && echo "scope: $scope"
-    echo "query: \"$q\""
-    echo ""
-
-    local mem_list
-    mem_list=$(printf '%s' "$mem_json" | jq -r '
-        (.results // []) |
-        if type == "array" then . else [.[]] end |
-        to_entries[] |
-        "[" + ((.key + 1) | tostring) + "] " + (.value.kind // "?") +
-        " \u2014 " + (.value.title // "") + "\n" + (.value.body // "") + "\n"
-    ' 2>/dev/null)
-
-    if [[ -n "$mem_list" ]]; then
-        echo "$mem_list"
+        printf '%s' "$result" | jq .
     else
-        echo "(no memories found)"
-        echo ""
+        printf '%s' "$result" | jq -r '.text // "(no context)"'
     fi
-
-    if [[ -n "$kg_json" ]] && [[ "$kg_json" != '{"ok":false}' ]]; then
-        local facts
-        facts=$(printf '%s' "$kg_json" | jq -r '
-            (.results // []) |
-            if type == "array" then . else [.[]] end |
-            .[] |
-            "\u2022 " + .subject + " " + .predicate + " " + .object
-        ' 2>/dev/null)
-        if [[ -n "$facts" ]]; then
-            echo "=== GROUND TRUTH (knowledge graph) ==="
-            echo "$facts"
-            echo ""
-        fi
-    fi
-
-    echo "=== END CONTEXT ==="
 }
 
 # memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
@@ -506,27 +443,22 @@ cmd_consolidate() {
         case "$1" in
             --dry-run)
                 json=$(printf '%s' "$json" | jq '. + {dry_run: true}')
-                shift
-                ;;
+                shift ;;
             --*)
                 local key="${1#--}"; key="${key//-/_}"
                 local val="$2"
                 json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
-                shift 2
-                ;;
+                shift 2 ;;
             *) echo "memo consolidate: unknown arg: $1" >&2; exit 1 ;;
         esac
     done
-    curl -sS -X POST "${MEMO_URL}/consolidate" \
-        "${TOKEN_HEADER[@]}" \
-        -H "Content-Type: application/json" \
-        -d "$json" | jq .
+    printf '%s' "$json" | api_call consolidate | jq .
 }
 
-# memo calibrate — three-phase host probe, corpus health check, and codebase ingest.
-# Probe phase runs without MEMO_URL. Ingest phase requires a running API.
+# ---------------------------------------------------------------------------
+# memo calibrate — three-phase host probe, corpus health check, codebase ingest.
+# ---------------------------------------------------------------------------
 cmd_calibrate() {
-    require_jq
     local root="." scope="" dry_run=false no_git=false no_comments=false probe_only=false
     local lua_extra_flags=""
 
@@ -551,58 +483,35 @@ cmd_calibrate() {
         exit 1
     }
 
-    # ── Phase 1: host probe + embedder recommendation (no server required) ──
+    # ── Phase 1: host probe + embedder recommendation (no DB required) ──────
     "$lua" -e "require('luamemo.cli.calibrate').run({[==[--root]==],[==[${root}]==],${lua_extra_flags}})"
     [[ "$probe_only" == true ]] && return 0
 
-    # ── Phases 2+3: resolve MEMO_URL ────────────────────────────────────────
+    # ── Phase 2: resolve DB connection ──────────────────────────────────────
     # Resolution order:
-    #   1. --url flag or $MEMO_URL env var (already in env from ~/.memorc load)
-    #   2. Auto-probe localhost:8765 (standard luamemo Docker Compose port)
+    #   1. $MEMO_DB_URL env var (from ~/.memorc or explicit)
+    #   2. Individual PG* env vars (PGHOST etc.)
     #   3. Prompt once, save to ~/.memorc
 
-    local _auto_token_generated=false
-
-    if [[ -z "${MEMO_URL:-}" ]]; then
-        # Try the standard local dev port silently
-        local _probe_url="http://localhost:8765/api/memory"
-        if curl -sf --connect-timeout 1 "${_probe_url}/recent?limit=1" \
-                ${TOKEN_HEADER[@]+"${TOKEN_HEADER[@]}"} -o /dev/null 2>/dev/null; then
-            MEMO_URL="$_probe_url"
+    if [[ -z "${MEMO_DB_URL:-}" ]] && \
+       [[ -z "${PGHOST:-}" ]] && [[ -z "${PGDATABASE:-}" ]]; then
+        echo ""
+        echo "  No database config found."
+        echo -n "  Enter MEMO_DB_URL (e.g. postgresql://postgres:@127.0.0.1:5432/luamemo): "
+        read -r MEMO_DB_URL
+        if [[ -z "$MEMO_DB_URL" ]]; then
             echo ""
-            echo "  Auto-detected server at $_probe_url"
-        else
-            echo ""
-            echo "  No server found at localhost:8765."
-            echo ""
-            echo -n "  Enter your MEMO_URL (e.g. http://localhost:8765/api/memory): "
-            read -r MEMO_URL
-            if [[ -z "$MEMO_URL" ]]; then
-                echo ""
-                echo "  ⚠  No server configured — memories will NOT be saved."
-                echo "     Re-run: memo calibrate"
-                return 0
-            fi
-            # Auto-generate a token if none set
-            if [[ -z "${MEMO_TOKEN:-}" ]]; then
-                MEMO_TOKEN=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40 2>/dev/null \
-                             || cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | head -c 40)
-                TOKEN_HEADER=(-H "Authorization: Bearer ${MEMO_TOKEN}")
-                _auto_token_generated=true
-            fi
-            # Persist to ~/.memorc
-            {
-                printf '\nMEMO_URL=%s\n' "$MEMO_URL"
-                [[ "$_auto_token_generated" == true ]] && printf 'MEMO_TOKEN=%s\n' "$MEMO_TOKEN"
-            } >> "$HOME/.memorc"
-            echo ""
-            echo "  Saved to ~/.memorc — future runs need no configuration."
-            [[ "$_auto_token_generated" == true ]] && \
-                echo "  Auto-generated token: $MEMO_TOKEN  (add to your app's auth_fn)"
+            echo "  No database configured — memories will NOT be saved."
+            echo "     Re-run: memo calibrate"
+            return 0
         fi
+        printf '\nMEMO_DB_URL=%s\n' "$MEMO_DB_URL" >> "$HOME/.memorc"
+        echo ""
+        echo "  Saved to ~/.memorc — future runs need no configuration."
+        export MEMO_DB_URL
     fi
 
-    # Auto-detect scope
+    # ── Phase 3: auto-detect scope ──────────────────────────────────────────
     if [[ -z "$scope" ]]; then
         if [[ -n "${MEMO_SCOPE:-}" ]]; then
             scope="$MEMO_SCOPE"
@@ -619,13 +528,13 @@ cmd_calibrate() {
     echo ""
     echo "Ingesting codebase → scope: $scope"
 
-    # Get last calibrated commit for incremental git scanning
+    # Get last calibrated commit for incremental scanning (via KG)
     local since_sha=""
-    since_sha=$(curl -sS -G "${MEMO_URL}/kg/query" "${TOKEN_HEADER[@]}" \
-        --data-urlencode "scope=$scope" \
-        --data-urlencode "subject=calibrate" \
-        --data-urlencode "predicate=last_commit" 2>/dev/null | \
-        jq -r '(.results // []) | if type=="array" then .[0] else ."1" end | .object // empty' \
+    since_sha=$(jq -n \
+        --arg scope "$scope" \
+        '{scope: $scope, subject: "calibrate", predicate: "last_commit", limit: 1}' \
+        | api_call kg-query \
+        | jq -r '(.results // []) | if type=="array" then .[0] else ."1" end | .object // empty' \
         2>/dev/null || echo "")
     [[ -n "$since_sha" ]] && echo "  (incremental: commits since ${since_sha:0:7})"
 
@@ -635,34 +544,31 @@ cmd_calibrate() {
     [[ "$no_git" == true      ]] && scan_flags+="[==[--no-git]==],"
     [[ "$no_comments" == true ]] && scan_flags+="[==[--no-comments]==],"
 
-    # ── Phase 3: scan → POST /write ─────────────────────────────────────────
+    # ── Phase 4: scan → write (single Lua process handles all writes) ────────
     local count=0 errors=0
-    while IFS= read -r mem_line; do
-        [[ -z "$mem_line" ]] && continue
-        if [[ "$dry_run" == true ]]; then
+    if [[ "$dry_run" == true ]]; then
+        while IFS= read -r mem_line; do
+            [[ -z "$mem_line" ]] && continue
             local title; title=$(printf '%s' "$mem_line" | jq -r '.title // "(no title)"' 2>/dev/null)
             echo "  [dry-run] $title"
             (( count++ )) || true
-        else
-            local resp
-            resp=$(curl -sS -X POST "${MEMO_URL}/write" \
-                "${TOKEN_HEADER[@]}" \
-                -H "Content-Type: application/json" \
-                -d "$mem_line" 2>/dev/null)
-            if printf '%s' "$resp" | jq -e '.ok' >/dev/null 2>&1; then
-                local title; title=$(printf '%s' "$resp" | jq -r '.result.title // "(ok)"' 2>/dev/null)
-                echo "  + $title"
+        done < <("$lua" -e "require('luamemo.cli.calibrate').run({${scan_flags}})")
+        echo ""
+        echo "  [dry-run] Would write $count memories. Re-run without --dry-run to apply."
+    else
+        while IFS= read -r result_line; do
+            [[ -z "$result_line" ]] && continue
+            local ok; ok=$(printf '%s' "$result_line" | jq -r '.ok // false' 2>/dev/null)
+            if [[ "$ok" == "true" ]]; then
                 (( count++ )) || true
             else
                 (( errors++ )) || true
             fi
-        fi
-    done < <("$lua" -e "require('luamemo.cli.calibrate').run({${scan_flags}})")
-
-    echo ""
-    if [[ "$dry_run" == true ]]; then
-        echo "  [dry-run] Would write $count memories. Re-run without --dry-run to apply."
-    else
+        done < <(
+            "$lua" -e "package.path='./?/init.lua;'..package.path; require('luamemo.cli.calibrate').run({${scan_flags}})" \
+            | "$lua" -e "package.path='./?/init.lua;'..package.path; require('luamemo.cli.api').dispatch('write-many')"
+        )
+        echo ""
         echo "  Done: $count memories written ($errors errors) to scope=$scope"
     fi
 
@@ -670,21 +576,13 @@ cmd_calibrate() {
     if [[ "$dry_run" != true ]] && [[ "$no_git" != true ]]; then
         local head_sha; head_sha=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo "")
         if [[ -n "$head_sha" ]]; then
-            curl -sS -X POST "${MEMO_URL}/kg/assert" "${TOKEN_HEADER[@]}" \
-                -H "Content-Type: application/json" \
-                -d "{\"scope\":\"${scope}\",\"subject\":\"calibrate\",\"predicate\":\"last_commit\",\"object\":\"${head_sha}\",\"supersede\":true}" \
-                >/dev/null 2>&1 || true
+            jq -n \
+                --arg scope "$scope" \
+                --arg sha "$head_sha" \
+                '{scope: $scope, subject: "calibrate", predicate: "last_commit", object: $sha, supersede: true}' \
+            | api_call kg-assert >/dev/null 2>&1 || true
         fi
     fi
-}
-
-# Find a Lua interpreter for local subcommands (calibrate, doctor) that bypass
-# the HTTP API and load the library modules directly.
-find_lua() {
-    for cand in lua5.1 luajit lua5.3 lua5.4 lua; do
-        if command -v "$cand" >/dev/null; then echo "$cand"; return 0; fi
-    done
-    return 1
 }
 
 cmd_local_lua() {
@@ -694,14 +592,11 @@ cmd_local_lua() {
         echo "memo: no Lua interpreter found (tried lua5.1, luajit, lua5.3, lua5.4, lua)" >&2
         exit 1
     fi
-    # Build a Lua array literal of string args. Each arg goes inside
-    # Lua long-bracket quotes ([==[...]==]) so embedded special chars
-    # (quotes, backslashes, brackets) do not need escaping.
     local args=""
     for a in "$@"; do
         args+="[==[${a}]==],"
     done
-    "$lua" -e "require('luamemo.cli.${module}').run({${args}})"
+    "$lua" -e "package.path='./?/init.lua;'..package.path; require('luamemo.cli.${module}').run({${args}})"
 }
 
 usage() {
@@ -711,12 +606,6 @@ usage() {
 
 [[ $# -lt 1 ]] && usage
 sub="$1"; shift
-
-# calibrate/doctor/migrate: probe phase doesn't need MEMO_URL.
-case "$sub" in
-    calibrate|doctor|migrate) ;;
-    *) : "${MEMO_URL:?MEMO_URL is not set}" ;;
-esac
 
 case "$sub" in
     write)  cmd_write  "$@" ;;

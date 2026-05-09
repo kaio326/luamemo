@@ -7,8 +7,10 @@
 --
 -- Contract: summarize(memories, cfg) -> { title, body, metadata }, err
 
-local cjson = require("cjson.safe")
-local http  = require("luamemo.http")
+local cjson   = require("cjson.safe")
+local http    = require("luamemo.http")
+local util    = require("luamemo.util")
+local _common = require("luamemo.summarizers._common")
 
 local M = {}
 
@@ -20,9 +22,8 @@ local function build_prompt(memories)
         "",
         "Memories:",
     }
-    for i, m in ipairs(memories) do
-        lines[#lines + 1] = string.format("[%d] %s\n%s",
-            i, m.title or "", m.body or "")
+    for _, line in ipairs(_common.build_memory_lines(memories, 1500)) do
+        lines[#lines + 1] = line
     end
     return table.concat(lines, "\n")
 end
@@ -47,10 +48,8 @@ function M.summarize(memories, cfg)
         headers    = { ["Content-Type"] = "application/json" },
         timeout_ms = cfg.summarizer_timeout_ms or 60000,
     })
-    if not status then return nil, "ollama.summarize: HTTP error: " .. tostring(err) end
-    if status >= 300 then
-        return nil, "ollama.summarize: HTTP " .. status .. ": " .. tostring(body)
-    end
+    local ok, herr = util.check_http(status, body, err, "ollama.summarize")
+    if not ok then return nil, herr end
 
     local payload = cjson.decode(body)
     if not payload or type(payload.response) ~= "string" then

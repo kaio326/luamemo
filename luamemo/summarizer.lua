@@ -8,6 +8,7 @@
 --   * the `memo summarize` CLI
 
 local store = require("luamemo.store")
+local util  = require("luamemo.util")
 local db    = require("luamemo.db")
 
 local M = {}
@@ -21,18 +22,7 @@ end
 
 -- Load a summarizer adapter by name, caching the result.
 local function load_adapter(name)
-    name = name or "noop"
-    if _adapter_cache[name] then return _adapter_cache[name] end
-    local ok, mod = pcall(require, "luamemo.summarizers." .. name)
-    if not ok then
-        return nil, "summarizer: adapter not found: " .. name
-            .. " (" .. tostring(mod) .. ")"
-    end
-    if type(mod.summarize) ~= "function" then
-        return nil, "summarizer: adapter '" .. name .. "' missing summarize()"
-    end
-    _adapter_cache[name] = mod
-    return mod
+    return util.load_submodule(_adapter_cache, "luamemo.summarizers", name, "summarize")
 end
 
 --- Run one summarisation cycle.
@@ -208,14 +198,10 @@ function M.promote(opts)
 
     local deleted = false
     if opts.delete_source then
-        local id_list = {}
-        for _, id in ipairs(source_ids) do
-            local n = tonumber(id)
-            if n then id_list[#id_list + 1] = tostring(n) end
-        end
-        if #id_list > 0 then
+        local id_list, id_err = util.sql_id_list(source_ids)
+        if id_list then
             local del_sql = "DELETE FROM " .. store.table_name()
-                .. " WHERE id IN (" .. table.concat(id_list, ",") .. ")"
+                .. " WHERE id IN (" .. id_list .. ")"
             local _, derr = db.query(del_sql)
             if derr then
                 db.query("ROLLBACK")
@@ -249,6 +235,12 @@ end
 --   Phase 3 — Merge clusters: if summarizer adapter ≠ "noop" and dry_run is
 --              false, call adapter.summarize() per cluster, write the merged
 --              memory, delete the originals via replace_with_summary().
+--
+-- max_rows caps the working set to bound pairwise clustering cost (O(N²)).
+-- At max_rows = 500 the worst case is 125 000 pairwise comparisons —
+-- acceptable on modern hardware (~10-50 ms in Lua). Raising above 1000
+-- is not recommended without a smarter clustering algorithm (e.g. mini-batch
+-- k-means or LSH-based candidate generation — see Plan 5 in copilot-planer.md).
 --
 -- @param opts table  scope, dry_run, similarity_threshold, decay_threshold,
 --                    max_rows

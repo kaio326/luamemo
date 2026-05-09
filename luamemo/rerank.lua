@@ -32,6 +32,7 @@
 
 local M = {}
 
+local util            = require("luamemo.util")
 local cfg             = nil
 local _adapter_cache  = {}   -- [name] -> module; avoids repeated pcall+validation
 
@@ -42,18 +43,7 @@ end
 -- Load a reranker adapter by name, caching the result so repeated calls
 -- in a hot search path don't pcall+validate on every request.
 local function load_adapter(name)
-    name = name or "noop"
-    if _adapter_cache[name] then return _adapter_cache[name] end
-    local ok, mod = pcall(require, "luamemo.rerankers." .. name)
-    if not ok then
-        return nil, "rerank: adapter not found: " .. name
-            .. " (" .. tostring(mod) .. ")"
-    end
-    if type(mod.rerank) ~= "function" then
-        return nil, "rerank: adapter '" .. name .. "' missing rerank()"
-    end
-    _adapter_cache[name] = mod
-    return mod
+    return util.load_submodule(_adapter_cache, "luamemo.rerankers", name, "rerank")
 end
 
 --- Rerank a list of search hits against the original query.

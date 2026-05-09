@@ -12,14 +12,14 @@
 -- A 20-candidate rerank typically costs ~10-15k input tokens + a tiny
 -- output, well within local-model latency budgets.
 
-local cjson = require("cjson.safe")
-local http  = require("luamemo.http")
-local util  = require("luamemo.util")
+local cjson   = require("cjson.safe")
+local http    = require("luamemo.http")
+local util    = require("luamemo.util")
+local _common = require("luamemo.rerankers._common")
 
 local M = {}
 
 local CHUNK_MAX = 500
-local clip      = util.clip
 
 local function build_prompt(query, hits)
     local lines = {
@@ -31,11 +31,8 @@ local function build_prompt(query, hits)
         "Query: " .. query,
         "",
         "Candidates:",
+        _common.build_candidates(hits, CHUNK_MAX),
     }
-    for i, h in ipairs(hits) do
-        lines[#lines + 1] = string.format("[%d] %s\n%s",
-            i, clip(h.title or "", 120), clip(h.body or "", CHUNK_MAX))
-    end
     return table.concat(lines, "\n")
 end
 
@@ -57,10 +54,8 @@ function M.rerank(query, hits, cfg)
         headers    = { ["Content-Type"] = "application/json" },
         timeout_ms = cfg.rerank_timeout_ms or 30000,
     })
-    if not status then return nil, "ollama.rerank: HTTP error: " .. tostring(err) end
-    if status >= 300 then
-        return nil, "ollama.rerank: HTTP " .. status .. ": " .. tostring(body)
-    end
+    local ok, herr = util.check_http(status, body, err, "ollama.rerank")
+    if not ok then return nil, herr end
 
     local payload = cjson.decode(body)
     if not payload or type(payload.response) ~= "string" then

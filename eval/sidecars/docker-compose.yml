@@ -31,6 +31,8 @@ services:
       DTYPE: float16
       MAX_CLIENT_BATCH_SIZE: "32"
       MAX_BATCH_TOKENS: "4096"
+    volumes:
+      - tei_embed_cache:/data
     ports:
       - "127.0.0.1:8081:80"
     restart: unless-stopped
@@ -59,6 +61,8 @@ services:
       DTYPE: float16
       MAX_CLIENT_BATCH_SIZE: "32"
       MAX_BATCH_TOKENS: "4096"
+    volumes:
+      - tei_reranker_cache:/data
     ports:
       - "127.0.0.1:8082:80"
     restart: unless-stopped
@@ -75,3 +79,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 180s
+
+volumes:
+  tei_embed_cache:
+  tei_reranker_cache:
+

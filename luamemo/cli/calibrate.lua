@@ -40,6 +40,7 @@
 local cjson     = require("cjson.safe")
 local probe     = require("luamemo.cli.probe")
 local recommend = require("luamemo.cli.recommend")
+local util      = require("luamemo.util")
 
 local M = {}
 
@@ -47,22 +48,15 @@ local M = {}
 -- Utilities
 -- ---------------------------------------------------------------------------
 
-local function read_file(path)
-    local f = io.open(path, "r")
-    if not f then return nil end
-    local c = f:read("*a"); f:close()
-    return c
-end
+local read_file  = util.read_file
+local trim       = util.trim
+local shell_quote = util.shell_quote
 
 local function pread(cmd)
     local f = io.popen(cmd .. " 2>/dev/null")
     if not f then return "" end
     local out = f:read("*a") or ""; f:close()
     return out:gsub("%s+$", "")
-end
-
-local function trim(s)
-    return (s:gsub("^%s*(.-)%s*$", "%1"))
 end
 
 local function truncate(s, n)
@@ -172,7 +166,7 @@ local function scan_adr_files(root, scope)
     for _, dir in ipairs(ADR_DIRS) do
         local ls = pread(string.format(
             "find %s/%s -maxdepth 2 -name '*.md' -type f 2>/dev/null | sort",
-            root, dir))
+            shell_quote(root), shell_quote(dir)))
         for path in ls:gmatch("[^\n]+") do
             local content = read_file(path)
             if content and #content > 50 then
@@ -236,7 +230,7 @@ local function scan_source_comments(root, scope)
         .. " --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor"
         .. " --exclude-dir=.venv --exclude-dir=dist --exclude-dir=build"
         .. " 2>/dev/null | head -300",
-        root)
+        shell_quote(root))
 
     local out = pread(cmd)
     if out == "" then return end
@@ -311,7 +305,7 @@ local function scan_git_commits(root, scope, since_sha, limit)
     end
     local cmd = string.format(
         "git -C %s log %s --no-merges --format='%%H\t%%as\t%%s' 2>/dev/null | head -%d",
-        root, range, limit)
+        shell_quote(root), shell_quote(range), limit)
     local out = pread(cmd)
     if out == "" then return end
 

@@ -93,6 +93,13 @@ elseif args.embedder == "ollama" then
     setup_opts.embedder_adapter = "ollama"
     setup_opts.embedder_model   = os.getenv("OLLAMA_MODEL") or "nomic-embed-text"
     setup_opts.embed_dim        = tonumber(os.getenv("OLLAMA_DIM") or "768")
+elseif args.embedder == "tei" then
+    -- HuggingFace text-embeddings-inference (TEI) sidecar.
+    setup_opts.embedder_url     = os.getenv("TEI_URL")
+        or "http://127.0.0.1:8081/embed"
+    setup_opts.embedder_adapter = "tei"
+    setup_opts.embedder_model   = os.getenv("TEI_MODEL") or "BAAI/bge-m3"
+    setup_opts.embed_dim        = tonumber(os.getenv("TEI_DIM") or "1024")
 elseif args.embedder == "openai" then
     local key = os.getenv("OPENAI_API_KEY")
     if not key or key == "" then

@@ -1,5 +1,126 @@
 # Changelog
 
+## 0.2.5 — 2026-05-09
+
+- **LSH ANN backend (`luamemo/lsh.lua`) — new module.**
+  Random-hyperplane Locality-Sensitive Hashing (Charikar 2002) for cosine
+  similarity. Pure Lua 5.1, zero new dependencies. Activates automatically
+  on the bruteforce backend when a scope's corpus exceeds `lsh_rebuild_at`
+  rows (default 10 000). Reduces the candidate fetch from 1 000 rows to
+  ≈100–300, cutting search latency proportionally. Tunable via
+  `lsh_enabled`, `lsh_rebuild_at`, `lsh_tables` (default 8),
+  `lsh_bits` (default 12). `_get_lsh()` hooks into `_find_near_duplicate()`
+  and `_search_bruteforce()`; insert/update paths keep the in-process index
+  current without a full rebuild.
+
+- **Batch dedup for `write_many()` — O(1) DB queries instead of O(N).**
+  Previously each row in a `write_many()` call with `dedup_strategy != "append"`
+  issued one `_find_near_duplicate()` DB round-trip.  Now: (1) an intra-batch
+  dedup pass compares all pairs in the embed queue using the in-process
+  `_cosine()` function; (2) one `SELECT ... LIMIT <dedup_candidate_limit>`
+  per distinct scope fetches all candidates; (3) cosine matching runs in Lua
+  memory.  New config key: `dedup_candidate_limit` (default 1 000).
+
+- **Parallel async embedding for `write_many()` (`luamemo/async.lua`) — new
+  module.** When running outside OpenResty and the batch has more than one
+  row, embeddings are fetched concurrently via `luamemo.async.run_all()` —
+  a pure-Lua coroutine scheduler built on non-blocking `socket.tcp()`.
+  `luamemo.http.request_async()` and `luamemo.embed.embed_async()` are the
+  public async entry-points.  Falls back to sequential embedding when
+  inside OpenResty (resty.http is already non-blocking) or when using HTTPS
+  or a local embedder.
+
+- **`tune_weights` sampling fix.** For corpora > 10 000 rows,
+  `_sample_rows()` now issues `TABLESAMPLE BERNOULLI` with 3× oversampling
+  instead of a full-table `ORDER BY random()` scan, capping I/O while
+  keeping the sample representative.
+
+- **`migrations/005_composite_indexes.sql` — new migration.**
+  Adds `CREATE INDEX IF NOT EXISTS lm_memories_scope_kind_idx ON lm_memories (scope, kind)`
+  to accelerate scope+kind filtered queries on the bruteforce backend.
+
+- **Shared helper modules (code quality).**
+  `luamemo/rerankers/_common.lua` (`build_candidates`) and
+  `luamemo/summarizers/_common.lua` (`build_memory_lines`) extracted from
+  the Ollama/OpenAI adapters to eliminate duplication.  All callers updated.
+
+- **`util.shell_quote`, `util.require_str` — new helpers.**
+  `shell_quote(s)` wraps a value in POSIX single-quotes with `'` → `'\''`
+  escaping, replacing all ad-hoc quoting in `calibrate.lua` and `secrets.lua`.
+  `require_str(v, name)` validates a non-empty string argument, returning
+  `nil, err` on failure.
+
+- **Security hardening.**
+  - `secrets.execute_with_secret`: SSRF guard extended with a live DNS
+    re-validation pass (`socket.dns.toip`) after the hostname string-match
+    check to catch bypasses via numeric-looking hostnames; multipart symlink
+    guard uses `util.shell_quote`; `os.execute` exit-code check corrected for
+    Lua 5.1 semantics.
+  - `routes.lua`: all boolean query-param coercions delegated to
+    `util.to_bool()`; `recent` limit capped at 100 (was unbounded).
+  - `kg.lua`: `require_str` replaces the local duplicate validation function.
+  - `hooks.lua`: `clip` alias corrected (was `trim`, which shadowed the wrong
+    function), fixing silent body truncation in all 5 hook call sites.
+
+## 0.2.5 — 2026-05-08
+
+- **Direct DB access — HTTP layer removed.** `MEMO_DB_URL` (PostgreSQL URL)
+  replaces `MEMO_URL` + `MEMO_TOKEN` for all CLI and MCP operations.
+  Accepts `postgresql://[user[:pass]@][host][:port][/db]`; falls back to
+  individual `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD` env vars
+  or `luamemo.config` `pg_*` keys.
+- **`luamemo/db.lua` — pgmoon only.** `lapis.db` detection and all HTTP
+  adapters removed. A URL parser (`parse_db_url`) handles `MEMO_DB_URL`.
+  `M.reset()` forces reconnect (useful in long-lived processes after a
+  config change). Public API unchanged: `query`, `escape_literal`,
+  `escape_identifier`, `interpolate_query`, `delete`.
+- **`luamemo/cli/api.lua`** — new single-operation Lua dispatcher.
+  Each invocation reads a JSON object from stdin, calls the appropriate
+  `luamemo.*` library function, and writes the JSON result to stdout.
+  Commands: `write`, `write-many` (NDJSON stream), `search`, `recent`,
+  `get`, `update`, `delete`, `summarize`, `promote`, `consolidate`,
+  `kg-query`, `kg-assert`, `kg-invalidate`, `kg-timeline`, `secret-list`,
+  `secret-store`, `secret-delete`, `secret-execute`, `context`.
+  Used by both `cli/memo` (Bash → Lua pipe) and `mcp/server.lua` (direct
+  `require` calls).
+- **`mcp/server.lua` — direct lib calls, no curl.** All 11 tool handlers
+  now call `store.*`, `summarizer.*`, `secrets.*` directly. Removed:
+  `MEMO_URL`, `MEMO_TOKEN`, `http_request()`, `shell_quote()`,
+  `urlencode()`, `build_query()`. Config: `MEMO_DB_URL`, `MEMO_SCOPE`,
+  `MEMO_MASTER_KEY`, `MEMO_SECRETS_FILE`, `MEMO_DEBUG`.
+- **`cli/memo` — all curl removed.** Every subcommand now pipes a JSON
+  payload through `lua -e "require('luamemo.cli.api').dispatch('cmd')"`.
+  `memo calibrate` Phase 4 pipes `calibrate.run({--scan})` output directly
+  into `api.dispatch('write-many')`. No HTTP server running required.
+- **Pre-release security and correctness audit — all findings fixed:**
+  - `secrets`: constant-time HMAC comparison; key length stripped from error
+    messages; path traversal guard in `execute_with_secret` multipart upload;
+    full SSRF IP-range blocking (localhost, 127.x, 169.254.x, 10.x,
+    192.168.x, 172.16–31.x, ::1) added alongside existing scheme guard;
+    multipart boundary now uses `crypto.random_bytes` (CSPRNG) instead of
+    `math.random`; `os.execute` chmod exit-code check fixed for Lua 5.1
+    (non-zero integer is a failure, not `false`); `_read_file` deduplication
+    removed (delegates to `util.read_file`).
+  - `store`: `M.recent` now honours `kind` filter and `offset` pagination
+    arguments (previously silently ignored); temporal `until` bound key
+    corrected to `args["until"]` (was `args.until_`, never matched callers).
+  - `store`, `cli/api`, `mcp/server`: `store.write` returns `(row, err, action)`;
+    all three callers now destructure in the correct order (previously `action`
+    and `err` were swapped, causing error messages to be silently discarded).
+  - `calibrate`: all three `io.popen` sites shell-quote the `root` and
+    `range`/`dir` arguments to prevent command injection via CLI flags.
+  - `mcp/server`: DB password redacted from `MEMO_DEBUG=1` startup log;
+    `tools/list` and `prompts/list` responses are now sorted alphabetically
+    (deterministic across runs).
+  - `summarizers`: memory body clipped to 1500 chars before sending to
+    summarizer LLM to prevent oversized prompts.
+- **`luamemo/util.lua` — centralised shared helpers.** All previously
+  duplicated one-liners across adapters, CLI modules, and dispatchers now
+  delegate to a single source of truth:
+  `trim`, `read_file`, `to_bool`, `load_submodule`, `check_http`,
+  `sql_id_list`, `clamp_check`, `clip`, `parse_scores`.
+  Every module that previously had its own copy now `require("luamemo.util")`.
+
 ## 0.2.4 — 2026-05-07
 
 - **`memo context QUERY`** — new CLI subcommand that assembles a compact,

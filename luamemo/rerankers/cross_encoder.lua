@@ -102,13 +102,8 @@ function M.rerank(query, hits, cfg)
         method = "POST", body = req_body, headers = headers,
         timeout_ms = cfg.rerank_timeout_ms or 30000,
     })
-    if not status then
-        return nil, "cross_encoder.rerank: HTTP error: " .. tostring(err)
-    end
-    if status >= 300 then
-        return nil, "cross_encoder.rerank: HTTP " .. status
-            .. ": " .. tostring(body)
-    end
+    local ok, herr = util.check_http(status, body, err, "cross_encoder.rerank")
+    if not ok then return nil, herr end
 
     local out, perr = parse_response(body)
     if not out then return nil, perr end

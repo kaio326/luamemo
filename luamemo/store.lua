@@ -4,11 +4,14 @@
 local db    = require("luamemo.db")
 local cjson = require("cjson.safe")
 local embed = require("luamemo.embed")
+local util  = require("luamemo.util")
 
 local M = {}
 
 local cfg = nil
 local _backend = nil   -- resolved backend: "pgvector" | "bruteforce"
+local lsh_mod    = nil  -- lazily required "luamemo.lsh" (never loads for pgvector backend)
+local _lsh_index = {}   -- [scope_string] = lsh-idx-object | false | nil
 
 -- Probe Postgres for the `vector` extension. Wrapped in pcall so a DB
 -- that's not yet reachable at configure() time doesn't crash startup —
@@ -35,6 +38,9 @@ function M.configure(config)
     if type(ngx) == "table" and ngx.log and ngx.INFO then
         ngx.log(ngx.INFO, "luamemo backend: ", _backend)
     end
+    -- Reset per-scope LSH indices on reconfigure so tests start fresh.
+    _lsh_index = {}
+    lsh_mod    = nil
 end
 
 --- Returns the resolved backend ("pgvector" | "bruteforce"). Useful for
@@ -53,6 +59,71 @@ end
 --- that need to write their own queries against the same table.
 function M.table_name() return tbl() end
 
+-- ---------------------------------------------------------------------------
+-- LSH helpers (Phases 5.2–5.4)
+-- LSH is a middle-tier ANN backend for the bruteforce case: when the corpus
+-- exceeds lsh_rebuild_at rows, one candidate-fetch SELECT is replaced by an
+-- in-memory hash lookup that returns ≈100–300 candidates instead of 1000.
+-- ---------------------------------------------------------------------------
+
+-- LSH is only useful on the bruteforce backend; pgvector uses HNSW already.
+local function _lsh_enabled()
+    if _backend ~= "bruteforce"         then return false end
+    if cfg and cfg.lsh_enabled == false then return false end
+    return true
+end
+
+local function _lsh_rebuild_at()
+    return (cfg and tonumber(cfg.lsh_rebuild_at)) or 10000
+end
+
+-- Return the active LSH index for `scope`, building it lazily on first call
+-- when the corpus crosses lsh_rebuild_at rows for that scope.
+-- `vec_hint` is a sample embedding used to infer the vector dimension;
+-- falls back to cfg.embed_dim (default 384) when nil.
+-- Returns the index object, or nil when LSH is disabled / corpus is small.
+local function _get_lsh(scope, vec_hint)
+    if not _lsh_enabled() or not scope then return nil end
+
+    local cached = _lsh_index[scope]
+    if cached ~= nil then
+        -- false  = corpus was below threshold when last checked
+        -- <idx>  = active index object
+        return cached ~= false and cached or nil
+    end
+
+    -- First access for this scope: fetch all embeddings to decide.
+    -- For the bruteforce backend, embedding is real[] — pgmoon returns a Lua table.
+    local rows = db.query(([[SELECT id, embedding FROM %s WHERE scope = %s
+    ]]):format(tbl(), db.escape_literal(scope)))
+
+    if not rows or #rows < _lsh_rebuild_at() then
+        _lsh_index[scope] = false  -- below threshold; use full-scan bruteforce
+        return nil
+    end
+
+    -- Infer dimension from first row, then fall back to config / 384.
+    local dim = (vec_hint and #vec_hint)
+        or  (rows[1] and type(rows[1].embedding) == "table" and #rows[1].embedding)
+        or  (cfg and tonumber(cfg.embed_dim))
+        or  384
+
+    if not lsh_mod then lsh_mod = require("luamemo.lsh") end
+    local new_idx = lsh_mod.new(dim,
+        tonumber(cfg and cfg.lsh_tables) or 8,
+        tonumber(cfg and cfg.lsh_bits)   or 12)
+
+    local entries = {}
+    for _, row in ipairs(rows) do
+        if type(row.embedding) == "table" then
+            entries[#entries + 1] = { id = row.id, vec = row.embedding }
+        end
+    end
+    new_idx:rebuild(entries)
+    _lsh_index[scope] = new_idx
+    return new_idx
+end
+
 local function pg_array(arr)
     if not arr or #arr == 0 then return "'{}'" end
     local parts = {}
@@ -66,20 +137,8 @@ local function as_jsonb(t)
     return db.interpolate_query("?::jsonb", cjson.encode(t or {}))
 end
 
--- Validate a numeric weight against [lo, hi]. Returns (number, nil) on
--- success or (nil, err) on failure. Accepts string or number; returns nil
--- if the value is nil so callers can fall back to a default.
-local function clamp_check(name, val, lo, hi)
-    if val == nil then return nil, nil end
-    local n = tonumber(val)
-    if not n then
-        return nil, name .. ": must be a number"
-    end
-    if n < lo or n > hi then
-        return nil, string.format("%s: must be between %g and %g", name, lo, hi)
-    end
-    return n, nil
-end
+-- Validate a numeric weight against [lo, hi].  Delegates to util.
+local clamp_check = util.clamp_check
 
 -- Standard column list returned by all read paths. Kept in one place so new
 -- columns (e.g. importance/decay_rate from migration 002) are surfaced
@@ -132,7 +191,8 @@ local function _cosine(a, b)
     if na == 0 or nb == 0 then return 0 end
     return dot / (math.sqrt(na) * math.sqrt(nb))
 end
-M._cosine = _cosine   -- exposed for tests
+M._cosine    = _cosine    -- exposed for tests
+M._get_lsh   = _get_lsh   -- exposed for tests (trigger lazy rebuild)
 
 -- Format an embedding for INSERT depending on backend.
 local function _embed_literal(vec)
@@ -156,14 +216,31 @@ local function _find_near_duplicate(scope, vec, threshold)
 
     if _backend == "bruteforce" then
         local cap = tonumber(cfg.bruteforce_candidate_limit) or 1000
-        local sql = ([[
-            SELECT %s, embedding
-            FROM %s
-            WHERE scope = %s
-            ORDER BY updated_at DESC
-            LIMIT %d
-        ]]):format(RETURN_COLS, tbl(), db.escape_literal(scope), cap)
-        local rows = db.query(sql)
+        -- When the LSH index is active for this scope, pre-filter to a small
+        -- candidate set; fall back to a full-scope scan for small corpora.
+        local lsh_idx = _get_lsh(scope, vec)
+        local rows
+        if lsh_idx then
+            local cand_ids = lsh_idx:query(vec, cap)
+            if #cand_ids > 0 then
+                local id_list = util.sql_id_list(cand_ids)
+                if id_list then
+                    rows = db.query(([[
+                        SELECT %s, embedding FROM %s WHERE id IN (%s)
+                    ]]):format(RETURN_COLS, tbl(), id_list))
+                end
+            end
+        end
+        if not rows then
+            -- Full scan fallback: LSH disabled or corpus below threshold.
+            rows = db.query(([[
+                SELECT %s, embedding
+                FROM %s
+                WHERE scope = %s
+                ORDER BY updated_at DESC
+                LIMIT %d
+            ]]):format(RETURN_COLS, tbl(), db.escape_literal(scope), cap))
+        end
         if not rows or #rows == 0 then return nil end
         local best, best_sim = nil, -1
         for _, row in ipairs(rows) do
@@ -289,6 +366,9 @@ function M.write(args)
     )
     local rows, qerr = db.query(sql)
     if not rows then return nil, "write: db error: " .. tostring(qerr) end
+    -- Keep LSH index current when active for this scope.
+    local _lsh = _lsh_index[scope]
+    if _lsh and _lsh ~= false then _lsh:insert(rows[1].id, vec) end
     return rows[1], nil, "inserted"
 end
 
@@ -318,9 +398,10 @@ function M.write_many(rows_in, opts)
     local results = {}
     if #rows_in == 0 then return results, nil end
 
-    -- Phase A: validate + embed every row, recording per-row errors. We embed
-    -- before slicing into INSERT chunks so a bad row doesn't poison the batch.
+    -- Phase A1: validate every row and collect an embed queue.
+    -- Embedding is deferred so we can fan it out concurrently in A2.
     local prepared = {}
+    local embed_queue = {}   -- { i, text, title, body, importance, decay_rate, args }
     for i, args in ipairs(rows_in) do
         if type(args) ~= "table" then
             results[i] = { row = nil, action = nil, error = "row must be a table" }
@@ -340,49 +421,223 @@ function M.write_many(rows_in, opts)
                         results[i] = { row = nil, action = nil, error = derr }
                     else
                         if decay_rate == nil then decay_rate = cfg.default_decay_rate or 0.0 end
-                        local vec, eerr, vtrunc = embed.embed(title .. "\n" .. body)
-                        if not vec then
-                            results[i] = { row = nil, action = nil, error = eerr }
-                        else
-                            -- Optional dedup. Costs one similarity probe per
-                            -- row; opt-in only.
-                            if cfg.dedup_enabled and strategy ~= "append" then
-                                local scope = args.scope or cfg.default_scope
-                                local existing = _find_near_duplicate(
-                                    scope, vec, cfg.dedup_threshold or 0.95)
-                                if existing then
-                                    if strategy == "skip" then
-                                        results[i] = { row = existing, action = "skipped" }
-                                        -- Do not enqueue for INSERT.
-                                        prepared[i] = nil
-                                    elseif strategy == "update" then
-                                        local merged, merr = _merge_into(existing, args)
-                                        if not merged then
-                                            results[i] = { row = nil, action = nil, error = merr }
-                                        else
-                                            results[i] = { row = merged, action = "merged" }
-                                        end
-                                        prepared[i] = nil
-                                    end
-                                end
-                            end
-                            if results[i] == nil then
-                                prepared[i] = {
-                                    scope = args.scope or cfg.default_scope,
-                                    kind  = args.kind or "fact",
-                                    title = title,
-                                    body  = body,
-                                    tags  = args.tags or {},
-                                    meta  = args.metadata or {},
-                                    vec   = vec,
-                                    importance = importance,
-                                    decay_rate = decay_rate,
-                                    truncated  = vtrunc and true or false,
-                                }
+                        embed_queue[#embed_queue + 1] = {
+                            i          = i,
+                            text       = title .. "\n" .. body,
+                            title      = title,
+                            body       = body,
+                            importance = importance,
+                            decay_rate = decay_rate,
+                            args       = args,
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    -- Phase A2: embed all queued rows.
+    -- In plain Lua with an HTTP embedder and more than one row, fan out
+    -- concurrently via luamemo.async so total latency ≈ 1 × embed_latency.
+    -- In OpenResty (ngx global present) resty.http is already non-blocking,
+    -- so the async scheduler adds overhead without benefit — stay sequential.
+    local vecs = {}   -- [j] = { vec = table, truncated = bool } for embed_queue[j]
+    local is_openresty = (type(ngx) == "table")
+    if not is_openresty and #embed_queue > 1 then
+        local async = require("luamemo.async")
+        local tasks = {}
+        for j, item in ipairs(embed_queue) do
+            local text = item.text
+            tasks[j] = function()
+                local vec, eerr, vtrunc = embed.embed_async(text, async.wait)
+                return { vec = vec, err = eerr, truncated = vtrunc }
+            end
+        end
+        local timeout_per = tonumber(cfg.embed_timeout_ms) or 5000
+        local async_results = async.run_all(tasks, timeout_per * #embed_queue + 5000)
+        for j, ar in ipairs(async_results) do
+            local r = ar.result
+            if ar.ok and r and r.vec then
+                vecs[j] = { vec = r.vec, truncated = r.truncated }
+            else
+                local errmsg = (r and r.err) or (not ar.ok and tostring(ar.result)) or "embed failed"
+                results[embed_queue[j].i] = { row = nil, action = nil, error = errmsg }
+            end
+        end
+    else
+        -- Sequential path: OpenResty, single row, or local embedder.
+        for j, item in ipairs(embed_queue) do
+            local vec, eerr, vtrunc = embed.embed(item.text)
+            if not vec then
+                results[item.i] = { row = nil, action = nil, error = eerr }
+            else
+                vecs[j] = { vec = vec, truncated = vtrunc and true or false }
+            end
+        end
+    end
+
+    -- Phase A3: batch dedup + build prepared INSERT entries.
+    --
+    -- Original approach: one _find_near_duplicate() DB call per row = O(N) round-trips.
+    -- New approach (when dedup is active):
+    --   1. Intra-batch dedup: compare all pairs within the embed_queue first so
+    --      rows that duplicate each other within the same batch are handled correctly
+    --      (DB candidates won't include rows being inserted in this very call).
+    --   2. Group embedded rows by scope (usually 1 scope, sometimes a few).
+    --   3. Issue ONE candidate fetch per distinct scope from the DB.
+    --   4. Run cosine comparisons in Lua memory — no extra DB round-trips.
+    -- O(distinct_scopes) DB calls instead of O(N). For N=100 rows of 1 scope
+    -- this eliminates ~99 round-trips; memory footprint ≈ candidates × dim × 8B.
+    local threshold = cfg.dedup_threshold or 0.95
+    local dedup_active = cfg.dedup_enabled and strategy ~= "append"
+
+    -- 1. Intra-batch dedup pass (only when dedup is active).
+    --    For each successfully embedded pair (j, k) with j<k, if cosine ≥ threshold
+    --    the later-indexed item (k) is treated as a duplicate of item j.
+    --    We process pairs in order so the first occurrence always wins.
+    if dedup_active then
+        for j = 1, #embed_queue do
+            if vecs[j] then
+                for k = j + 1, #embed_queue do
+                    if vecs[k] then
+                        local sim = _cosine(vecs[j].vec, vecs[k].vec)
+                        if sim >= threshold then
+                            local i_j = embed_queue[j].i
+                            local i_k = embed_queue[k].i
+                            -- "k" duplicates "j".  Build a synthetic "existing" row
+                            -- from item j's args so the skip/update logic below works
+                            -- correctly.  We only have vector similarity here; the
+                            -- actual DB row does not exist yet, so we skip/merge in
+                            -- favour of item j by marking item k as a duplicate.
+                            if strategy == "skip" then
+                                -- Mark k as skipped; j will be inserted normally.
+                                results[i_k] = { row = nil, action = "skipped",
+                                    error = "duplicate of batch item " .. i_j }
+                                vecs[k] = nil  -- remove from further processing
+                            elseif strategy == "update" then
+                                -- Merge k's args into j's args (title/body/tags/meta).
+                                local a_j = embed_queue[j].args
+                                local a_k = embed_queue[k].args
+                                if a_k.body  and a_k.body  ~= "" then a_j.body  = a_j.body .. "\n" .. a_k.body  end
+                                if a_k.tags     then a_j.tags     = a_k.tags     end
+                                if a_k.metadata then a_j.metadata = a_k.metadata end
+                                results[i_k] = { row = nil, action = "merged",
+                                    error = "merged into batch item " .. i_j }
+                                vecs[k] = nil
                             end
                         end
                     end
                 end
+            end
+        end
+    end
+
+    -- 2+3. Group by scope; one candidate fetch per distinct scope.
+    --      Only runs when dedup is active.
+    local scope_candidates = {}  -- [scope_str] = array of { row, embedding_vec }
+    if dedup_active then
+        -- Collect distinct scopes among still-valid embed_queue items.
+        local scopes_needed = {}
+        for j, item in ipairs(embed_queue) do
+            if vecs[j] and not results[item.i] then
+                local sc = item.args.scope or cfg.default_scope
+                scopes_needed[sc] = true
+            end
+        end
+        -- Fetch candidates once per scope.
+        local cap = tonumber(cfg.dedup_candidate_limit) or 1000
+        for sc in pairs(scopes_needed) do
+            local sql
+            if _backend == "bruteforce" then
+                sql = ([[
+                    SELECT id, title, body, tags, metadata, importance,
+                           decay_rate, was_truncated, created_at, updated_at,
+                           scope, kind, embedding
+                    FROM %s WHERE scope = %s
+                    ORDER BY updated_at DESC LIMIT %d
+                ]]):format(tbl(), db.escape_literal(sc), cap)
+            else
+                -- pgvector: embedding column is a vector type; cast to text for transfer
+                -- then parse back so we can use _cosine() on it in Lua.
+                sql = ([[
+                    SELECT id, title, body, tags, metadata, importance,
+                           decay_rate, was_truncated, created_at, updated_at,
+                           scope, kind, embedding::text AS embedding_text
+                    FROM %s WHERE scope = %s
+                    ORDER BY updated_at DESC LIMIT %d
+                ]]):format(tbl(), db.escape_literal(sc), cap)
+            end
+            local rows = db.query(sql)
+            if rows then
+                local cands = {}
+                for _, row in ipairs(rows) do
+                    -- Parse embedding into a Lua number array for _cosine().
+                    local ev = row.embedding or row.embedding_text
+                    local vec_parsed
+                    if type(ev) == "table" then
+                        vec_parsed = ev  -- bruteforce: pgmoon returns real[] as table
+                    elseif type(ev) == "string" then
+                        -- pgvector returns '[1.0,2.0,...]'; bruteforce '{1.0,...}'
+                        vec_parsed = {}
+                        for num in ev:gmatch("[%-]?%d+%.?%d*[eE]?[+-]?%d*") do
+                            vec_parsed[#vec_parsed + 1] = tonumber(num)
+                        end
+                    end
+                    row.embedding      = nil
+                    row.embedding_text = nil
+                    cands[#cands + 1] = { row = row, vec = vec_parsed }
+                end
+                scope_candidates[sc] = cands
+            else
+                scope_candidates[sc] = {}
+            end
+        end
+    end
+
+    -- 4. Per-row dedup against in-memory candidates + build prepared entries.
+    for j, item in ipairs(embed_queue) do
+        local slot = vecs[j]
+        if slot then
+            local i, args_i = item.i, item.args
+            local vec, vtrunc = slot.vec, slot.truncated
+
+            if dedup_active and not results[i] then
+                local sc = args_i.scope or cfg.default_scope
+                local cands = scope_candidates[sc] or {}
+                local best_row, best_sim = nil, -1
+                for _, c in ipairs(cands) do
+                    if c.vec then
+                        local sim = _cosine(c.vec, vec)
+                        if sim > best_sim then best_sim = sim; best_row = c.row end
+                    end
+                end
+                if best_row and best_sim >= threshold then
+                    if strategy == "skip" then
+                        results[i] = { row = best_row, action = "skipped" }
+                    elseif strategy == "update" then
+                        local merged, merr = _merge_into(best_row, args_i)
+                        if not merged then
+                            results[i] = { row = nil, action = nil, error = merr }
+                        else
+                            results[i] = { row = merged, action = "merged" }
+                        end
+                    end
+                end
+            end
+
+            if results[i] == nil then
+                prepared[i] = {
+                    scope      = args_i.scope or cfg.default_scope,
+                    kind       = args_i.kind or "fact",
+                    title      = item.title,
+                    body       = item.body,
+                    tags       = args_i.tags or {},
+                    meta       = args_i.metadata or {},
+                    vec        = vec,
+                    importance = item.importance,
+                    decay_rate = item.decay_rate,
+                    truncated  = vtrunc and true or false,
+                }
             end
         end
     end
@@ -431,6 +686,12 @@ function M.write_many(rows_in, opts)
                 local r = inserted[j - pos + 1]
                 if r then
                     results[indices[j]] = { row = r, action = "inserted" }
+                    -- Keep LSH index current when active for this scope.
+                    local p = prepared[indices[j]]
+                    if p then
+                        local _lsh = _lsh_index[p.scope]
+                        if _lsh and _lsh ~= false then _lsh:insert(r.id, p.vec) end
+                    end
                 else
                     results[indices[j]] = { row = nil, action = nil,
                         error = "write_many: missing RETURNING row" }
@@ -492,11 +753,13 @@ function M.update(id, patch)
     end
 
     -- Re-embed when text changed.
+    local update_vec = nil  -- tracked so we can keep the LSH index current below
     if patch.title or patch.body then
         local title = patch.title or existing.title
         local body  = patch.body  or existing.body
         local vec, eerr, vtrunc = embed.embed(title .. "\n" .. body)
         if not vec then return nil, eerr end
+        update_vec = vec
         table.insert(fields, "embedding = " .. _embed_literal(vec))
         table.insert(fields, "was_truncated = " .. db.escape_literal(vtrunc and true or false))
     end
@@ -508,6 +771,12 @@ function M.update(id, patch)
     table.insert(vals, id)
     local rows, err = db.query(db.interpolate_query(sql, unpack(vals)))
     if not rows then return nil, "update: db error: " .. tostring(err) end
+    -- Keep LSH index current when the embedding was re-computed.
+    if update_vec then
+        local sc  = patch.scope or existing.scope
+        local _lsh = _lsh_index[sc]
+        if _lsh and _lsh ~= false then _lsh:insert(id, update_vec) end
+    end
     return rows[1]
 end
 
@@ -627,17 +896,13 @@ function M.replace_with_summary(ids, summary_args)
         return nil, "replace_with_summary: insert failed: " .. tostring(werr)
     end
 
-    local id_list = {}
-    for _, id in ipairs(ids) do
-        local n = tonumber(id)
-        if n then id_list[#id_list + 1] = tostring(n) end
-    end
-    if #id_list == 0 then
+    local id_list, id_err = util.sql_id_list(ids)
+    if not id_list then
         db.query("ROLLBACK")
         return nil, "replace_with_summary: no valid ids"
     end
     local del_sql = "DELETE FROM " .. tbl()
-        .. " WHERE id IN (" .. table.concat(id_list, ",") .. ")"
+        .. " WHERE id IN (" .. id_list .. ")"
     local _, derr = db.query(del_sql)
     if derr then
         db.query("ROLLBACK")
@@ -653,17 +918,22 @@ end
 -- ---------------------------------------------------------------------------
 function M.recent(args)
     args = args or {}
-    local limit = math.min(tonumber(args.limit) or 20, 200)
-    local where = ""
+    local limit  = math.min(tonumber(args.limit) or 20, 200)
+    local offset = math.max(tonumber(args.offset) or 0, 0)
+    local conds  = {}
     if args.scope then
-        where = "WHERE scope = " .. db.escape_literal(args.scope)
+        table.insert(conds, "scope = " .. db.escape_literal(args.scope))
     end
+    if args.kind then
+        table.insert(conds, "kind = " .. db.escape_literal(args.kind))
+    end
+    local where = #conds > 0 and ("WHERE " .. table.concat(conds, " AND ")) or ""
     local sql = ([[
         SELECT %s
         FROM %s %s
         ORDER BY created_at DESC
-        LIMIT %d
-    ]]):format(RETURN_COLS, tbl(), where, limit)
+        LIMIT %d OFFSET %d
+    ]]):format(RETURN_COLS, tbl(), where, limit, offset)
     return db.query(sql) or {}
 end
 
@@ -705,7 +975,7 @@ function M.find_decayed(opts)
     for _, r in ipairs(rows) do table.insert(ids, r.id) end
 
     if apply and #ids > 0 then
-        local id_list = table.concat(ids, ",")
+        local id_list = util.sql_id_list(ids)
         local _, uerr = db.query(
             "UPDATE " .. tbl() .. " SET importance = 0 WHERE id IN (" .. id_list .. ")")
         if uerr then
@@ -919,9 +1189,31 @@ local function _search_bruteforce(q, qvec, scope, kind, limit, wv, wf, ignore_de
     if until_sql then table.insert(conds, "updated_at <  " .. until_sql) end
     local where = #conds > 0 and ("WHERE " .. table.concat(conds, " AND ")) or ""
 
+    -- When the LSH index is active for this scope, pre-filter candidates by
+    -- vector proximity instead of doing a full-table FTS-ranked scan.
+    -- LSH is only active for single-scope searches on the bruteforce backend.
+    local lsh_sql
+    local lsh_idx = scope and _get_lsh(scope, qvec) or nil
+    if lsh_idx then
+        local cand_ids = lsh_idx:query(qvec, cap)
+        if #cand_ids > 0 then
+            local id_list = util.sql_id_list(cand_ids)
+            if id_list then
+                lsh_sql = ([[
+                    SELECT id, scope, kind, title, body, tags, metadata,
+                           importance, decay_rate, created_at, updated_at, embedding,
+                           ts_rank_cd(fts, plainto_tsquery('english', %s)) AS fts_score
+                    FROM %s
+                    WHERE id IN (%s)
+                    ORDER BY fts_score DESC NULLS LAST
+                ]]):format(db.escape_literal(q), tbl(), id_list)
+            end
+        end
+    end
+
     -- Order candidates by FTS rank (desc) so the cap preserves the most
     -- lexically-relevant rows. NULLS LAST keeps non-matching rows behind.
-    local sql = ([[
+    local sql = lsh_sql or ([[
         SELECT id, scope, kind, title, body, tags, metadata,
                importance, decay_rate, created_at, updated_at, embedding,
                ts_rank_cd(fts, plainto_tsquery('english', %s)) AS fts_score
@@ -945,6 +1237,7 @@ local function _search_bruteforce(q, qvec, scope, kind, limit, wv, wf, ignore_de
     end
 
     -- Blend + weight + drop the embedding payload before returning.
+    local now_epoch = os.time()  -- cached once; avoids N syscalls in the loop
     for _, r in ipairs(rows) do
         local vec_n = (max_vec > 0) and (r.vec_score / max_vec) or 0
         local fts_n = (max_fts > 0) and (r.fts_score / max_fts) or 0
@@ -953,18 +1246,17 @@ local function _search_bruteforce(q, qvec, scope, kind, limit, wv, wf, ignore_de
             local imp = tonumber(r.importance) or 1.0
             local dr  = tonumber(r.decay_rate) or 0.0
             -- Days since updated. updated_at comes back as a string from
-            -- lapis.db; we approximate by parsing the date prefix. When
+            -- pgmoon; we approximate by parsing the date prefix. When
             -- parsing fails, age = 0 (no decay applied).
             local age_days = 0
             local s = tostring(r.updated_at or "")
             local y, m, d = s:match("^(%d%d%d%d)-(%d%d)-(%d%d)")
             if y then
-                local now = os.time()
                 local row_t = os.time({
                     year = tonumber(y), month = tonumber(m), day = tonumber(d),
                     hour = 0, min = 0, sec = 0,
                 })
-                age_days = math.max(0, (now - row_t) / 86400.0)
+                age_days = math.max(0, (now_epoch - row_t) / 86400.0)
             end
             weight = imp * math.exp(-dr * age_days)
         end
@@ -990,12 +1282,12 @@ function M.search(args)
     local limit = math.min(tonumber(args.limit) or 10, 100)
     local ignore_decay = args.ignore_decay and true or false
 
-    -- Optional temporal bounds (Phase 11). `until_` uses a trailing
-    -- underscore because `until` is a Lua reserved word.
+    -- Optional temporal bounds (Phase 11). `args["until"]` uses the bracket
+    -- syntax because `until` is a Lua reserved word; accept both forms.
     local since_sql, t_err = _parse_time(args.since, "since")
     if t_err then return nil, t_err end
     local until_sql
-    until_sql, t_err = _parse_time(args.until_, "until_")
+    until_sql, t_err = _parse_time(args["until"] or args.until_, "until")
     if t_err then return nil, t_err end
 
     local weights = args.hybrid_weights or cfg.hybrid_weights
