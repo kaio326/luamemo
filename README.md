@@ -113,9 +113,11 @@ OpenResty is optional — the library runs in any Lua 5.1+ runtime.
 | `luamemo.rerankers.*`          | Reranker adapters (`noop`, `ollama`, `openai`, `cross_encoder`). |
 | `luamemo.schema.sql`           | Fresh-install schema for the **pgvector** backend. |
 | `luamemo.schema_bruteforce.sql`| Fresh-install schema for the **brute-force** backend (no extension). |
-| `luamemo.migrations/`          | Idempotent ALTERs for live DBs.                 |
-| `cli/memo`                          | Bash CLI; calls the HTTP API with bearer token. |
-| `mcp/server.lua`                    | Pure-Lua stdio MCP server. 11 tools.            |
+| `luamemo.async`                | Pure-Lua coroutine scheduler. `run_all(tasks)` fans out N embed calls concurrently; used by `write_many()` outside OpenResty. |
+| `luamemo.lsh`                  | Random-hyperplane LSH index (Charikar 2002). Auto-activated by `store.lua` when a scope's corpus exceeds `lsh_rebuild_at` rows. |
+| `luamemo.migrations/`          | Idempotent ALTERs for live DBs. Apply sequentially; each file is safe to re-run. |
+| `cli/memo`                          | Bash CLI. Most subcommands (`write`, `search`, `calibrate`, …) call `luamemo.cli.api` directly — no running HTTP server required. |
+| `mcp/server.lua`                    | Pure-Lua stdio MCP server. 11 tools, direct DB access via `MEMO_DB_URL`. |
 
 ### Request flow (write)
 
@@ -155,7 +157,22 @@ OpenResty is optional — the library runs in any Lua 5.1+ runtime.
 See “Backends & cost” below for the trade-off.
 
 ---
+## Upgrading
 
+### 0.2.4 → 0.2.5
+
+Apply one new migration (adds a composite index — safe to run on a live DB,
+no table rewrites, no downtime required):
+
+```bash
+psql -d mydb < luamemo/migrations/005_composite_indexes.sql
+```
+
+No schema changes to `lm_memories` or `lm_kg_facts`. No config changes
+required. LSH activates automatically once a scope's corpus exceeds
+`lsh_rebuild_at` (default 10 000 rows).
+
+---
 ## 5-minute setup
 
 ### 1. Database
@@ -260,14 +277,43 @@ That's it. You now have:
 | POST   | `/api/memory/:id/update`      | Update (re-embeds if changed) |
 | POST   | `/api/memory/:id/delete`      | Hard delete                   |
 
+### Batch writes — `write_many()`
+
+For ingestion pipelines and calibration runs, use `memory.write_many(rows)`
+instead of looping over `memory.write`. It is more efficient in every
+dimension:
+
+- **Embeddings** — fetched concurrently (parallel coroutine fan-out via
+  `luamemo.async`) when running outside OpenResty. Under OpenResty the
+  existing non-blocking cosocket path is already concurrent.
+- **Dedup** — a single `SELECT … LIMIT <dedup_candidate_limit>` per
+  distinct scope fetches all candidates once; cosine matching runs in Lua
+  memory. Cost is O(1) DB round-trips per batch regardless of batch size.
+- **Intra-batch dedup** — rows within the same batch are cosine-compared
+  against each other before touching the DB, so duplicate inputs in the
+  same call are collapsed immediately.
+
+```lua
+local rows, err = memory.write_many(
+    {
+        { scope = "repo:my-app", title = "Alpha", body = "First fact.",  kind = "fact" },
+        { scope = "repo:my-app", title = "Beta",  body = "Second fact.", kind = "fact" },
+    },
+    {
+        dedup_strategy  = "update",   -- "append" | "update" | "skip" | nil
+        dedup_threshold = 0.92,
+    }
+)
+-- rows is a list of { id, action } where action is "insert", "update", or "skip"
+```
+
 ---
 
 ## Secrets Management
 
 `luamemo` can store encrypted API keys and tokens server-side and
 inject them into HTTP requests without ever exposing the raw value to the
-LLM. This is the `lm_secrets` module, built on the `execute_with_secret`
-design principle.
+LLM. Secrets are built on the `execute_with_secret` design principle.
 
 ### Security model
 
