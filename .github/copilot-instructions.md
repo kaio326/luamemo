@@ -91,7 +91,7 @@ All config keys set on `M.config`. `M.setup()` is called once by the host app at
 |-----|---------|
 | `embedder_local` | Which embedder to use (`"hash"`, `"ollama"`, `"openai"`, …) |
 | `auth_fn` | Function `(self) → bool` — return truthy to allow, false/nil to deny |
-| `before_request` | Pre-auth hook |
+| `before_request` | Pre-auth hook — the correct place for rate limiting, CSRF checks, and request logging. Called on every route before `auth_fn`. |
 | `master_key_path` | Path to a file containing a 64-hex-char master key for secrets |
 | `pg_host` | PostgreSQL host (plain-Lua / non-OpenResty only; ignored under OpenResty) |
 | `pg_port` | PostgreSQL port (default 5432; plain-Lua only) |
@@ -120,6 +120,10 @@ The raw secret value **never crosses the LLM context boundary**. Only the HTTP r
 - Multipart boundary generated via `luamemo.crypto.random_bytes` (CSPRNG, not `math.random`).
 - SSRF guard: `execute_with_secret` blocks non-http/https schemes **and** known private IP
   ranges (`localhost`, `127.x`, `169.254.x`, `10.x`, `192.168.x`, `172.16-31.x`, `::1`).
+  The hostname is also **DNS-resolved** at call time and the resolved IP is re-checked
+  against the same blocklist (closes DNS-rebinding bypasses). Unresolvable hosts are
+  rejected (fail-closed). Multipart file paths are validated: no `..` traversal and no
+  symlinks (`test ! -L`); fail-closed on Windows.
 - Master key resolution order: `master_key_path` file → `master_key_env` env var → `master_key` explicit. If none set, module is disabled; all other library features continue to work.
 - No `get_secret` API exists — values cannot be retrieved through the HTTP or MCP layer
 

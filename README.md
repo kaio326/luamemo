@@ -326,7 +326,7 @@ That's it. You now have:
 |--------|-------------------------------|-------------------------------|
 | POST   | `/api/memory/write`           | Insert a memory               |
 | GET    | `/api/memory/search?q=...`    | Hybrid search                 |
-| GET    | `/api/memory/recent`          | Recent memories               |
+| GET    | `/api/memory/recent`          | Recent memories (HTTP: hard-capped at 100 rows) |
 | GET    | `/api/memory/:id`             | Fetch one                     |
 | POST   | `/api/memory/:id/update`      | Update (re-embeds if changed) |
 | POST   | `/api/memory/:id/delete`      | Hard delete                   |
@@ -383,6 +383,17 @@ LLM. Secrets are built on the `execute_with_secret` design principle.
   boundary.
 - There is **no `get_secret` tool** — raw values cannot be retrieved
   through the API.
+- **SSRF guard**: `execute_with_secret` rejects non-`http`/`https` schemes and
+  blocks all known private IP ranges (`localhost`, `127.x`, `169.254.x`,
+  `10.x`, `192.168.x`, `172.16–31.x`, `::1`). The hostname is also
+  **resolved via DNS** and the resolved IP is re-checked against the same
+  blocklist — closing the DNS-rebinding bypass where a public-looking domain
+  resolves to an internal address at request time. Unresolvable hosts are
+  rejected (fail-closed).
+- **Multipart file path guard**: when `execute_with_secret` sends a multipart
+  body with a local file field, the path is validated for no `..` traversal
+  and no symlinks. A symlink pointing outside the intended directory is
+  rejected before `io.open` is called.
 
 ### Setup
 
