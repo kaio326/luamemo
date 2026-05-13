@@ -22,6 +22,7 @@
 --   summarize        summarizer.run(args)
 --   promote          summarizer.promote(args)
 --   consolidate      summarizer.consolidate(args)
+--   digest           digest.run(scope, opts)
 --   kg-query         kg.query(args)
 --   kg-assert        kg.assert_fact(args)
 --   kg-invalidate    kg.invalidate(args)
@@ -273,6 +274,20 @@ handlers["consolidate"] = function(p)
         max_rows             = tonumber(p.max_rows),
     })
     if not result then return err_out(err) end
+    out({ ok = true, result = result })
+end
+
+-- digest
+handlers["digest"] = function(p)
+    local d = require("luamemo.digest")
+    local scope = p.scope
+    if not scope or scope == "" then
+        return err_out("digest: scope required")
+    end
+    local result = d.run(scope, {
+        dry_run   = to_bool(p.dry_run),
+        threshold = tonumber(p.threshold),
+    })
     out({ ok = true, result = result })
 end
 

@@ -171,6 +171,11 @@ Tools.memory_search = {
                 type = "string",
                 description = "Only return memories with updated_at < this bound. Half-open interval [since, until).",
             },
+            tier_min = {
+                type = "integer",
+                description = "Minimum tier (0–3) to include. Default 1 — excludes ephemeral (tier=0) raw events. Pass 0 to see all tiers.",
+                minimum = 0, maximum = 3,
+            },
         },
         required = { "query" },
     },
@@ -178,6 +183,9 @@ Tools.memory_search = {
         ensure_setup()
         local store = require("luamemo.store")
         local scope = args.scope or MEMO_SCOPE
+        -- Default tier_min=1 so ephemeral events are hidden from MCP callers
+        -- unless they explicitly pass tier_min=0.
+        local tier_min = (args.tier_min ~= nil) and tonumber(args.tier_min) or 1
         local rows, err = store.search({
             query        = args.query,
             scope        = scope,
@@ -186,6 +194,7 @@ Tools.memory_search = {
             ignore_decay = to_bool(args.ignore_decay),
             since        = args.since,
             ["until"]    = args["until"],
+            tier_min     = tier_min,
         })
         if not rows then return nil, err end
         return { ok = true, results = rows }
@@ -382,6 +391,41 @@ Tools.memory_consolidate = {
             max_rows             = tonumber(args.max_rows),
         })
         if not result then return nil, err end
+        return { ok = true, result = result }
+    end,
+}
+
+Tools.memory_digest = {
+    description = "Run hippocampus digest for a scope: consolidate ephemeral tier-0 "
+        .. "memories, reinforce matching observations, and promote tier-1/2 memories "
+        .. "when proof_count or mistake-event thresholds are met. "
+        .. "Returns a summary of actions taken (processed, promoted2, promoted3, deleted). "
+        .. "Use dry_run=true to preview without writing.",
+    inputSchema = {
+        type = "object",
+        properties = {
+            scope = {
+                type = "string",
+                description = "Scope to digest. Defaults to the server's configured scope.",
+            },
+            dry_run = {
+                type = "boolean",
+                description = "If true, report what would happen without writing (default false).",
+            },
+            threshold = {
+                type = "number", minimum = 0.5, maximum = 1.0,
+                description = "Cosine clustering threshold for ephemeral grouping (default 0.80).",
+            },
+        },
+    },
+    handler = function(args)
+        ensure_setup()
+        local digest = require("luamemo.digest")
+        local scope = args.scope or MEMO_SCOPE
+        local result = digest.run(scope, {
+            dry_run   = to_bool(args.dry_run),
+            threshold = tonumber(args.threshold),
+        })
         return { ok = true, result = result }
     end,
 }

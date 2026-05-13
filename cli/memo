@@ -18,6 +18,7 @@
 #   memo context QUERY [--scope SCOPE] [--limit N] [--no-kg] [--format text|json]
 #   memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
 #                    [--decay-threshold F] [--max-rows N]
+#   memo digest [--scope SCOPE] [--dry-run] [--threshold F]
 #   memo calibrate [--scope SCOPE] [--root DIR] [--no-git] [--no-comments] [--dry-run]
 #                  [--probe-only] [--multilingual] [--long] [--hosted] [--allow-hash]
 #                  [--write PATH] [--no-migrate] [--no-mcp] [--docker-compose FILE]
@@ -437,6 +438,7 @@ cmd_context() {
 
 # memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
 #                  [--decay-threshold F] [--max-rows N]
+# memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
 cmd_consolidate() {
     require_jq
     local json='{}'
@@ -456,8 +458,25 @@ cmd_consolidate() {
     printf '%s' "$json" | api_call consolidate | jq .
 }
 
-# ---------------------------------------------------------------------------
-# Docker Compose Postgres credential reader
+# memo digest [--scope SCOPE] [--dry-run] [--threshold F]
+cmd_digest() {
+    require_jq
+    local json='{}'
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                json=$(printf '%s' "$json" | jq '. + {dry_run: true}')
+                shift ;;
+            --*)
+                local key="${1#--}"; key="${key//-/_}"
+                local val="$2"
+                json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+                shift 2 ;;
+            *) echo "memo digest: unknown arg: $1" >&2; exit 1 ;;
+        esac
+    done
+    printf '%s' "$json" | api_call digest | jq .
+}
 # Used by --docker-compose FILE flag in cmd_calibrate.
 # Parses a docker-compose.yml for Postgres credentials and host port,
 # then exports MEMO_DB_URL.
@@ -1024,6 +1043,7 @@ case "$sub" in
     promote) cmd_promote "$@" ;;
     context) cmd_context "$@" ;;
     consolidate) cmd_consolidate "$@" ;;
+    digest) cmd_digest "$@" ;;
     calibrate) cmd_calibrate "$@" ;;
     secret-store)   cmd_secret_store   "$@" ;;
     secret-list)    cmd_secret_list         ;;

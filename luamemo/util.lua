@@ -141,4 +141,98 @@ function M.parse_scores(tbl)
     return out
 end
 
+-- ---------------------------------------------------------------------------
+-- Shared math / ML helpers
+-- ---------------------------------------------------------------------------
+
+--- Cosine similarity over two Lua numeric arrays.
+--- Returns 0 for nil, non-table, or zero-magnitude input.
+--- Handles mismatched lengths by using the shorter of the two.
+--- @param a  table  numeric array
+--- @param b  table  numeric array
+--- @return number  value in [0, 1]
+function M.cosine(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then return 0 end
+    local dot, na, nb = 0, 0, 0
+    local len = math.min(#a, #b)
+    if len == 0 then return 0 end
+    for i = 1, len do
+        local ai, bi = tonumber(a[i]) or 0, tonumber(b[i]) or 0
+        dot = dot + ai * bi
+        na  = na  + ai * ai
+        nb  = nb  + bi * bi
+    end
+    local denom = math.sqrt(na) * math.sqrt(nb)
+    if denom == 0 then return 0 end
+    return dot / denom
+end
+
+--- Greedy single-linkage cosine clustering.
+--- Assigns each memory to the first existing cluster whose pivot has
+--- cosine similarity >= threshold; otherwise starts a new cluster.
+--- Memories without a table-type embedding are placed in singleton clusters.
+--- @param memories   table  array of rows; each may have an `.embedding` field
+--- @param threshold  number cosine similarity cutoff (e.g. 0.80)
+--- @return table  array of clusters; each cluster is an array of memory rows
+function M.cluster(memories, threshold)
+    local clusters = {}
+    local pivots   = {}
+    for _, mem in ipairs(memories) do
+        local vec = type(mem.embedding) == "table" and mem.embedding or nil
+        local assigned = false
+        if vec then
+            for ci = 1, #clusters do
+                if M.cosine(pivots[ci], vec) >= threshold then
+                    local cl = clusters[ci]
+                    cl[#cl + 1] = mem
+                    assigned = true
+                    break
+                end
+            end
+        end
+        if not assigned then
+            clusters[#clusters + 1] = { mem }
+            pivots[#pivots + 1]     = vec
+        end
+    end
+    return clusters
+end
+
+--- Derive a memory tier (0–3) from an importance value.
+--- Mirrors the formula used on write; keeps tier derivation in one place.
+--- @param imp  number  importance value (0.0 – 1.0)
+--- @return number  tier integer 0–3
+function M.importance_to_tier(imp)
+    local v = tonumber(imp) or 0
+    if v < 0.3  then return 0 end
+    if v < 0.6  then return 1 end
+    if v < 0.85 then return 2 end
+    return 3
+end
+
+-- Module-level cache shared by util.table_exists across all callers in the
+-- same Lua VM.  Deliberately never invalidated at runtime (see docs).
+local _table_ok_cache = {}
+
+--- Check whether a PostgreSQL table exists in the public schema.
+--- Results are cached permanently within the process lifetime.
+--- Requires luamemo.db to be available (called lazily to avoid a circular
+--- require at load time).
+--- @param name  string  unquoted table name
+--- @return boolean
+function M.table_exists(name)
+    if _table_ok_cache[name] then return true end
+    local db = require("luamemo.db")
+    local rows = db.query(
+        "SELECT 1 FROM information_schema.tables "
+        .. "WHERE table_schema = 'public' AND table_name = "
+        .. db.escape_literal(name)
+        .. " LIMIT 1")
+    if rows and #rows > 0 then
+        _table_ok_cache[name] = true
+        return true
+    end
+    return false
+end
+
 return M

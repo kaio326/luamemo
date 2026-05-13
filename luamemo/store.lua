@@ -1,10 +1,13 @@
 -- luamemo.store
 -- Persistence + retrieval. Uses luamemo.db for raw SQL.
 
-local db    = require("luamemo.db")
-local json  = require("luamemo.json")
-local embed = require("luamemo.embed")
-local util  = require("luamemo.util")
+local db          = require("luamemo.db")
+local json        = require("luamemo.json")
+local embed       = require("luamemo.embed")
+local util        = require("luamemo.util")
+local temporal    = require("luamemo.temporal")
+local consolidate = require("luamemo.consolidate")
+local digest      = require("luamemo.digest")
 
 local M = {}
 
@@ -27,6 +30,8 @@ end
 
 function M.configure(config)
     cfg = config
+    consolidate.configure(config)
+    digest.configure(config)
     local requested = config.backend or "auto"
     if requested == "auto" then
         _backend = _probe_backend()
@@ -144,7 +149,10 @@ local clamp_check = util.clamp_check
 -- columns (e.g. importance/decay_rate from migration 002) are surfaced
 -- everywhere automatically.
 local RETURN_COLS = "id, scope, kind, title, body, tags, metadata, "
-    .. "importance, decay_rate, was_truncated, created_at, updated_at"
+    .. "importance, decay_rate, was_truncated, created_at, updated_at, tier"
+
+-- Derive initial tier from importance value (delegates to util).
+local _importance_to_tier = util.importance_to_tier
 
 -- Parse a temporal bound (`since` / `until_`) into a SQL literal expression.
 -- Accepts:
@@ -173,23 +181,9 @@ local function _parse_time(v, name)
     return nil, name .. ": must be number (epoch) or ISO 8601 string, got " .. t
 end
 
--- Cosine similarity over two equal-length numeric arrays. Returns 0 when
--- either side has zero magnitude (matches pgvector's behaviour for null
--- vectors). Pure Lua so it runs anywhere — used by the bruteforce backend
--- and exposed for tests.
+-- Cosine similarity — delegates to util.cosine (shared with consolidate + digest).
 local function _cosine(a, b)
-    if not a or not b then return 0 end
-    local n = #a
-    if n == 0 or n ~= #b then return 0 end
-    local dot, na, nb = 0, 0, 0
-    for i = 1, n do
-        local x, y = a[i], b[i]
-        dot = dot + x * y
-        na  = na + x * x
-        nb  = nb + y * y
-    end
-    if na == 0 or nb == 0 then return 0 end
-    return dot / (math.sqrt(na) * math.sqrt(nb))
+    return util.cosine(a, b)
 end
 M._cosine    = _cosine    -- exposed for tests
 M._get_lsh   = _get_lsh   -- exposed for tests (trigger lazy rebuild)
@@ -346,9 +340,17 @@ function M.write(args)
         end
     end
 
+    -- Tier: caller may override; otherwise derived from importance.
+    local tier = args.tier
+    if tier ~= nil then
+        tier = math.max(0, math.min(3, math.floor(tonumber(tier) or 1)))
+    else
+        tier = _importance_to_tier(importance)
+    end
+
     local sql = ([[
-        INSERT INTO %s (scope, kind, title, body, tags, metadata, embedding, importance, decay_rate, was_truncated)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO %s (scope, kind, title, body, tags, metadata, embedding, importance, decay_rate, was_truncated, tier)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %d)
         RETURNING %s
     ]]):format(
         tbl(),
@@ -362,6 +364,7 @@ function M.write(args)
         db.escape_literal(importance),
         db.escape_literal(decay_rate),
         db.escape_literal(truncated and true or false),
+        tier,
         RETURN_COLS
     )
     local rows, qerr = db.query(sql)
@@ -369,6 +372,9 @@ function M.write(args)
     -- Keep LSH index current when active for this scope.
     local _lsh = _lsh_index[scope]
     if _lsh and _lsh ~= false then _lsh:insert(rows[1].id, vec) end
+    -- Notify consolidation engine of new unprocessed memory.
+    consolidate.notify(scope)
+    digest.notify_write(scope)
     return rows[1], nil, "inserted"
 end
 
@@ -626,6 +632,12 @@ function M.write_many(rows_in, opts)
             end
 
             if results[i] == nil then
+                local p_tier = args_i.tier
+                if p_tier ~= nil then
+                    p_tier = math.max(0, math.min(3, math.floor(tonumber(p_tier) or 1)))
+                else
+                    p_tier = _importance_to_tier(item.importance)
+                end
                 prepared[i] = {
                     scope      = args_i.scope or cfg.default_scope,
                     kind       = args_i.kind or "fact",
@@ -637,6 +649,7 @@ function M.write_many(rows_in, opts)
                     importance = item.importance,
                     decay_rate = item.decay_rate,
                     truncated  = vtrunc and true or false,
+                    tier       = p_tier,
                 }
             end
         end
@@ -655,7 +668,7 @@ function M.write_many(rows_in, opts)
         local values = {}
         for j = pos, last do
             local p = prepared[indices[j]]
-            values[#values + 1] = string.format("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            values[#values + 1] = string.format("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %d)",
                 db.escape_literal(p.scope),
                 db.escape_literal(p.kind),
                 db.escape_literal(p.title),
@@ -665,11 +678,12 @@ function M.write_many(rows_in, opts)
                 _embed_literal(p.vec),
                 db.escape_literal(p.importance),
                 db.escape_literal(p.decay_rate),
-                db.escape_literal(p.truncated and true or false)
+                db.escape_literal(p.truncated and true or false),
+                p.tier or 1
             )
         end
         local sql = ([[
-            INSERT INTO %s (scope, kind, title, body, tags, metadata, embedding, importance, decay_rate, was_truncated)
+            INSERT INTO %s (scope, kind, title, body, tags, metadata, embedding, importance, decay_rate, was_truncated, tier)
             VALUES %s
             RETURNING %s
         ]]):format(tbl(), table.concat(values, ", "), RETURN_COLS)
@@ -699,6 +713,16 @@ function M.write_many(rows_in, opts)
             end
         end
         pos = last + 1
+    end
+
+    -- Notify consolidation engine for each scope touched by this batch.
+    local _seen_scopes = {}
+    for _, r in ipairs(results) do
+        if r.row and r.row.scope and not _seen_scopes[r.row.scope] then
+            _seen_scopes[r.row.scope] = true
+            consolidate.notify(r.row.scope)
+            digest.notify_write(r.row.scope)
+        end
     end
 
     return results, nil
@@ -1118,14 +1142,16 @@ end
 --                 computes cosine, normalises, blends, applies weight,
 --                 sorts. Same return shape so callers don't care.
 -- ---------------------------------------------------------------------------
-local function _search_pgvector(q, qvec, scope, kind, limit, wv, wf, ignore_decay, since_sql, until_sql)
+local function _search_pgvector(q, qvec, scope, kind, limit, wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max)
     local qvec_lit = embed.to_pg_literal(qvec)
 
     local conds = {}
-    if scope then table.insert(conds, "scope = " .. db.escape_literal(scope)) end
-    if kind  then table.insert(conds, "kind  = " .. db.escape_literal(kind))  end
+    if scope    then table.insert(conds, "scope = " .. db.escape_literal(scope)) end
+    if kind     then table.insert(conds, "kind  = " .. db.escape_literal(kind))  end
     if since_sql then table.insert(conds, "updated_at >= " .. since_sql) end
     if until_sql then table.insert(conds, "updated_at <  " .. until_sql) end
+    if tier_min then table.insert(conds, "tier >= " .. math.max(0, math.min(3, math.floor(tonumber(tier_min))))) end
+    if tier_max then table.insert(conds, "tier <= " .. math.max(0, math.min(3, math.floor(tonumber(tier_max))))) end
     local where = #conds > 0 and ("WHERE " .. table.concat(conds, " AND ")) or ""
 
     local weight_expr = ignore_decay
@@ -1135,7 +1161,7 @@ local function _search_pgvector(q, qvec, scope, kind, limit, wv, wf, ignore_deca
     local sql = ([[
         WITH candidates AS (
             SELECT id, scope, kind, title, body, tags, metadata,
-                   importance, decay_rate, created_at, updated_at,
+                   importance, decay_rate, created_at, updated_at, tier,
                    (1 - (embedding <=> %s)) AS vec_score,
                    ts_rank_cd(fts, plainto_tsquery('english', %s)) AS fts_score,
                    (%s) AS weight
@@ -1155,7 +1181,7 @@ local function _search_pgvector(q, qvec, scope, kind, limit, wv, wf, ignore_deca
             FROM candidates
         )
         SELECT id, scope, kind, title, body, tags, metadata,
-               importance, decay_rate, created_at, updated_at,
+               importance, decay_rate, created_at, updated_at, tier,
                vec_score, fts_score, weight,
                ((%f * vec_n + %f * fts_n) * weight) AS score
         FROM normalised
@@ -1179,14 +1205,16 @@ end
 -- FTS so lexically-relevant rows survive the cap; Lua computes cosine,
 -- normalises both signals, blends, applies the importance/decay weight,
 -- sorts, and trims. Returns rows in the same shape as the pgvector path.
-local function _search_bruteforce(q, qvec, scope, kind, limit, wv, wf, ignore_decay, since_sql, until_sql)
+local function _search_bruteforce(q, qvec, scope, kind, limit, wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max)
     local cap = tonumber(cfg.bruteforce_candidate_limit) or 1000
 
     local conds = {}
-    if scope then table.insert(conds, "scope = " .. db.escape_literal(scope)) end
-    if kind  then table.insert(conds, "kind  = " .. db.escape_literal(kind))  end
+    if scope    then table.insert(conds, "scope = " .. db.escape_literal(scope)) end
+    if kind     then table.insert(conds, "kind  = " .. db.escape_literal(kind))  end
     if since_sql then table.insert(conds, "updated_at >= " .. since_sql) end
     if until_sql then table.insert(conds, "updated_at <  " .. until_sql) end
+    if tier_min then table.insert(conds, "tier >= " .. math.max(0, math.min(3, math.floor(tonumber(tier_min))))) end
+    if tier_max then table.insert(conds, "tier <= " .. math.max(0, math.min(3, math.floor(tonumber(tier_max))))) end
     local where = #conds > 0 and ("WHERE " .. table.concat(conds, " AND ")) or ""
 
     -- When the LSH index is active for this scope, pre-filter candidates by
@@ -1201,7 +1229,7 @@ local function _search_bruteforce(q, qvec, scope, kind, limit, wv, wf, ignore_de
             if id_list then
                 lsh_sql = ([[
                     SELECT id, scope, kind, title, body, tags, metadata,
-                           importance, decay_rate, created_at, updated_at, embedding,
+                           importance, decay_rate, created_at, updated_at, embedding, tier,
                            ts_rank_cd(fts, plainto_tsquery('english', %s)) AS fts_score
                     FROM %s
                     WHERE id IN (%s)
@@ -1215,7 +1243,7 @@ local function _search_bruteforce(q, qvec, scope, kind, limit, wv, wf, ignore_de
     -- lexically-relevant rows. NULLS LAST keeps non-matching rows behind.
     local sql = lsh_sql or ([[
         SELECT id, scope, kind, title, body, tags, metadata,
-               importance, decay_rate, created_at, updated_at, embedding,
+               importance, decay_rate, created_at, updated_at, embedding, tier,
                ts_rank_cd(fts, plainto_tsquery('english', %s)) AS fts_score
         FROM %s
         %s
@@ -1274,6 +1302,66 @@ local function _search_bruteforce(q, qvec, scope, kind, limit, wv, wf, ignore_de
     return rows
 end
 
+-- ---------------------------------------------------------------------------
+-- _search_temporal
+-- Third search leg: proximity-weighted date filter.  Fires only when the
+-- caller supplies a parsed temporal window.  Returns rows in the same shape
+-- as the vector/FTS legs so they can participate in RRF fusion.
+-- ---------------------------------------------------------------------------
+local function _search_temporal(scope, kind, window, fetch_limit, ignore_decay, tier_min, tier_max)
+    local center_sql = ("to_timestamp(%d)"):format(math.floor(window.center))
+    local half_secs  = math.max(1, window.half_secs)
+
+    local conds = {}
+    if scope    then table.insert(conds, "scope = " .. db.escape_literal(scope)) end
+    if kind     then table.insert(conds, "kind  = " .. db.escape_literal(kind))  end
+    if tier_min then table.insert(conds, "tier >= " .. math.max(0, math.min(3, math.floor(tonumber(tier_min))))) end
+    if tier_max then table.insert(conds, "tier <= " .. math.max(0, math.min(3, math.floor(tonumber(tier_max))))) end
+    -- Widen the date filter to 3× the half-window so nearby-but-outside rows
+    -- still contribute (they'll receive a low proximity score).
+    local expanded = half_secs * 3
+    table.insert(conds,
+        ("created_at BETWEEN to_timestamp(%d) AND to_timestamp(%d)")
+        :format(math.floor(window.center - expanded),
+                math.floor(window.center + expanded)))
+    local where = "WHERE " .. table.concat(conds, " AND ")
+
+    local weight_expr = ignore_decay
+        and "1.0"
+        or  "importance * exp(-decay_rate * (EXTRACT(EPOCH FROM (now() - updated_at)) / 86400.0))"
+
+    local sql = ([[SELECT %s,
+           GREATEST(0.0,
+               1.0 - ABS(EXTRACT(EPOCH FROM (created_at - %s)) / %d.0)
+           ) AS temporal_score,
+           (%s) AS weight
+    FROM %s %s
+    ORDER BY temporal_score DESC
+    LIMIT %d]]):format(
+        RETURN_COLS,
+        center_sql,
+        half_secs,
+        weight_expr,
+        tbl(),
+        where,
+        fetch_limit
+    )
+    local rows, qerr = db.query(sql)
+    if not rows then return {} end  -- temporal leg is best-effort
+
+    -- Set .score = temporal_score * weight and .vec_score/.fts_score for
+    -- uniform shape.
+    for _, r in ipairs(rows) do
+        local ts = tonumber(r.temporal_score) or 0
+        local w  = tonumber(r.weight) or 1.0
+        r.vec_score      = 0
+        r.fts_score      = 0
+        r.temporal_score = ts
+        r.score          = ts * w
+    end
+    return rows
+end
+
 function M.search(args)
     assert(args and args.query, "search: query is required")
     local q     = args.query
@@ -1282,7 +1370,7 @@ function M.search(args)
     local limit = math.min(tonumber(args.limit) or 10, 100)
     local ignore_decay = args.ignore_decay and true or false
 
-    -- Optional temporal bounds (Phase 11). `args["until"]` uses the bracket
+    -- Optional explicit temporal bounds.  `args["until"]` uses the bracket
     -- syntax because `until` is a Lua reserved word; accept both forms.
     local since_sql, t_err = _parse_time(args.since, "since")
     if t_err then return nil, t_err end
@@ -1290,9 +1378,19 @@ function M.search(args)
     until_sql, t_err = _parse_time(args["until"] or args.until_, "until")
     if t_err then return nil, t_err end
 
+    -- Natural-language temporal parsing (opt-in; disabled when skip_temporal=true).
+    local twindow = nil
+    if not args.skip_temporal then
+        twindow = temporal.parse(q)
+    end
+
     local weights = args.hybrid_weights or cfg.hybrid_weights
     local wv = weights.vector or 0.7
     local wf = weights.fts or 0.3
+
+    -- Optional tier bounds for structural filtering.
+    local tier_min = (args.tier_min ~= nil) and tonumber(args.tier_min) or nil
+    local tier_max = (args.tier_max ~= nil) and tonumber(args.tier_max) or nil
 
     local qvec, err = embed.embed(q)
     if not qvec then return nil, err end
@@ -1313,16 +1411,75 @@ function M.search(args)
             fetch_limit = math.min(top_n, 100)
         end
     end
+    -- Over-fetch for RRF when temporal leg is active.
+    local rrf_fetch = twindow and math.min(fetch_limit * 2, 100) or fetch_limit
 
     local rows
     if _backend == "bruteforce" then
-        rows, err = _search_bruteforce(q, qvec, scope, kind, fetch_limit,
-            wv, wf, ignore_decay, since_sql, until_sql)
+        rows, err = _search_bruteforce(q, qvec, scope, kind, rrf_fetch,
+            wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max)
     else
-        rows, err = _search_pgvector(q, qvec, scope, kind, fetch_limit,
-            wv, wf, ignore_decay, since_sql, until_sql)
+        rows, err = _search_pgvector(q, qvec, scope, kind, rrf_fetch,
+            wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max)
     end
     if not rows then return nil, err end
+
+    -- When a temporal window was detected, run the temporal leg and fuse
+    -- all legs with RRF.  Fall back to weighted-blend when no temporal
+    -- expression was found (unchanged behaviour for existing queries).
+    if twindow then
+        local t_rows = _search_temporal(scope, kind, twindow, rrf_fetch, ignore_decay, tier_min, tier_max)
+        -- Apply temporal proximity boost to the baseline rows, then re-sort
+        -- so that RRF uses the boost-adjusted rank (not the raw vector rank).
+        local alpha = (cfg.temporal_alpha) or 0.2
+        for _, r in ipairs(rows) do
+            local epoch = 0
+            local s = tostring(r.created_at or "")
+            local y, mo, d = s:match("^(%d%d%d%d)-(%d%d)-(%d%d)")
+            if y then
+                epoch = os.time({
+                    year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+                    hour = 0, min = 0, sec = 0,
+                })
+            end
+            local boost = temporal.proximity_boost(epoch, twindow, alpha)
+            r.score = (r.score or 0) * boost
+        end
+        -- Re-sort baseline by boosted score so RRF inherits the adjusted rank.
+        table.sort(rows, function(a, b) return (a.score or 0) > (b.score or 0) end)
+        -- Merge lists with RRF (only when the temporal leg returned results).
+        local lists = { rows }
+        if #t_rows > 0 then lists[#lists + 1] = t_rows end
+        if #lists > 1 then
+            rows = temporal.rrf_merge(lists)
+        end
+    end
+
+    -- Trim to fetch_limit before reranking.
+    if #rows > fetch_limit then
+        local trimmed = {}
+        for i = 1, fetch_limit do trimmed[i] = rows[i] end
+        rows = trimmed
+    end
+
+    -- Observation search leg: merge observation rows via RRF when not
+    -- explicitly skipped and the table exists.
+    if not args.skip_observations then
+        -- Run any pending consolidation for this scope so results are fresh.
+        if consolidate.pending(scope or "") then
+            pcall(consolidate.process, scope or "")
+        end
+        local obs_rows = consolidate.search(scope or "", qvec, rrf_fetch)
+        if #obs_rows > 0 then
+            rows = temporal.rrf_merge({ rows, obs_rows })
+            -- Re-trim after merge.
+            if #rows > fetch_limit then
+                local trimmed = {}
+                for i = 1, fetch_limit do trimmed[i] = rows[i] end
+                rows = trimmed
+            end
+        end
+    end
 
     if not rerank_on or #rows <= 1 then
         if #rows > limit then

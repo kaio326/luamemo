@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.3.0 — 2026-05-13
+
+- **`luamemo.temporal` — natural-language temporal retrieval.**
+  New module parses time expressions ("last month", "in June", "last spring",
+  "recently", "yesterday", "last 30 days", etc.) directly from the query string
+  and fires a temporal SQL leg alongside vector + FTS. All legs are fused via
+  Reciprocal Rank Fusion (RRF). Zero new external dependencies.
+  Migration: `luamemo/migrations/006_temporal_index.sql` (adds `created_at` index).
+
+- **`luamemo.consolidate` — evidence-tracked observations.**
+  New module clusters unprocessed memories by cosine similarity and either
+  reinforces an existing observation (cheap UPDATE) or synthesises a new one via
+  the configured summarizer. Observations surface as first-class results in
+  `store.search()` with `type = "observation"`. Proof count, freshness trend, and
+  evidence IDs are tracked per observation.
+  Migration: `luamemo/migrations/007_observations.sql` (adds `lm_observations` table
+  and `consolidated_at` column on `lm_memories`).
+
+- **Memory tiers (0–3) — structural importance hierarchy.**
+  New `tier SMALLINT` column on `lm_memories`. Tier is derived automatically from
+  `importance` on write, or overridden explicitly. `store.search()` accepts
+  `tier_min` / `tier_max` filters. MCP `memory_search` defaults to `tier_min = 1`,
+  hiding ephemeral noise from AI agents by default (pass `tier_min = 0` to override).
+  Migration: `luamemo/migrations/008_tiers.sql` (adds column, backfills, adds index).
+
+- **`luamemo.digest` — hippocampus idle-triggered digest.**
+  New module: idle-triggered pipeline that clusters tier-0 ephemeral memories,
+  reinforces observations, escalates importance on repeated corrections, and promotes
+  tiers. `record_event("reversal", ...)` immediately diminishes the target memory's
+  importance and demotes its tier. `digest.run()` supports `dry_run` mode.
+  Migration: `luamemo/migrations/009_reinforcements.sql` (adds `lm_reinforcements`
+  table with FK→lm_memories).
+  CLI: `memo digest [--scope SCOPE] [--dry-run] [--threshold F]`.
+  MCP: new `memory_digest` tool.
+
+- **Code quality — shared helpers in `util`.**
+  `util.cosine`, `util.cluster`, `util.importance_to_tier`, and `util.table_exists`
+  replace three independent copies of each in `store`, `consolidate`, and `digest`.
+  `util.table_exists` caches results process-wide, eliminating repeated
+  `information_schema.tables` queries.
+
+- **Security — `record_event` delta clamped to `[-1.0, 1.0]`.**
+  Previously an unclamped `tonumber(delta)` on a very large string (e.g. `"1e308"`)
+  would produce `Infinity` in the `REAL` column. Delta is now clamped before insert.
+
+- **Reversal handling fully wired.**
+  `record_event(..., "reversal", delta, ...)` now immediately applies importance
+  diminishment to the target memory and demotes its tier in the same call, in
+  addition to recording the event.
+
 ## 0.2.9 — 2026-05-11
 
 - **`memo ping` — standalone connectivity check.**

@@ -110,11 +110,14 @@ function M.register(app, opts)
             kind         = p.kind,
             limit        = tonumber(p.limit),
             ignore_decay = util.to_bool(p.ignore_decay),
-            -- Phase 11: temporal bounds. `until` is a Lua reserved word so
+            -- temporal bounds. `until` is a Lua reserved word so
             -- we read the HTTP param as bracket syntax and pass on as
             -- `until_` to the store layer.
             since        = p.since,
             until_       = p["until"],
+            -- tier bounds.
+            tier_min     = tonumber(p.tier_min),
+            tier_max     = tonumber(p.tier_max),
         })
         if not rows then return json(400, { error = err }) end
         return json(200, { ok = true, results = rows })
