@@ -47,7 +47,15 @@ function M.decide(profile)
     local rationale = {}
     local function note(msg) table.insert(rationale, msg) end
 
+    -- has_gpu is true only when a GPU is detected AND has ≥ 2,048 MiB free VRAM.
+    -- When the GPU exists but free VRAM is below the threshold, log a clear note
+    -- so the rationale doesn't misleadingly say "No GPU".
     local has_gpu       = profile.has_gpu and (profile.gpu_free_mb or 0) >= 2048
+    if profile.has_gpu and not has_gpu then
+        note(string.format(
+            "GPU detected but only %d MiB VRAM free (≥ 2,048 MiB required for GPU inference) — falling back to CPU path",
+            profile.gpu_free_mb or 0))
+    end
     local has_docker    = profile.has_docker
     local has_ollama    = profile.has_ollama
     local has_ram       = (profile.ram_mb or 0) >= 4096
@@ -93,13 +101,13 @@ function M.decide(profile)
         end
     elseif has_docker and has_ram then
         if multilingual or long_rows then
-            note("No GPU but Docker + 4GB RAM; multilingual or long rows -> bge-m3 via TEI cpu-1.7 (slow)")
+            note("No GPU (or insufficient free VRAM); Docker + 4GB RAM; multilingual or long rows -> bge-m3 via TEI (CPU)")
             result = {
                 adapter = "tei",
                 model   = "BAAI/bge-m3",
                 dim     = 1024,
                 embed_max_chars = M.SAFE_CHARS["bge-m3"],
-                tei_image = "ghcr.io/huggingface/text-embeddings-inference:cpu-1.7",
+                tei_image = recommend_tei_image(has_gpu, profile.gpu_free_mb),
                 setup_keys = {
                     embedder_adapter = "tei",
                     embedder_url     = "http://lapis-tei-embed:80",

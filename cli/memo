@@ -1,36 +1,70 @@
 #!/usr/bin/env bash
-# memo — CLI wrapper for luamemo library (direct DB access, no HTTP layer).
+# memo — luamemo CLI: persistent semantic memory for AI agents.
+#
+# Stores and retrieves memories in PostgreSQL using hybrid vector + full-text
+# search. Supports pluggable embedders (Ollama, OpenAI, TEI, built-in hash),
+# knowledge graphs, encrypted secrets, memory tiers (0–3), and an MCP stdio
+# server so AI agents can read and write memory directly. Works with plain
+# PostgreSQL + Lua 5.1 — no OpenResty required.
 #
 # Configuration (env vars or ~/.memorc):
 #   MEMO_DB_URL   PostgreSQL connection URL, e.g.
 #                 postgresql://user:pass@localhost:5432/luamemo
 #                 (Individual PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD also work)
 #
-# Usage:
-#   memo write   --scope SCOPE --kind KIND --title T --body B [--tags a,b,c]
-#   memo search  QUERY [--scope SCOPE] [--kind KIND] [--limit N] [--since ISO|EPOCH] [--until ISO|EPOCH]
-#   memo recent  [--scope SCOPE] [--limit N]
-#   memo get     ID
-#   memo update  ID [--title T] [--body B] [--scope S] [--kind K] [--tags a,b]
-#   memo delete  ID
-#   memo summarize [--scope S] [--dry-run] [--weight-threshold F] [--retention-days N]
-#   memo promote --from FROM_SCOPE --to TO_SCOPE [--delete-source] [--dry-run] [--limit N]
-#   memo context QUERY [--scope SCOPE] [--limit N] [--no-kg] [--format text|json]
+# Commands:
+#   memo write      --scope SCOPE --kind KIND --title T --body B [--tags a,b,c]
+#                   [--importance F]
+#
+#   memo search     QUERY [--scope SCOPE] [--kind KIND] [--limit N]
+#                         [--since ISO|EPOCH] [--until ISO|EPOCH]
+#                         [--tier-min N] [--tier-max N]
+#
+#   memo recent     [--scope SCOPE] [--limit N]
+#
+#   memo get        ID
+#
+#   memo update     ID [--title T] [--body B] [--scope S] [--kind K] [--tags a,b]
+#
+#   memo delete     ID
+#
+#   memo context    QUERY [--scope SCOPE] [--limit N] [--no-kg] [--format text|json]
+#                   (search + KG facts in one call, formatted for agent consumption)
+#
 #   memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
 #                    [--decay-threshold F] [--max-rows N]
-#   memo digest [--scope SCOPE] [--dry-run] [--threshold F]
-#   memo calibrate [--scope SCOPE] [--root DIR] [--no-git] [--no-comments] [--dry-run]
-#                  [--probe-only] [--multilingual] [--long] [--hosted] [--allow-hash]
-#                  [--write PATH] [--no-migrate] [--no-mcp] [--docker-compose FILE]
-#   memo secret-store  NAME [--desc DESCRIPTION] [--file PATH]
+#                    (cluster related memories into observations)
+#
+#   memo digest     [--scope SCOPE] [--dry-run] [--threshold F]
+#                   (hippocampus digest: promote tiers, delete stale ephemeral rows)
+#
+#   memo promote    --from FROM_SCOPE --to TO_SCOPE [--delete-source] [--dry-run]
+#                   [--limit N]
+#
+#   memo summarize  [--scope S] [--dry-run] [--weight-threshold F]
+#                   [--retention-days N]
+#
+#   memo calibrate  [--scope SCOPE] [--root DIR] [--no-git] [--no-comments]
+#                   [--probe-only] [--multilingual] [--long] [--hosted]
+#                   [--allow-hash] [--write PATH] [--no-migrate] [--no-mcp]
+#                   [--docker-compose FILE] [--dry-run]
+#                   (probe host + recommend embedder + ingest codebase)
+#
+#   memo ping       [--db] [--table] [--embedder]   Connectivity check (exit 0/1)
+#
+#   memo doctor     [--setup PATH] [--json]
+#                   (corpus health: truncation counts, p95 row size, scale warnings)
+#
+#   memo migrate    Print all luamemo migration SQL to stdout (pipe to psql)
+#
+#   memo secret-store   NAME [--desc DESCRIPTION] [--file PATH]
 #   memo secret-list
-#   memo secret-delete NAME
-#   memo secret-execute NAME URL [--method M] [--header K:V]... [--body TEXT]
-#                               [--form FIELD=VALUE]... [--form-file FIELD:PATH]
-#                               [--timeout-ms N]
-#   memo migrate         Print all luamemo migration SQL to stdout (pipe to psql)
-#   memo ping    [--db] [--table] [--embedder]  Connectivity check (exit 0/1)
-#   memo doctor  [--setup PATH] [--json]
+#   memo secret-delete  NAME
+#   memo secret-execute NAME URL [--method M] [--header K:V]...
+#                               [--body TEXT] [--form FIELD=VALUE]...
+#                               [--form-file FIELD:PATH] [--timeout-ms N]
+#
+#   memo help | --help | -h
 
 set -euo pipefail
 
@@ -271,7 +305,56 @@ cmd_secret_execute() {
 # ---------------------------------------------------------------------------
 # memo migrate
 # ---------------------------------------------------------------------------
-cmd_migrate() {
+
+# Required lm_memories columns shared by _cmd_migrate_check and _cmd_doctor_check.
+# Add new column names here when a migration introduces them.
+_MEMO_REQUIRED_COLS=(
+    id scope kind title body tags metadata embedding importance
+    decay_rate was_truncated fts created_at updated_at
+    tier consolidated_at
+)
+
+# Redact password from a postgresql:// URL for safe display in error messages.
+_redact_url() {
+    echo "$1" | sed 's|://\([^:]*\):[^@]*@|://\1:***@|'
+}
+
+# Assemble a postgresql:// URL from components, validating structural fields
+# for URL-unsafe characters (@  /  #  ?) that would silently mis-parse the
+# authority section.  The password is percent-encoded so those characters in
+# credentials don't break the URL.  Prints the URL to stdout on success;
+# prints an error to stderr and returns 1 when a component is invalid.
+# Usage: _build_pg_url <user> <pass> <host> <port> <dbname>
+_build_pg_url() {
+    local _u="$1" _p="$2" _h="$3" _pt="$4" _db="$5"
+    if [[ "$_u" =~ [@/#?] ]]; then
+        echo "  \u2717 DB user contains URL-unsafe characters (@ / # ?) — enter MEMO_DB_URL manually." >&2
+        return 1
+    fi
+    if [[ "$_h" =~ [@#?] ]]; then
+        echo "  \u2717 DB host contains URL-unsafe characters (@ # ?) — enter MEMO_DB_URL manually." >&2
+        return 1
+    fi
+    if [[ -n "$_pt" ]] && ! [[ "$_pt" =~ ^[0-9]+$ ]]; then
+        echo "  \u2717 DB port '$_pt' is not numeric — enter MEMO_DB_URL manually." >&2
+        return 1
+    fi
+    if [[ "$_db" =~ [/@#?] ]]; then
+        echo "  \u2717 DB name contains URL-unsafe characters (/ @ # ?) — enter MEMO_DB_URL manually." >&2
+        return 1
+    fi
+    # Percent-encode password characters that would break URL parsing.
+    # Encode % first to avoid double-encoding subsequent replacements.
+    local _p_enc
+    _p_enc=$(printf '%s' "$_p" | sed 's/%/%25/g; s/@/%40/g; s/#/%23/g; s|/|%2F|g; s/?/%3F/g')
+    printf 'postgresql://%s:%s@%s:%s/%s' "$_u" "$_p_enc" "$_h" "$_pt" "$_db"
+}
+
+# ---------------------------------------------------------------------------
+# _cmd_migrate_sql: emit full idempotent schema SQL (migrations 001–009).
+# Outputs vector(384) — callers pipe through sed to substitute embed_dim.
+# ---------------------------------------------------------------------------
+_cmd_migrate_sql() {
     cat <<'MIGRATE_EOF'
 -- ==========================================================================
 -- luamemo: full schema + migrations (generated by `memo migrate`)
@@ -283,31 +366,57 @@ cmd_migrate() {
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS lm_memories (
-    id          BIGSERIAL PRIMARY KEY,
-    scope       TEXT NOT NULL,
-    kind        TEXT NOT NULL,
-    title       TEXT NOT NULL,
-    body        TEXT NOT NULL,
-    tags        TEXT[] NOT NULL DEFAULT '{}',
-    metadata    JSONB  NOT NULL DEFAULT '{}'::jsonb,
-    embedding   vector(384),
-    importance  REAL   NOT NULL DEFAULT 1.0
-                    CHECK (importance >= 0.0 AND importance <= 10.0),
-    decay_rate  REAL   NOT NULL DEFAULT 0.0
-                    CHECK (decay_rate >= 0.0 AND decay_rate <= 1.0),
-    was_truncated BOOLEAN NOT NULL DEFAULT FALSE,
-    fts         tsvector GENERATED ALWAYS AS
-                    (to_tsvector('english',
-                        coalesce(title, '') || ' ' || coalesce(body, '')))
-                STORED,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id              BIGSERIAL   PRIMARY KEY,
+    scope           TEXT        NOT NULL,
+    kind            TEXT        NOT NULL,
+    title           TEXT        NOT NULL,
+    body            TEXT        NOT NULL,
+    tags            TEXT[]      NOT NULL DEFAULT '{}',
+    metadata        JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    embedding       vector(384),
+    importance      REAL        NOT NULL DEFAULT 1.0
+                        CHECK (importance >= 0.0 AND importance <= 10.0),
+    decay_rate      REAL        NOT NULL DEFAULT 0.0
+                        CHECK (decay_rate >= 0.0 AND decay_rate <= 1.0),
+    was_truncated   BOOLEAN     NOT NULL DEFAULT FALSE,
+    tier            SMALLINT    NOT NULL DEFAULT 1,
+    consolidated_at TIMESTAMPTZ,
+    fts             tsvector GENERATED ALWAYS AS
+                        (to_tsvector('english',
+                            coalesce(title, '') || ' ' || coalesce(body, '')))
+                    STORED,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS lm_memories_scope_idx ON lm_memories (scope);
 CREATE INDEX IF NOT EXISTS lm_memories_kind_idx  ON lm_memories (kind);
 CREATE INDEX IF NOT EXISTS lm_memories_tags_idx  ON lm_memories USING GIN (tags);
 CREATE INDEX IF NOT EXISTS lm_memories_fts_idx   ON lm_memories USING GIN (fts);
+
+-- Detect real[] embedding column (happens when the table was created before
+-- the pgvector extension was installed — PostgreSQL silently used real[] as
+-- a fallback).  Abort with a clear remediation command rather than crashing
+-- on the HNSW CREATE INDEX below.
+DO $luamemo_col_check$
+DECLARE
+    col_udt text;
+BEGIN
+    SELECT udt_name INTO col_udt
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name   = 'lm_memories'
+      AND column_name  = 'embedding';
+    IF col_udt = '_float4' THEN
+        RAISE EXCEPTION
+            'lm_memories.embedding is typed real[] instead of vector. '
+            'The pgvector extension was not installed when the table was first created. '
+            'Fix with (replace N with your embed_dim, e.g. 384 or 1024): '
+            'ALTER TABLE lm_memories ALTER COLUMN embedding TYPE vector(N) USING NULL; '
+            'Then re-run: memo migrate | psql "$MEMO_DB_URL"';
+    END IF;
+END $luamemo_col_check$;
+
 CREATE INDEX IF NOT EXISTS lm_memories_embedding_hnsw_idx
     ON lm_memories USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS lm_memories_was_truncated_idx
@@ -366,7 +475,179 @@ ALTER TABLE lm_kg_facts ADD  CONSTRAINT lm_kg_facts_validity_window
 -- migration 004 / was_truncated flag ---------------------------------------
 
 ALTER TABLE lm_memories ADD COLUMN IF NOT EXISTS was_truncated BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- migration 005 / composite index (scope, kind) ----------------------------
+
+CREATE INDEX IF NOT EXISTS lm_memories_scope_kind_idx
+    ON lm_memories (scope, kind);
+
+-- migration 006 / temporal retrieval index ---------------------------------
+
+CREATE INDEX IF NOT EXISTS lm_memories_created_at_scope_idx
+    ON lm_memories (scope, created_at DESC);
+
+-- migration 007 / observation consolidation --------------------------------
+
+ALTER TABLE lm_memories ADD COLUMN IF NOT EXISTS consolidated_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS lm_memories_consolidated_at_idx
+    ON lm_memories (scope, consolidated_at)
+    WHERE consolidated_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS lm_observations (
+    id              BIGSERIAL PRIMARY KEY,
+    scope           TEXT    NOT NULL,
+    body            TEXT    NOT NULL,
+    proof_count     INTEGER NOT NULL DEFAULT 1
+                        CHECK (proof_count >= 1),
+    evidence_ids    BIGINT[] NOT NULL DEFAULT '{}',
+    evidence_quotes TEXT[]  NOT NULL DEFAULT '{}',
+    freshness_trend TEXT    NOT NULL DEFAULT 'new'
+                        CHECK (freshness_trend IN
+                            ('new', 'strengthening', 'stable', 'weakening', 'stale')),
+    last_reinforced TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    importance      REAL    NOT NULL DEFAULT 0.5
+                        CHECK (importance >= 0.0 AND importance <= 10.0),
+    embedding       REAL[]
+);
+
+CREATE INDEX IF NOT EXISTS lm_observations_scope_idx
+    ON lm_observations (scope);
+CREATE INDEX IF NOT EXISTS lm_observations_reinforced_idx
+    ON lm_observations (scope, last_reinforced DESC);
+
+-- migration 008 / memory tiers ---------------------------------------------
+
+-- Note: consolidated_at was already added in migration 007.
+ALTER TABLE lm_memories ADD COLUMN IF NOT EXISTS tier SMALLINT NOT NULL DEFAULT 1;
+
+UPDATE lm_memories SET tier = CASE
+    WHEN importance < 0.3  THEN 0
+    WHEN importance < 0.6  THEN 1
+    WHEN importance < 0.85 THEN 2
+    ELSE 3
+END
+WHERE tier = 1;
+
+CREATE INDEX IF NOT EXISTS lm_memories_tier_scope_idx
+    ON lm_memories (scope, tier);
+
+-- migration 009 / reinforcement event log ----------------------------------
+
+CREATE TABLE IF NOT EXISTS lm_reinforcements (
+    id          BIGSERIAL PRIMARY KEY,
+    memory_id   BIGINT NOT NULL REFERENCES lm_memories(id) ON DELETE CASCADE,
+    scope       TEXT NOT NULL,
+    event_type  TEXT NOT NULL CHECK (event_type IN
+                    ('direct_command','mistake','reversal','praise')),
+    delta       REAL NOT NULL,
+    note        TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS lm_reinforcements_memory_idx
+    ON lm_reinforcements (memory_id);
+CREATE INDEX IF NOT EXISTS lm_reinforcements_scope_type_idx
+    ON lm_reinforcements (scope, event_type);
 MIGRATE_EOF
+}
+
+# ---------------------------------------------------------------------------
+# _check_col_list <newline-separated-column-list>
+# Shared inner loop: given a newline-separated string of present column names,
+# prints ✓/✗ for each name in _MEMO_REQUIRED_COLS[@].
+# Returns 0 if all present, 1 if any missing.
+# ---------------------------------------------------------------------------
+_check_col_list() {
+    local _list="$1"
+    local _ok=true
+    for _col in "${_MEMO_REQUIRED_COLS[@]}"; do
+        if printf '%s\n' "$_list" | grep -qx "$_col"; then
+            printf "  ✓ %s\n" "$_col"
+        else
+            printf "  ✗ %s — MISSING\n" "$_col"
+            _ok=false
+        fi
+    done
+    [[ "$_ok" == "true" ]]
+}
+
+# ---------------------------------------------------------------------------
+# _check_mem_columns <psql_url>
+# Shared helper: queries lm_memories columns and prints ✓/✗ per required
+# column from _MEMO_REQUIRED_COLS.
+# Return codes:
+#   0 — all columns present
+#   1 — one or more columns missing
+#   2 — table not found / DB unreachable (present_cols was empty)
+# Does NOT call exit — the caller decides how to handle each code.
+# ---------------------------------------------------------------------------
+_check_mem_columns() {
+    local _db="$1"
+    local _present
+    _present=$(PGPASSWORD="${PGPASSWORD:-}" psql "$_db" -tAc \
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema='public' AND table_name='lm_memories'" 2>/dev/null || true)
+    if [[ -z "$_present" ]]; then
+        return 2
+    fi
+    _check_col_list "$_present"
+}
+
+# ---------------------------------------------------------------------------
+# _cmd_migrate_check: diff required columns vs live DB via psql.
+# Exits 0 if schema is complete, 1 if anything is missing.
+# ---------------------------------------------------------------------------
+_cmd_migrate_check() {
+    local embed_dim="${1:-384}"
+    if [[ -z "${MEMO_DB_URL:-}" ]]; then
+        echo "memo migrate --check: MEMO_DB_URL is not set." >&2
+        exit 1
+    fi
+    if ! command -v psql &>/dev/null; then
+        echo "memo migrate --check: psql not found in PATH." >&2
+        exit 1
+    fi
+    local _rc
+    _check_mem_columns "$MEMO_DB_URL"; _rc=$?
+    if [[ "$_rc" -eq 2 ]]; then
+        echo "  ✗ lm_memories — table not found or DB unreachable"
+        echo "    Is MEMO_DB_URL correct? Run: memo migrate | psql \"\$MEMO_DB_URL\""
+        exit 1
+    fi
+    echo ""
+    if [[ "$_rc" -eq 0 ]]; then
+        echo "Schema is complete."
+    else
+        echo "Run: memo migrate | psql \"\$MEMO_DB_URL\"  to apply missing columns."
+        exit 1
+    fi
+}
+
+
+# memo migrate [--embed-dim N] [--check]
+cmd_migrate() {
+    local embed_dim=384
+    local check_mode=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --embed-dim) embed_dim="$2"; shift 2 ;;
+            --check)     check_mode=true; shift ;;
+            *) echo "memo migrate: unknown arg: $1" >&2; exit 1 ;;
+        esac
+    done
+    if [[ "$check_mode" == "true" ]]; then
+        _cmd_migrate_check "$embed_dim"
+        return $?
+    fi
+    if [[ "$embed_dim" -eq 384 ]]; then
+        echo "-- [warn] embed_dim defaults to 384."
+        echo "--        If your embedder outputs a different dimension (e.g. bge-m3 = 1024),"
+        echo "--        re-run with: memo migrate --embed-dim N"
+        echo "--"
+    fi
+    _cmd_migrate_sql | sed "s/vector(384)/vector(${embed_dim})/g"
 }
 
 cmd_promote() {
@@ -595,17 +876,64 @@ cmd_calibrate() {
         _parse_compose_pg "$dc_file" || true
     fi
 
-    "$lua" -e "require('luamemo.cli.calibrate').run({[==[--root]==],[==[${root}]==],${lua_extra_flags}})"
+    # Run probe. Write config snippet to a temp file so we can extract embed_dim
+    # and pass it to cmd_migrate later (avoids vector(384) hardcode mismatch).
+    local _probe_tmp; _probe_tmp=$(mktemp /tmp/luamemo_probe_XXXXXX.lua)
+    "$lua" -e "require('luamemo.cli.calibrate').run({[==[--root]==],[==[${root}]==],${lua_extra_flags}[==[--write]==],[==[${_probe_tmp}]==]})"
+    local _probe_embed_dim=384
+    if [[ -s "$_probe_tmp" ]]; then
+        local _dim_line; _dim_line=$(grep -o 'embed_dim = [0-9]*' "$_probe_tmp" 2>/dev/null | head -1)
+        [[ -n "$_dim_line" ]] && _probe_embed_dim="${_dim_line##*= }"
+    fi
+    rm -f "$_probe_tmp"
     [[ "$probe_only" == true ]] && return 0
 
     # ── Phase 2: resolve DB connection ──────────────────────────────────────
-    # Resolution order:
-    #   1. $MEMO_DB_URL env var (from ~/.memorc or explicit)
-    #   2. Individual PG* env vars (PGHOST etc.)
-    #   3. Prompt once, save to ~/.memorc
+    # Resolution order (first match wins):
+    #   1. $MEMO_DB_URL already set (from --docker-compose, ~/.memorc, or user)
+    #   2. $DATABASE_URL env var (common 12-factor / Heroku convention)
+    #   3. $POSTGRES_DB + sibling POSTGRES_*/PG* env vars → build MEMO_DB_URL
+    #   4. $PGDATABASE + $PGHOST env vars → build MEMO_DB_URL
+    #   5. Auto-detect docker-compose.yml / docker-compose.yaml in CWD
+    #   6. Prompt once, save to ~/.memorc
 
-    if [[ -z "${MEMO_DB_URL:-}" ]] && \
-       [[ -z "${PGHOST:-}" ]] && [[ -z "${PGDATABASE:-}" ]]; then
+    if [[ -z "${MEMO_DB_URL:-}" ]]; then
+        if [[ -n "${DATABASE_URL:-}" ]]; then
+            export MEMO_DB_URL="$DATABASE_URL"
+            echo "  DB: using DATABASE_URL"
+        elif [[ -n "${POSTGRES_DB:-}" ]]; then
+            local _pg_user="${POSTGRES_USER:-${PGUSER:-postgres}}"
+            local _pg_pass="${POSTGRES_PASSWORD:-${PGPASSWORD:-}}"
+            local _pg_host="${POSTGRES_HOST:-${PGHOST:-127.0.0.1}}"
+            local _pg_port="${POSTGRES_PORT:-${PGPORT:-5432}}"
+            local _url
+            if _url=$(_build_pg_url "$_pg_user" "$_pg_pass" "$_pg_host" "$_pg_port" "${POSTGRES_DB}"); then
+                export MEMO_DB_URL="$_url"
+                echo "  DB: assembled from POSTGRES_* env vars → ${POSTGRES_DB}"
+            else
+                echo "  Falling back to manual MEMO_DB_URL prompt."
+            fi
+        elif [[ -n "${PGDATABASE:-}" ]]; then
+            local _pg_user="${PGUSER:-postgres}"
+            local _pg_pass="${PGPASSWORD:-}"
+            local _pg_host="${PGHOST:-127.0.0.1}"
+            local _pg_port="${PGPORT:-5432}"
+            local _url
+            if _url=$(_build_pg_url "$_pg_user" "$_pg_pass" "$_pg_host" "$_pg_port" "${PGDATABASE}"); then
+                export MEMO_DB_URL="$_url"
+                echo "  DB: assembled from PG* env vars → ${PGDATABASE}"
+            else
+                echo "  Falling back to manual MEMO_DB_URL prompt."
+            fi
+        elif [[ -f "docker-compose.yml" ]] || [[ -f "docker-compose.yaml" ]]; then
+            local _dc="docker-compose.yml"
+            [[ -f "docker-compose.yaml" ]] && _dc="docker-compose.yaml"
+            echo "  DB: auto-detected $_dc — probing for Postgres config..."
+            _parse_compose_pg "$_dc" || true
+        fi
+    fi
+
+    if [[ -z "${MEMO_DB_URL:-}" ]]; then
         echo ""
         echo "  No database config found."
         echo -n "  Enter MEMO_DB_URL (e.g. postgresql://postgres:@127.0.0.1:5432/luamemo): "
@@ -646,6 +974,23 @@ cmd_calibrate() {
             kg_present=$(printf '%s' "$schema_result" | jq -r '.tables.lm_kg_facts.present // false' 2>/dev/null || echo "false")
             kg_missing=$(printf '%s' "$schema_result" | jq -r '(.tables.lm_kg_facts.missing_cols // []) | join(", ")' 2>/dev/null || echo "")
 
+            # Check for a DB connection error — this is distinct from "table missing":
+            # if the Lua process couldn't connect at all, the schema-check result
+            # contains db_error on every table entry.  Treat this as a connectivity
+            # problem, not a missing-schema problem, so we don't confusingly say
+            # "table missing" and then have psql succeed (contradicting the check).
+            local any_db_err
+            any_db_err=$(printf '%s' "$schema_result" | \
+                jq -r '[.tables // {} | to_entries[] | .value.db_error // empty] | first // ""' \
+                2>/dev/null || echo "")
+            if [[ -n "$any_db_err" ]]; then
+                echo "  Schema check: DB connection failed — cannot verify schema."
+                echo "    Error: $any_db_err"
+                echo "    Verify MEMO_DB_URL ($(_redact_url "${MEMO_DB_URL:-}")) is reachable, then re-run."
+                echo "  (If the schema already exists this is harmless once connectivity is restored.)"
+                return 0
+            fi
+
             echo "  Schema: incomplete"
             [[ "$mem_present" != "true" ]] && echo "    - lm_memories table: missing"
             [[ "$mem_present" == "true" ]] && [[ -n "$mem_missing" ]] && echo "    - lm_memories columns missing: $mem_missing"
@@ -662,14 +1007,14 @@ cmd_calibrate() {
             fi
 
             if [[ "$do_migrate" =~ ^[Yy]$ ]]; then
-                echo "  Applying schema..."
-                if cmd_migrate | PGPASSWORD="${PGPASSWORD:-}" psql "$MEMO_DB_URL" -v ON_ERROR_STOP=1 -q; then
+                echo "  Applying schema (embed_dim=${_probe_embed_dim})..."
+                if cmd_migrate --embed-dim "${_probe_embed_dim}" | PGPASSWORD="${PGPASSWORD:-}" psql "$MEMO_DB_URL" -v ON_ERROR_STOP=1 -q; then
                     echo "  Schema applied successfully."
                 else
                     echo ""
                     echo "  ERROR: psql exited with an error. Check the output above." >&2
                     echo "  You can apply the schema manually:" >&2
-                    echo "    memo migrate | psql \"\$MEMO_DB_URL\"" >&2
+                    echo "    memo migrate --embed-dim ${_probe_embed_dim} | psql \"\$MEMO_DB_URL\"" >&2
                     echo "  Codebase ingest will be skipped until the schema is ready." >&2
                     return 1
                 fi
@@ -677,7 +1022,7 @@ cmd_calibrate() {
                 echo ""
                 echo "  Schema not applied. Memories cannot be stored without it."
                 echo "  To apply manually:"
-                echo "    memo migrate | psql \"$MEMO_DB_URL\""
+                echo "    memo migrate --embed-dim ${_probe_embed_dim} | psql \"$MEMO_DB_URL\""
                 echo ""
                 echo "  Without the schema, codebase ingest will fail."
                 echo "  Re-run memo calibrate once the schema is in place."
@@ -1010,6 +1355,108 @@ _calibrate_mcp_phase() {
     echo ""
 }
 
+# ---------------------------------------------------------------------------
+# _cmd_doctor_check: standalone DB health check via psql.
+# Requires only a DB URL. No Lua interpreter, no setup() context needed.
+# Exits 0 if healthy, 1 if problems found.
+# ---------------------------------------------------------------------------
+_cmd_doctor_check() {
+    local db_url="${1:-${MEMO_DB_URL:-}}"
+    if [[ -z "$db_url" ]]; then
+        echo "memo doctor --db-url: no DB URL provided and MEMO_DB_URL is not set." >&2
+        echo "  Usage: memo doctor --db-url postgresql://user:pass@host:5432/dbname" >&2
+        exit 1
+    fi
+    if ! command -v psql &>/dev/null; then
+        echo "memo doctor --db-url: psql not found in PATH." >&2
+        exit 1
+    fi
+    local all_ok=true
+
+    # Run all diagnostic queries in one psql session — single connection and
+    # auth handshake instead of 4 separate subprocesses.
+    # Section markers (\echo MARKER) delimit output sections for bash parsing.
+    local _psql_out
+    if ! _psql_out=$(PGPASSWORD="${PGPASSWORD:-}" psql "$db_url" --no-psqlrc -At 2>&1 <<'DOCTOR_SQL'
+\echo __LM_CONNECTED__
+SELECT extname FROM pg_extension WHERE extname = 'vector';
+\echo __LM_VEC_DONE__
+SELECT column_name FROM information_schema.columns
+WHERE  table_schema = 'public' AND table_name = 'lm_memories'
+ORDER  BY column_name;
+\echo __LM_COLS_DONE__
+SELECT table_name FROM information_schema.tables
+WHERE  table_schema = 'public' AND table_name = 'lm_kg_facts';
+\echo __LM_KG_DONE__
+DOCTOR_SQL
+    ); then
+        echo "DB connectivity..."
+        echo "  ✗ cannot connect to $(_redact_url "$db_url")"
+        exit 1
+    fi
+    echo "DB connectivity..."
+    echo "  ✓ connected"
+
+    # Extract each section: lines between marker pairs, markers excluded.
+    local _vec_out _cols_out _kg_out
+    _vec_out=$(printf   '%s\n' "$_psql_out" | awk '/^__LM_CONNECTED__/{f=1;next} /^__LM_VEC_DONE__/{f=0}   f')
+    _cols_out=$(printf  '%s\n' "$_psql_out" | awk '/^__LM_VEC_DONE__/{f=1;next}  /^__LM_COLS_DONE__/{f=0}  f')
+    _kg_out=$(printf    '%s\n' "$_psql_out" | awk '/^__LM_COLS_DONE__/{f=1;next} /^__LM_KG_DONE__/{f=0}    f')
+
+    echo "pgvector extension..."
+    if [[ "$_vec_out" == "vector" ]]; then
+        echo "  ✓ vector extension installed"
+    else
+        echo "  ✗ vector extension missing (run: CREATE EXTENSION vector;)"
+        all_ok=false
+    fi
+
+    echo "lm_memories schema..."
+    if [[ -z "$_cols_out" ]]; then
+        echo "  ✗ lm_memories table not found"
+        echo "    Run: memo migrate | psql \"$(_redact_url "$db_url")\""
+        all_ok=false
+    else
+        _check_col_list "$_cols_out" || all_ok=false
+    fi
+
+    echo ""
+    echo "lm_kg_facts table..."
+    if [[ -n "$_kg_out" ]]; then
+        echo "  ✓ present"
+    else
+        echo "  ✗ missing (run: memo migrate | psql \"$(_redact_url "$db_url")\")"
+        all_ok=false
+    fi
+
+    echo ""
+    if [[ "$all_ok" == "true" ]]; then
+        echo "All checks passed — database is healthy."
+    else
+        echo "Problems found. Run: memo migrate | psql \"$(_redact_url "$db_url")\""
+        exit 1
+    fi
+}
+
+# memo doctor [--db-url URL] [--setup PATH] [--json]
+# --db-url URL: standalone mode (no Lua, no setup() context needed).
+# Without --db-url: falls through to the Lua-based doctor.
+cmd_doctor() {
+    local db_url=""
+    local passthrough_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --db-url) db_url="$2"; shift 2 ;;
+            *) passthrough_args+=("$1"); shift ;;
+        esac
+    done
+    if [[ -n "$db_url" ]]; then
+        _cmd_doctor_check "$db_url"
+        return $?
+    fi
+    cmd_local_lua doctor "${passthrough_args[@]}"
+}
+
 cmd_local_lua() {
     local module="$1"; shift
     local lua
@@ -1025,8 +1472,8 @@ cmd_local_lua() {
 }
 
 usage() {
-    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
-    exit 1
+    awk 'NR>1 && /^[^#]/{exit} NR>1{sub(/^# ?/,""); print}' "$0"
+    exit 0
 }
 
 [[ $# -lt 1 ]] && usage
@@ -1049,9 +1496,9 @@ case "$sub" in
     secret-list)    cmd_secret_list         ;;
     secret-delete)  cmd_secret_delete  "$@" ;;
     secret-execute) cmd_secret_execute "$@" ;;
-    migrate) cmd_migrate ;;
+    migrate) cmd_migrate "$@" ;;
     ping)    cmd_local_lua ping    "$@" ;;
-    doctor)  cmd_local_lua doctor  "$@" ;;
+    doctor)  cmd_doctor            "$@" ;;
     -h|--help|help) usage ;;
     *) echo "memo: unknown subcommand: $sub" >&2; usage ;;
 esac

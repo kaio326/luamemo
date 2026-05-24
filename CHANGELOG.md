@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.3.2 — 2026-05-15
+
+- **`luamemo.patterns` — new module: preference extraction + query-time boosts.**
+  Scans each `store.write()` body for first-person preference/habit/sentiment
+  signals ("I prefer X", "I always Y", "I hate Z") and inserts synthetic companion
+  memories at `importance = 0.4` in the same scope. At query time, scores are
+  boosted by `person_name_boost` (default +0.15) for capitalised tokens from the
+  query that appear in a memory body, and by `quoted_phrase_boost` (default +0.40)
+  for single- or double-quoted phrase matches. Both extraction and each boost can
+  be independently disabled. New config keys: `patterns_enabled` (default `true`),
+  `patterns_max_body_chars` (default 5 000), `person_name_boost` (0.15),
+  `person_name_boost_enabled` (true), `quoted_phrase_boost` (0.40),
+  `quoted_phrase_boost_enabled` (true).
+
+- **MCP server — 4 new tools (17 total).**
+  - `memory_status`: returns a DB health snapshot — total row count, per-scope
+    breakdown via a single window-function query, and optional config details
+    (embedder, backend, `embed_dim`) when `verbose = true`.
+  - `memory_reconnect`: resets the pgmoon connection and verifies it with a row
+    count. Useful after external scripts modify `lm_memories` directly.
+  - `memory_diary_write`: writes a personal diary entry for a named agent into
+    an isolated `diary:<agent_name>` scope. `agent_name` is validated
+    (letters/digits/hyphens/underscores/dots only, max 64 chars; enforced in both
+    diary tools to prevent scope injection).
+  - `memory_diary_read`: reads the most recent N diary entries for an agent
+    (default 10, max 50), newest first.
+
+- **`luamemo.init` — `ensure_ready()` probe retry backoff.**
+  When the embedder is unreachable at `setup()` time and `skip_embed_probe = true`
+  is set, `store.write()` probes the embedder on each call. Without a backoff this
+  hammered the embedder on every write when it was slow to start. A
+  `_last_probe_ts` guard now limits retries to at most once per
+  `ensure_ready_retry_secs` seconds (default 10). New config key:
+  `ensure_ready_retry_secs` (default 10).
+
+- **`store.lua` — LSH filter bypass (bug fix).**
+  When a scope contained ≥ `lsh_rebuild_at` rows, the LSH SQL path emitted
+  `WHERE id IN (...)` without appending the extra `kind`/`tier`/time filter
+  clauses and without a `LIMIT` cap. Filters were silently dropped on large
+  scopes. Both the filter clause and `LIMIT %d` are now correctly appended to
+  the LSH path.
+
+- **`store.lua` — pgvector CTE LIMIT now scales with `fetch_limit` (bug fix).**
+  The inner pgvector CTE used a hardcoded `LIMIT 50` regardless of the caller's
+  `limit` parameter. With high reranker candidate counts the CTE silently
+  truncated the candidate set before reranking. The CTE now uses
+  `LIMIT math.max(50, limit)` so the pool size tracks the request.
+
+- **`store.lua` — `store.delete()` error string propagation (bug fix).**
+  A single-variable capture pattern (`local res = db.delete(...); return res`)
+  dropped the DB error string — callers received `nil, nil` on failure instead
+  of `nil, "<error>"`. Fixed to return `db.delete(...)` directly.
+
+- **`store.lua` — dead `_get_luamemo()` call outside guard (code quality).**
+  `_get_luamemo()` was called unconditionally at the top of `M.write()` before
+  the `if _has_ensure_ready then` guard, doing a module lookup on every write
+  even when ensure_ready was not wired. Call moved inside the guard.
+
+- **`mcp/server.lua` — hardcoded `lm_memories` table name (bug fix).**
+  `memory_status`, `memory_reconnect`, and `memory_diary_read` all contained
+  the literal string `"lm_memories"`. Each now calls `store_mod.table_name()`,
+  respecting any custom table configuration.
+
+- **`luamemo.http` — pre-load `ltn12` before `socket.http` (bug fix).**
+  LuaSocket's lazy `_G` assignment for `ltn12` triggered OpenResty's
+  `__newindex` guard when the module was loaded for the first time inside an
+  OpenResty request context. Fixed by pre-loading `ltn12` via `pcall(require,
+  "ltn12")` before `socket.http`.
+
+- **`cli/memo` — `_MEMO_REQUIRED_COLS` as single source of truth.**
+  The required-column list was duplicated across multiple `schema-check` paths.
+  A single `_MEMO_REQUIRED_COLS` array and `_check_mem_columns()` helper now
+  serve all paths. DB URL password is redacted in all credential error messages
+  to prevent accidental exposure in logs.
+
+- **`cli/calibrate` — GPU VRAM threshold note.**
+  When a GPU is detected but free VRAM is below 2 048 MiB, the calibrate output
+  now logs the exact VRAM figure and explains the CPU fallback instead of
+  printing "No GPU".
+
+- **`README.md` — `skip_embed_probe` and `store.write()` return convention.**
+  Added a dedicated section for slow-starting embedder sidecars (`skip_embed_probe
+  = true`) and a reference table documenting that `store.write()` never throws —
+  failures always surface as `nil, err`.
+
 ## 0.3.1 — 2026-05-14
 
 - **`luamemo.temporal` — word-boundary fix for month-name rules.**

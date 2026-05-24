@@ -406,12 +406,12 @@ end
 handlers["schema-check"] = function(_p)
     local db = require("luamemo.db")
 
-    -- Expected columns per table (covers all migrations 001–005).
+    -- Expected columns per table (covers all migrations 001–009).
     local expected = {
         lm_memories = {
             "id", "scope", "kind", "title", "body", "tags", "metadata",
             "embedding", "importance", "decay_rate", "was_truncated",
-            "fts", "created_at", "updated_at",
+            "fts", "created_at", "updated_at", "tier", "consolidated_at",
         },
         lm_kg_facts = {
             "id", "scope", "subject", "predicate", "object",

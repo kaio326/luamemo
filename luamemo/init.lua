@@ -7,8 +7,16 @@ local routes      = require("luamemo.routes")
 local summarizer  = require("luamemo.summarizer")
 local rerank      = require("luamemo.rerank")
 local secrets     = require("luamemo.secrets")
+local patterns    = require("luamemo.patterns")
 
 local M = {}
+
+-- Runtime state. ok is false until setup() completes a successful embedder
+-- probe. ensure_ready() retries the probe on demand so a slow-starting
+-- embedder sidecar can recover without a full container restart.
+local _state         = { ok = false }
+local _setup_called  = false  -- true after setup() completes successfully
+local _last_probe_ts = 0   -- os.time() of the most recent ensure_ready() probe attempt
 
 -- ---------------------------------------------------------------------------
 -- Default configuration. Overridden by setup().
@@ -89,6 +97,30 @@ M.config = {
     -- Observations are never merged into the primary evidence ranking; they
     -- supplement it. Set to 0 to suppress observations from results entirely.
     obs_max_slots               = 3,
+    -- Preference extraction: when true, store.write() scans each memory body for
+    -- first-person preference/habit/sentiment signals ("I prefer X", "I always Y")
+    -- and inserts synthetic companion memories at importance=0.4 in the same scope.
+    -- Synthetic rows carry metadata.is_synthetic=true and are never re-processed.
+    -- Set to false to disable (e.g. for verbatim-only deployments).
+    patterns_enabled            = true,
+    -- Maximum body length (bytes) scanned by patterns.extract().
+    -- Bodies longer than this are skipped entirely to bound CPU cost.
+    patterns_max_body_chars     = 5000,
+    -- Query-time boosts: score multipliers applied after retrieval to rows matching
+    -- proper names or quoted phrases extracted from the query string.
+    -- person_name_boost: applied when a capitalised token from the query appears in a row body.
+    -- quoted_phrase_boost: applied when a single- or double-quoted phrase from the query appears verbatim.
+    -- Set *_enabled = false to disable independently.
+    person_name_boost           = 0.15,
+    person_name_boost_enabled   = true,
+    quoted_phrase_boost         = 0.40,
+    quoted_phrase_boost_enabled = true,
+    -- Backoff for ensure_ready() probe retries.
+    -- When the embedder is down, ensure_ready() fires an HTTP probe on each
+    -- failed store.write() call.  This key caps how often retries are attempted:
+    -- at most once per ensure_ready_retry_secs seconds per Lua VM.
+    -- Set to 0 to disable the backoff (retry on every call).
+    ensure_ready_retry_secs     = 10,
     -- LLM rerank (Roadmap Item 15.1):
     --   adapter: "noop" (lexical overlap, no network) | "ollama" | "openai"
     --   enabled: when true, every search() runs through the reranker
@@ -157,23 +189,17 @@ function M.setup(opts)
     summarizer.configure(M.config)
     rerank.configure(M.config)
     secrets.configure(M.config)
+    patterns.configure(M.config)
 
-    -- Fail-fast embedder health check. Skip for the `hash` embedder
-    -- (cannot fail) and when callers explicitly opt out (offline tests,
-    -- pgmoon-shim eval scripts).
-    if not M.config.skip_embed_probe and M.config.embedder_local ~= "hash" then
-        local dim, err = embed.probe()
-        if not dim then
-            error("setup() embed probe failed: " .. tostring(err) ..
-                "\n  Check embedder_url / embedder_model / network access." ..
-                "\n  To bypass during offline testing, pass `skip_embed_probe = true`.")
-        end
-        if dim ~= M.config.embed_dim then
-            error(("setup() embed_dim mismatch: configured %d, embedder returned %d." ..
-                "\n  Update setup({ embed_dim = %d }) to match your embedder.")
-                :format(M.config.embed_dim, dim, dim))
-        end
+    -- Fail-fast embedder health check.
+    local probe_ok, probe_err = M._init_embedder(M.config)
+    if not probe_ok then
+        error("setup() " .. probe_err ..
+            "\n  Check embedder_url / embedder_model / network access." ..
+            "\n  To bypass during offline testing, pass `skip_embed_probe = true`.")
     end
+    _state.ok     = true
+    _setup_called = true
 
     if M.config.corpus_health_check then
         -- Best-effort. Wrapped in pcall so a missing table on a fresh
@@ -182,6 +208,52 @@ function M.setup(opts)
     end
 
     return M
+end
+
+--- Run only the embedder probe portion of setup(). Returns true on success
+-- or false, err_string on failure. Called by setup() and ensure_ready().
+-- @param config table  M.config (or a compatible table for unit tests)
+function M._init_embedder(config)
+    if config.skip_embed_probe or config.embedder_local == "hash" then
+        return true
+    end
+    local dim, err = embed.probe()
+    if not dim then
+        return false, "embed probe failed: " .. tostring(err)
+    end
+    if dim ~= config.embed_dim then
+        return false, ("embed_dim mismatch: configured %d, embedder returned %d." ..
+            "  Update setup({ embed_dim = %d }) to match your embedder.")
+            :format(config.embed_dim, dim, dim)
+    end
+    return true
+end
+
+--- Returns true when the library is fully operational (setup succeeded and
+-- the embedder is reachable). On the first call after a failed startup,
+-- retries the embedder probe once. If the sidecar is now up, sets
+-- _state.ok = true so subsequent calls are cheap O(1) checks.
+-- @return boolean
+function M.ensure_ready()
+    if _state.ok then return true end
+    -- Nothing to retry if setup() was never called.
+    if not _setup_called then return false end
+    -- Backoff: only probe the embedder at most once per retry_secs to avoid
+    -- thundering-herd when the embedder is down and writes are arriving at
+    -- high frequency.  Each failed attempt resets the backoff window.
+    local retry_secs = M.config.ensure_ready_retry_secs or 10
+    if retry_secs > 0 and (os.time() - _last_probe_ts) < retry_secs then
+        return false  -- still within backoff window
+    end
+    _last_probe_ts = os.time()
+    local ok = M._init_embedder(M.config)
+    if ok then
+        _state.ok = true
+        if type(ngx) == "table" and ngx.log and ngx.INFO then
+            ngx.log(ngx.INFO, "[luamemo] embedder recovered, writes re-enabled")
+        end
+    end
+    return _state.ok
 end
 
 -- ---------------------------------------------------------------------------

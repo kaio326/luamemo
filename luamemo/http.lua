@@ -72,6 +72,9 @@ local function try_socket(url, opts)
         end
         http_mod = mod
     else
+        -- Pre-load ltn12 before socket.http to prevent LuaSocket's lazy _G
+        -- assignment from triggering OpenResty's __newindex guard.
+        pcall(require, "ltn12")
         local ok, mod = pcall(require, "socket.http")
         if not ok then
             return nil, nil,

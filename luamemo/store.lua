@@ -8,6 +8,7 @@ local util        = require("luamemo.util")
 local temporal    = require("luamemo.temporal")
 local consolidate = require("luamemo.consolidate")
 local digest      = require("luamemo.digest")
+local patterns    = require("luamemo.patterns")
 
 local M = {}
 
@@ -15,6 +16,63 @@ local cfg = nil
 local _backend = nil   -- resolved backend: "pgvector" | "bruteforce"
 local lsh_mod    = nil  -- lazily required "luamemo.lsh" (never loads for pgvector backend)
 local _lsh_index = {}   -- [scope_string] = lsh-idx-object | false | nil
+
+-- Lazy reference to the parent luamemo module for ensure_ready() calls.
+-- Fetched on first write() to avoid circular-require at module load time.
+local _luamemo_ref          = nil
+local _luamemo_ref_fetched  = false
+local _has_ensure_ready     = false   -- cached: _luamemo_ref.ensure_ready is a function
+
+-- ---------------------------------------------------------------------------
+-- Query-time boost helpers (Plan 14)
+-- ---------------------------------------------------------------------------
+
+-- Capitalised words that are structural query tokens, not proper names.
+local _NAME_STOPWORDS = {
+    what=1, when=1, where=1, who=1, why=1, how=1, which=1,
+    did=1, does=1, ["do"]=1, is=1, are=1, was=1, were=1, will=1,
+    the=1, a=1, an=1, ["in"]=1, on=1, at=1, to=1, of=1,
+    ["and"]=1, ["or"]=1, but=1, ["for"]=1, with=1, from=1, about=1, i=1,
+    my=1, me=1, we=1, our=1, you=1, your=1, he=1, she=1, they=1,
+}
+
+--- Extract likely proper names from a query string.
+-- Matches consecutive sequences of Title-case ASCII words.
+-- Returns a list of lowercased name tokens.
+local function _extract_names(query)
+    local names = {}
+    for word in query:gmatch("%u%a+") do
+        if not _NAME_STOPWORDS[word:lower()] then
+            names[#names + 1] = word:lower()
+        end
+    end
+    return names
+end
+
+--- Extract quoted phrases from a query string.
+-- Supports both "double" and 'single' quotes.
+-- Returns a list of lowercased phrase strings.
+local function _extract_quoted(query)
+    local phrases = {}
+    for p in query:gmatch('"([^"]+)"') do
+        phrases[#phrases + 1] = p:lower()
+    end
+    for p in query:gmatch("'([^']+)'") do
+        phrases[#phrases + 1] = p:lower()
+    end
+    return phrases
+end
+
+local function _get_luamemo()
+    if not _luamemo_ref_fetched then
+        _luamemo_ref_fetched = true
+        local ok, m = pcall(require, "luamemo")
+        _luamemo_ref      = ok and type(m) == "table" and m or nil
+        _has_ensure_ready = _luamemo_ref ~= nil
+            and type(_luamemo_ref.ensure_ready) == "function"
+    end
+    return _luamemo_ref
+end
 
 -- Probe Postgres for the `vector` extension. Wrapped in pcall so a DB
 -- that's not yet reachable at configure() time doesn't crash startup —
@@ -311,6 +369,14 @@ end
 -- callers continue to work unchanged.
 -- ---------------------------------------------------------------------------
 function M.write(args)
+    -- Lazy re-init: if the embedder was unreachable at startup, try once to
+    -- recover before failing the write with a clear error.
+    if _has_ensure_ready then
+        local lm = _get_luamemo()
+        if not lm.ensure_ready() then
+            return nil, "luamemo not ready (embedder unavailable)"
+        end
+    end
     assert(type(args) == "table", "write(args) requires a table")
     local scope = args.scope or cfg.default_scope
     local kind  = args.kind or "fact"
@@ -408,6 +474,35 @@ function M.write(args)
     -- Keep LSH index current when active for this scope.
     local _lsh = _lsh_index[scope]
     if _lsh and _lsh ~= false then _lsh:insert(rows[1].id, vec) end
+    -- Preference extraction: create synthetic companion memories for
+    -- preference / habit / sentiment signals in the body.
+    -- Skipped for synthetic rows (avoids infinite recursion) and when disabled.
+    -- Uses write_many() so multiple synthetics are embedded in one batch call.
+    if cfg.patterns_enabled ~= false then
+        local is_syn = type(args.metadata) == "table" and args.metadata.is_synthetic
+        if not is_syn then
+            local syns = patterns.extract(args.body or "")
+            if #syns > 0 then
+                local syn_rows = {}
+                for _, syn_body in ipairs(syns) do
+                    syn_rows[#syn_rows + 1] = {
+                        scope      = scope,
+                        kind       = "fact",
+                        title      = "Preference: " .. syn_body:sub(1, 60),
+                        body       = syn_body,
+                        importance = 0.4,
+                        metadata   = { is_synthetic = true, source_id = rows[1].id },
+                    }
+                end
+                local _wr_ok, _wr_err = pcall(M.write_many, syn_rows, { dedup_strategy = "skip" })
+                if not _wr_ok then
+                    if type(ngx) == "table" and ngx.log and ngx.WARN then
+                        ngx.log(ngx.WARN, "[luamemo.patterns] synthetic write failed: " .. tostring(_wr_err))
+                    end
+                end
+            end
+        end
+    end
     -- Notify consolidation engine of new unprocessed memory.
     consolidate.notify(scope)
     digest.notify_write(scope)
@@ -883,8 +978,7 @@ end
 function M.delete(id)
     id = tonumber(id)
     if not id then return nil, "delete: invalid id" end
-    local res = db.delete(cfg.db_table, { id = id })
-    return res
+    return db.delete(cfg.db_table, { id = id })
 end
 
 -- ---------------------------------------------------------------------------
@@ -1241,7 +1335,7 @@ local function _search_pgvector(q, qvec, scope, kind, limit, wv, wf, ignore_deca
             FROM %s
             %s
             ORDER BY embedding <=> %s
-            LIMIT 50
+            LIMIT %d
         ),
         normalised AS (
             SELECT *,
@@ -1266,6 +1360,7 @@ local function _search_pgvector(q, qvec, scope, kind, limit, wv, wf, ignore_deca
                tbl(),
                where,
                qvec_lit,
+               math.max(50, limit),
                wv, wf,
                limit)
 
@@ -1300,14 +1395,21 @@ local function _search_bruteforce(q, qvec, scope, kind, limit, wv, wf, ignore_de
         if #cand_ids > 0 then
             local id_list = util.sql_id_list(cand_ids)
             if id_list then
+                -- Apply any extra filters (kind, tier, time) that the LSH
+                -- pre-filter cannot enforce on its own.  Scope is implicit
+                -- (index is per-scope) but included here for SQL clarity.
+                local extra = (#conds > 0)
+                    and (" AND " .. table.concat(conds, " AND "))
+                    or  ""
                 lsh_sql = ([[
                     SELECT id, scope, kind, title, body, tags, metadata,
                            importance, decay_rate, created_at, updated_at, embedding, tier,
                            ts_rank_cd(fts, plainto_tsquery('english', %s)) AS fts_score
                     FROM %s
-                    WHERE id IN (%s)
+                    WHERE id IN (%s)%s
                     ORDER BY fts_score DESC NULLS LAST
-                ]]):format(db.escape_literal(q), tbl(), id_list)
+                    LIMIT %d
+                ]]):format(db.escape_literal(q), tbl(), id_list, extra, cap)
             end
         end
     end
@@ -1525,6 +1627,52 @@ function M.search(args)
         if #t_rows > 0 then lists[#lists + 1] = t_rows end
         if #lists > 1 then
             rows = temporal.rrf_merge(lists)
+        end
+    end
+
+    -- Post-retrieval boosts: proper-name and quoted-phrase matching (Plan 14).
+    -- Applied immediately after RRF merge, before fetch_limit trim, so the
+    -- boosted scores are visible to the reranker and final sort.
+    if args.query and (#rows > 0) then
+        local pnb_on = cfg.person_name_boost_enabled  ~= false
+        local qpb_on = cfg.quoted_phrase_boost_enabled ~= false
+        if pnb_on or qpb_on then
+            local names   = (pnb_on and args.query:find("%u", 1))    and _extract_names(args.query)  or {}
+            local phrases = (qpb_on and args.query:find('["\']', 1)) and _extract_quoted(args.query) or {}
+            if #names > 0 or #phrases > 0 then
+                local pb = cfg.person_name_boost  or 0.15
+                local qb = cfg.quoted_phrase_boost or 0.40
+                local _boosted = false
+                for _, r in ipairs(rows) do
+                    local body_lower  -- lazy: computed once on first use per row
+                    -- Person-name boost: first matching name wins.
+                    if #names > 0 then
+                        body_lower = body_lower or (r.body or ""):lower()
+                        for _, name in ipairs(names) do
+                            if body_lower:find(name, 1, true) then
+                                r.score = (r.score or 1.0) * (1 + pb)
+                                _boosted = true
+                                break
+                            end
+                        end
+                    end
+                    -- Quoted-phrase boost: first matching phrase wins.
+                    if #phrases > 0 then
+                        body_lower = body_lower or (r.body or ""):lower()
+                        for _, phrase in ipairs(phrases) do
+                            if body_lower:find(phrase, 1, true) then
+                                r.score = (r.score or 1.0) * (1 + qb)
+                                _boosted = true
+                                break
+                            end
+                        end
+                    end
+                end
+                -- Only re-sort when at least one score was actually modified.
+                if _boosted then
+                    table.sort(rows, function(a, b) return (a.score or 0) > (b.score or 0) end)
+                end
+            end
         end
     end
 

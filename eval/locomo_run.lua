@@ -39,6 +39,7 @@ local args = {
     k_max    = 20,
     out      = nil,
     corpus   = "eval/data/locomo.json",
+    backend  = "auto",
     rerank          = false,
     rerank_adapter  = "noop",
     rerank_top_n    = 20,
@@ -66,6 +67,7 @@ do
         elseif a == "--skip-temporal"     then args.skip_temporal = true; i = i + 1
         elseif a == "--no-timestamps"     then args.use_timestamps = false; i = i + 1
         elseif a == "--summarizer-model"  then args.summarizer_model = arg[i + 1]; i = i + 2
+        elseif a == "--backend"           then args.backend = arg[i + 1]; i = i + 2
         else io.stderr:write("unknown arg: " .. tostring(a) .. "\n"); os.exit(2) end
     end
 end
@@ -93,7 +95,7 @@ local locomo  = require("locomo")
 -- --- embedder config (mirrors longmemeval_run.lua) -----------------------
 local setup_opts = {
     db_table         = "lm_memories",
-    backend          = "auto",
+    backend          = args.backend or "auto",
     auth_fn          = function() return true end,
     skip_embed_probe = true,
     default_scope    = "locomo:" .. args.embedder,

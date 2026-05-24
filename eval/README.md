@@ -21,16 +21,10 @@ OpenResty or Lapis runtime required. All PostgreSQL access goes through
 |---|---|
 | `longmemeval_run.lua` | Main eval entry point. Ingest + query loop; writes a JSON result file. |
 | `datasets/longmemeval.lua` | Pure-Lua dataset loader + session→memory flattener. |
-| `score.lua` | Reads a result JSON file, prints R@k / MRR table. |
 | `recall_bench.lua` | Synthetic recall benchmark (hash vs. HTTP embedder head-to-head). |
 | `_resty_http_shim.lua` | LuaSocket-backed `resty.http` shim. Preloaded by eval scripts so `luamemo.http`'s `resty.http` path works in plain Lua. |
 | `sidecars/` | Docker Compose file + docs for the TEI GPU sidecars (bge-m3 embedder, bge-reranker-v2-m3). |
 | `results/longmemeval.md` | Full phase-by-phase results, reproduce commands, and analysis. |
-
-> **`_smoke_lapis_db.lua`** is a legacy file kept for reference only.
-> No current eval script uses it — `luamemo.db` now handles the
-> pgmoon path internally using `PGHOST` / `PGDATABASE` / `PGUSER` /
-> `PGPASSWORD` env vars when `ngx` is absent.
 
 ## Quick start
 
@@ -59,8 +53,6 @@ PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test PGUSER=postgres PGPASSWORD=postgr
   lua5.1 eval/longmemeval_run.lua --embedder hash \
     --corpus eval/data/longmemeval_s.json --n 50 \
     --out eval/results/smoke_hash.json
-
-lua5.1 eval/score.lua eval/results/smoke_hash.json
 ```
 
 ### Run with Ollama (nomic-embed-text, ~12 min for n=200)

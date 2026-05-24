@@ -320,6 +320,28 @@ memory.write{
 Alternatively, set the standard `PGHOST` / `PGDATABASE` / `PGUSER` /
 `PGPASSWORD` environment variables and omit the `pg_*` keys entirely.
 
+### Starting before the embedder is ready
+
+If your embedder (Ollama, TEI, OpenAI) starts **after** your app — for example
+because of GPU warm-up, a Docker cold-start, or a slow sidecar — add
+`skip_embed_probe = true` to your `setup()` config. This lets `setup()` succeed
+even when the embedder is not yet reachable:
+
+```lua
+memory.setup({
+    skip_embed_probe = true,   -- required for GPU sidecars or slow-starting embedders
+    embedder_adapter = "tei",
+    embedder_url     = "http://tei:8080",
+    embed_dim        = 768,
+    ...
+})
+```
+
+`setup()` completes immediately. The first `store.write()` call will probe the
+embedder via `ensure_ready()`. If the embedder is now up, the write succeeds. If
+not, `write()` returns `nil, "luamemo not ready (embedder unavailable)"` — a clear
+error the caller can log and retry.
+
 ### 3c. Docker / containerized setup
 
 When your Postgres instance runs in a Docker container, `127.0.0.1` is
@@ -709,6 +731,31 @@ memory.update(42, { body = "..." })
 memory.delete(42)
 ```
 
+### `store.write()` return convention
+
+`store.write()` (and `memory.write{}`) **never throws a Lua error**. Both embed
+failures and DB errors surface as a `nil, err` return. Check the returned row,
+not a `pcall` result:
+
+```lua
+-- Correct:
+local row, err = memory.write{ scope = "s", body = "fact" }
+if not row then
+    ngx.log(ngx.ERR, "write failed: ", err)
+end
+
+-- Wrong — pcall always succeeds; the error is hidden:
+local ok = pcall(memory.write, { scope = "s", body = "fact" })
+```
+
+Return values:
+
+| Value | Type | Meaning |
+|-------|------|---------|
+| `row` | table | The inserted/updated `lm_memories` row on success; `nil` on any failure |
+| `err` | string | Error message on failure; `nil` on success |
+| `action` | string | `"inserted"`, `"updated"`, or `"deduped"` when `row ~= nil` |
+
 ---
 
 ## Web UI
@@ -732,6 +779,72 @@ memo recent --scope repo:my-app --limit 5
 memo get 42
 memo delete 42
 ```
+
+---
+
+## Auto-save hooks (Claude Code / Cursor)
+
+luamemo ships shell hooks that wire automatic session persistence without any
+manual `memory_write` calls. Set them up once and every Claude Code or Cursor
+session is saved to your memory store.
+
+### Claude Code
+
+Add to `.claude/settings.json` in your project root:
+
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      { "command": "/absolute/path/to/hooks/claude/pre_compact.sh" }
+    ],
+    "PostToolUse": [
+      { "command": "/absolute/path/to/hooks/claude/post_message.sh" }
+    ]
+  }
+}
+```
+
+| Hook | Fires | What it saves |
+|------|-------|---------------|
+| `pre_compact.sh` | Before context compression | Last 20 messages, `importance=0.5` |
+| `post_message.sh` | After each tool use (with cooldown) | Last 20 messages, `importance=0.4` |
+
+Both hooks require `MEMO_DB_URL` in your shell environment (same value as the MCP
+server). They also require `jq` on `PATH`. Hooks are fail-open: they exit `0`
+silently on any error and never block the model.
+
+**Cooldown**: `post_message.sh` saves at most once per `MEMO_HOOK_COOLDOWN_SECS`
+(default `300` = 5 min) per session, preventing redundant writes during
+high-frequency sessions.
+
+**Scope**: defaults to `session:<CLAUDE_SESSION_ID>`. Override by setting
+`MEMO_SCOPE` in your environment before launching Claude Code.
+
+### Cursor
+
+Cursor (0.43+) uses the same hook format. Add to `.cursor/mcp.json`:
+
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      { "command": "/absolute/path/to/hooks/cursor/pre_compact.sh" }
+    ]
+  }
+}
+```
+
+`hooks/cursor/pre_compact.sh` is functionally identical to the Claude Code version
+but reads `CURSOR_SESSION_ID` and `CURSOR_TRANSCRIPT_PATH`.
+
+### VS Code Copilot Agent Mode
+
+VS Code Copilot Agent Mode does not expose lifecycle hooks (`PreCompact`,
+`PostToolUse`). The correct integration point is the `session_start` MCP prompt
+already built into `mcp/server.lua`. When called at conversation start, it instructs
+the agent to load recent memories, write key decisions during the session, and
+summarise before closing. Wire it into your system prompt for automatic activation.
 
 ---
 

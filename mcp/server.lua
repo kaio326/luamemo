@@ -33,7 +33,7 @@ local DEBUG       = os.getenv("MEMO_DEBUG") == "1"
 
 local PROTOCOL_VERSION = "2024-11-05"
 local SERVER_NAME      = "luamemo"
-local SERVER_VERSION   = "0.2.9"
+local SERVER_VERSION   = "0.3.1"
 
 -- ===========================================================================
 -- Logging (stderr only — stdout is reserved for JSON-RPC frames)
@@ -59,6 +59,21 @@ end
 -- Library bootstrap
 -- ===========================================================================
 local _setup_done = false
+
+--- Validate an agent_name string used to namespace diary scopes.
+-- Returns nil on success, or an error string on failure.
+-- Rules: non-empty, letters/digits/hyphens/underscores/dots only, max 64 chars.
+local function validate_agent_name(name)
+    if not name or name == "" then
+        return "agent_name is required"
+    end
+    if #name > 64 or not name:match("^[%w%-_%.]+$") then
+        return "agent_name must contain only letters, digits, hyphens, underscores, "
+            .. "or dots and be at most 64 characters"
+    end
+    return nil
+end
+
 local function ensure_setup()
     if _setup_done then return end
     _setup_done = true
@@ -582,6 +597,180 @@ Tools.secret_execute = {
         })
         if not body then return nil, err end
         return { ok = true, response = body }
+    end,
+}
+
+Tools.memory_status = {
+    description = "Return a DB health snapshot: total row count, per-scope row counts, "
+        .. "and a summary of the active configuration (embedder, backend, features).",
+    inputSchema = {
+        type       = "object",
+        properties = {
+            verbose = {
+                type        = "boolean",
+                description = "When true, include internal config details "
+                    .. "(embedder, backend, embed_dim) in the response.",
+            },
+        },
+        required   = {},
+    },
+    handler = function(args)
+        ensure_setup()
+        local db_mod    = require("luamemo.db")
+        local store_mod = require("luamemo.store")
+        -- P3: single query — window function gives grand total alongside per-scope counts.
+        local scopes, serr = db_mod.query(
+            "SELECT scope, COUNT(*) AS n, SUM(COUNT(*)) OVER () AS grand_total " ..
+            "FROM " .. store_mod.table_name() .. " GROUP BY scope ORDER BY n DESC LIMIT 20")
+        if not scopes then return nil, tostring(serr) end
+        local total = tonumber(scopes[1] and scopes[1].grand_total or 0)
+        local lm    = require("luamemo")  -- single local reference
+        local resp  = {
+            connected  = true,
+            total_rows = total,
+            top_scopes = scopes,
+            version    = lm.VERSION or "unknown",
+        }
+        -- expose internal config only when the caller explicitly requests
+        -- it (verbose=true).  Guards against architecture reconnaissance if the
+        -- server is ever fronted by HTTP/SSE transport instead of local stdio.
+        if args.verbose == true then
+            local cfg_ref = lm.config or {}
+            resp.config = {
+                embedder     = cfg_ref.embedder_local,
+                embed_dim    = cfg_ref.embed_dim,
+                backend      = cfg_ref.backend,
+                patterns_en  = cfg_ref.patterns_enabled ~= false,
+                tier_min_mcp = 1,
+            }
+        end
+        return resp
+    end,
+}
+
+Tools.memory_reconnect = {
+    description = "Force re-open the database connection. "
+        .. "Useful after an external script modified lm_memories directly, "
+        .. "or after a transient connection drop.",
+    inputSchema = {
+        type       = "object",
+        properties = {},
+        required   = {},
+    },
+    handler = function(_)
+        ensure_setup()
+        local db_mod    = require("luamemo.db")
+        local store_mod = require("luamemo.store")
+        db_mod.reset()
+        local ok, res = pcall(db_mod.query, "SELECT COUNT(*) AS n FROM " .. store_mod.table_name())
+        return {
+            success    = ok,
+            rows_after = ok and tonumber(res[1].n) or nil,
+            error      = (not ok) and tostring(res) or nil,
+        }
+    end,
+}
+
+Tools.memory_diary_write = {
+    description = "Write a personal diary entry for a named agent. "
+        .. "Each agent_name gets its own isolated scope (diary:<agent_name>). "
+        .. "Use this to log reflections, session summaries, or ongoing thoughts.",
+    inputSchema = {
+        type       = "object",
+        properties = {
+            agent_name = {
+                type        = "string",
+                description = "Agent identifier (e.g. 'momo', 'assistant').",
+            },
+            entry = {
+                type        = "string",
+                description = "The diary entry text to store.",
+            },
+            topic = {
+                type        = "string",
+                description = "Optional topic tag (default: 'general').",
+            },
+        },
+        required = { "agent_name", "entry" },
+    },
+    handler = function(args)
+        ensure_setup()
+        local name_err = validate_agent_name(args.agent_name)
+        if name_err then return nil, name_err end
+        if not args.entry or args.entry == "" then
+            return nil, "entry is required"
+        end
+        -- S3: cap entry at 50,000 chars to prevent oversized embedding requests.
+        if #args.entry > 50000 then
+            return nil, "entry exceeds maximum length of 50,000 characters"
+        end
+        local store = require("luamemo.store")
+        local scope = "diary:" .. args.agent_name
+        local topic = tostring(args.topic or "general")
+        if #topic > 200 then return nil, "topic exceeds 200-character limit" end
+        local row, err = store.write({
+            scope      = scope,
+            kind       = "diary",
+            title      = "Diary entry — " .. topic,
+            body       = args.entry,
+            importance = 0.5,
+            metadata   = { agent = args.agent_name, topic = topic, diary = true },
+        })
+        if not row then return nil, err end
+        return {
+            success  = true,
+            entry_id = row.id,
+            agent    = args.agent_name,
+            topic    = topic,
+            scope    = scope,
+        }
+    end,
+}
+
+Tools.memory_diary_read = {
+    description = "Read recent diary entries for a named agent in chronological order "
+        .. "(newest first). Returns up to last_n entries (max 50).",
+    inputSchema = {
+        type       = "object",
+        properties = {
+            agent_name = {
+                type        = "string",
+                description = "Agent identifier matching what was used in memory_diary_write.",
+            },
+            last_n = {
+                type        = "integer",
+                description = "Maximum number of entries to return (default 10, max 50).",
+                minimum     = 1,
+                maximum     = 50,
+            },
+        },
+        required = { "agent_name" },
+    },
+    handler = function(args)
+        ensure_setup()
+        local name_err = validate_agent_name(args.agent_name)
+        if name_err then return nil, name_err end
+        local db_mod    = require("luamemo.db")
+        local store_mod = require("luamemo.store")
+        local scope  = "diary:" .. args.agent_name
+        local limit  = math.max(1, math.min(math.floor(tonumber(args.last_n) or 10), 50))
+        local rows, err = db_mod.query(
+            "SELECT id, body, importance, metadata, created_at " ..
+            "FROM " .. store_mod.table_name() .. " WHERE scope = ? " ..
+            "ORDER BY created_at DESC LIMIT ?",
+            scope, limit)
+        if not rows then return nil, err end
+        local entries = {}
+        for _, r in ipairs(rows) do
+            local meta = (type(r.metadata) == "table") and r.metadata or {}
+            entries[#entries + 1] = {
+                entry_id  = r.id,
+                timestamp = r.created_at,
+                topic     = meta.topic or "general",
+                content   = r.body,
+            }
+        end
+        return { agent = args.agent_name, entries = entries, total = #entries, scope = scope }
     end,
 }
 

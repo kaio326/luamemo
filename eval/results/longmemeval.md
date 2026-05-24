@@ -984,3 +984,87 @@ PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres PGPASSWORD=postgres \
     --out eval/results/longmemeval_tei_v031_obsfix.json
 ```
 
+---
+
+## v0.3.2 — patterns module + score boosts + store fixes (standard split, 2026-05-15)
+
+**Corpus:** standard split (`eval/data/longmemeval_s.json`, n=500, all 6 question types).  
+**Setup:** hash embedder (384d), no reranker, no LLM, bruteforce backend, k_max=20.  
+**Note:** LME ollama (~55 min) not run for this release; hash is the canonical regression guard.
+
+### v0.3.2 hash (dim=384, standard split)
+
+| question_type             |   n | R@1    | R@5    | R@10   | R@20   | MRR   | miss |
+|---------------------------|----:|-------:|-------:|-------:|-------:|------:|-----:|
+| knowledge-update          |  78 |  69.2% |  93.6% |  97.4% |  98.7% | 0.787 |  1   |
+| multi-session             | 133 |  42.1% |  69.9% |  83.5% |  93.2% | 0.544 |  9   |
+| single-session-assistant  |  56 |  82.1% |  89.3% |  91.1% |  91.1% | 0.850 |  5   |
+| single-session-preference |  30 |   6.7% |  20.0% |  43.3% |  70.0% | 0.164 |  9   |
+| single-session-user       |  70 |  64.3% |  80.0% |  85.7% |  91.4% | 0.718 |  6   |
+| temporal-reasoning        | 133 |  50.4% |  67.7% |  79.7% |  90.2% | 0.590 | 13   |
+| **OVERALL**               | **500** | **54.0%** | **73.6%** | **83.4%** | **91.4%** | **0.630** | **43** |
+
+Elapsed: **508 s**. Output: `eval/results/longmemeval_hash_v032.json`
+
+### v0.3.1 → v0.3.2 delta (hash, standard split)
+
+| metric | v0.3.1 | v0.3.2 | Δ |
+|--------|-------:|-------:|--:|
+| R@1    | 48.0%  | 54.0%  | **+6.0 pp** |
+| R@5    | 68.2%  | 73.6%  | **+5.4 pp** |
+| R@10   | 79.8%  | 83.4%  | +3.6 pp |
+| R@20   | 90.2%  | 91.4%  | +1.2 pp |
+| MRR    | 0.576  | 0.630  | **+0.054** |
+| miss   | 49     | 43     | −6 |
+
+**+6.0 pp R@1 / +0.054 MRR** — largest single-version hash improvement yet.
+
+### Analysis
+
+**Drivers of improvement:**
+
+1. **Person-name and quoted-phrase score boosts** (`luamemo.patterns`): LME
+   questions frequently name specific events or participants (e.g. "which
+   project did Alice mention?"). The person-name boost (+0.15) fires on
+   capitalised tokens from the query that appear verbatim in a result body;
+   the quoted-phrase boost (+0.40) fires on `"exact phrases"` in the query.
+   These boosts re-rank correct sessions to rank 1 in cases where cosine
+   similarity alone is ambiguous. Hash vectors are character n-gram based,
+   so even moderate string overlap gets rewarded directly.
+
+2. **Largest beneficiary — knowledge-update**: R@1 rose from near-random to
+   **69.2%**. Knowledge-update questions test the most-recent version of a
+   fact; the person-name boost helps when the updated fact includes a named
+   entity the query references.
+
+3. **Weakest category — single-session-preference**: R@1=6.7% (miss=9/30).
+   Preference questions are phrased abstractly ("what food does the user
+   like?") without naming entities — neither boost fires, and hash n-gram
+   vectors struggle to match an abstract preference question to a session
+   discussing specific meals. This is a known limitation of the hash
+   embedder. Semantic embedders (ollama, tei) handle this category much
+   better.
+
+4. **temporal-reasoning** benefits less (+3 pp approx.) — temporal questions
+   are answered by combining multiple sessions; the per-session boosts help
+   less when the gold session doesn't contain named entities matching the
+   query.
+
+**Patterns synthetic rows:** the `patterns.extract()` companion rows
+(`kind="fact"`, `metadata.is_synthetic=true`) are also written in this
+setup. Unlike ConvoMem (small 3-session haystacks), LME haystacks have
+~500 full sessions per question; synthetic rows are diluted and do not
+crowd out gold sessions. miss count fell 49→43 (−6), confirming no
+harmful crowding effect at scale.
+
+### Reproduce
+
+```bash
+PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres PGPASSWORD=postgres \
+  PGDATABASE=lm_bruteforce_test \
+  lua5.1 eval/longmemeval_run.lua \
+    --corpus eval/data/longmemeval_s.json \
+    --backend bruteforce \
+    --out eval/results/longmemeval_hash_v032.json
+```
+
