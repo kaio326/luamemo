@@ -625,7 +625,6 @@ Tools.memory_status = {
                     .. "(embedder, backend, embed_dim) in the response.",
             },
         },
-        required   = {},
     },
     handler = function(args)
         ensure_setup()
@@ -668,7 +667,6 @@ Tools.memory_reconnect = {
     inputSchema = {
         type       = "object",
         properties = {},
-        required   = {},
     },
     handler = function(_)
         ensure_setup()

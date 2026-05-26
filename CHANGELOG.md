@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.4 — 2026-05-26
+
+- **Bug fix — `memo calibrate` ingest wrote 0 memories.**
+  `luamemo.cli.api.dispatch()` called `read_json_stdin()` (which drains all of
+  stdin via `io.read("*a")`) before invoking the `write-many` handler.  Because
+  `write-many` streams NDJSON row-by-row via `io.lines()`, stdin was already
+  exhausted and `json.decode()` threw "Expected the end but found T_OBJ_BEGIN"
+  on the multi-object stream.  Fix: `dispatch()` skips `read_json_stdin()` and
+  passes `{}` directly when the command is `write-many`.
+
+- **Bug fix — MCP tools `memory_status` and `memory_reconnect` rejected by client.**
+  Both tool `inputSchema` blocks contained `required = {}`.  Lua's empty table
+  serialises as a JSON object `{}`, but JSON Schema requires the `required` field
+  to be an array.  VS Code Copilot (and other strict MCP clients) rejected the
+  schema with "Incorrect type. Expected 'array' at /required" and omitted both
+  tools.  Fix: removed the empty `required` field from both schemas; absent
+  `required` is equivalent to `required: []` per JSON Schema spec.
+
 ## 0.3.3 — 2026-05-25
 
 - **Eval test suite — consolidated smoke tests into 7 grouped files.**

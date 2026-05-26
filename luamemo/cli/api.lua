@@ -550,7 +550,10 @@ function M.dispatch(cmd)
         err_out("api: unknown command: " .. tostring(cmd))
         os.exit(1)
     end
-    local p = read_json_stdin()
+    -- write-many reads NDJSON directly from stdin; the handler ignores
+    -- the pre-parsed param and calls io.lines() itself.  Skip read_json_stdin()
+    -- to avoid consuming the entire NDJSON stream before the handler runs.
+    local p = (cmd ~= "write-many") and read_json_stdin() or {}
     local ok, err = pcall(handler, p)
     if not ok then
         err_out("api: internal error in " .. cmd .. ": " .. tostring(err))
