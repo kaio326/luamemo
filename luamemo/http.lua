@@ -121,19 +121,26 @@ local function try_socket(url, opts)
     -- calls interleaved at a yield point will interfere via http_mod.TIMEOUT.
     -- Plain Lua is single-threaded so this is safe in normal use; avoid calling
     -- try_socket concurrently from coroutines.
+
     local ok_call, code, _resp_headers, _status = pcall(http_mod.request, req)
     http_mod.TIMEOUT = prev_timeout  -- restore regardless of outcome or error
     if not ok_call then
-        return nil, nil, "http: request error: " .. tostring(code)
+        -- Mask user:password@host credentials. Note: API keys passed as query
+        -- parameters (e.g. ?api_key=...) are not masked — current adapters use
+        -- Authorization headers instead, so this is intentionally not covered.
+        local safe_url = url:gsub("(https?://[^:@]*:)[^@]*(@)", "%1***%2")
+        return nil, nil, "http: request error: " .. tostring(code) .. " — " .. safe_url
     end
 
     if not code then
-        return nil, nil, "http: request failed (network error)"
+        local safe_url = url:gsub("(https?://[^:@]*:)[^@]*(@)", "%1***%2")
+        return nil, nil, "http: request failed (network error) — " .. safe_url
     end
     if type(code) ~= "number" then
         -- socket.http returns the error string as the second return when it
         -- fails at the transport level (e.g. "timeout", "connection refused").
-        return nil, nil, "http: " .. tostring(code)
+        local safe_url = url:gsub("(https?://[^:@]*:)[^@]*(@)", "%1***%2")
+        return nil, nil, "http: " .. tostring(code) .. " — " .. safe_url
     end
 
     return code, table.concat(chunks), nil

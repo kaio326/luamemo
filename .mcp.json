@@ -1,0 +1,13 @@
+{
+  "_note": "LUA_PATH puts plugin-root first so luamemo.* resolves from the cloned repo. The trailing ;; appends the system LuaRocks path, which is required for pgmoon, luasocket, and cjson (not bundled). Plugin-root entries win for luamemo.* because they appear first.",
+  "mcpServers": {
+    "luamemo": {
+      "command": "lua5.1",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/server.lua"],
+      "envFile": "${env:HOME}/.luamemorc",
+      "env": {
+        "LUA_PATH": "${CLAUDE_PLUGIN_ROOT}/?.lua;${CLAUDE_PLUGIN_ROOT}/?/init.lua;;"
+      }
+    }
+  }
+}

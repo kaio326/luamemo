@@ -846,6 +846,65 @@ already built into `mcp/server.lua`. When called at conversation start, it instr
 the agent to load recent memories, write key decisions during the session, and
 summarise before closing. Wire it into your system prompt for automatic activation.
 
+### VS Code Agent Plugin (Preview)
+
+Install luamemo as a VS Code agent plugin for instant access to memory skills,
+a pre-configured memory agent, and all 17 MCP tools in Agent Mode — without
+writing any config files manually.
+
+#### Quickstart (recommended)
+
+Run `memo calibrate` in your project — it installs the plugin automatically
+alongside the workspace MCP config:
+
+```bash
+memo calibrate
+```
+
+Then add `"chat.mcp.autoStart": true` to your VS Code settings so the MCP
+server starts automatically when VS Code opens.
+
+#### Manual install
+
+In VS Code Chat, run **Chat: Install Plugin From Source** and enter:
+
+```
+https://github.com/kaio326/luamemo
+```
+
+VS Code clones the repo and activates the plugin. The `luamemo` agent and
+`session-memory` skill appear immediately; the MCP server starts on first use.
+
+#### Prerequisites
+
+- VS Code 1.100+ with GitHub Copilot
+- `lua5.1` binary on PATH (`apt install lua5.1` / `brew install lua`)
+- `luarocks install pgmoon luasocket` (required by the MCP server)
+- `MEMO_DB_URL` exported in your shell **or** written to `~/.luamemorc`
+  by `memo calibrate`
+- `~/.luamemorc` should be readable only by your user:
+  ```bash
+  chmod 600 ~/.luamemorc
+  ```
+  The MCP server loads this file at startup; restricting its permissions
+  prevents other local users from reading your database credentials.
+
+#### What you get
+
+| Component | Description |
+|-----------|-------------|
+| `luamemo` agent | Activates automatically, calls `memory_status`, loads recent context, guides setup if DB is unreachable |
+| `session-memory` skill | On-demand workflow guide: search on open, write decisions during work, summarise on close |
+| 17 MCP tools | `memory_write`, `memory_search`, `memory_recent`, and all others — available in every VS Code workspace |
+
+#### How it relates to `memo calibrate`
+
+They work together. `memo calibrate` sets up per-project embedder config and
+writes a workspace-level MCP entry that takes precedence over the plugin's
+bundled server when working in that project. The plugin provides the agent UX
+and a fallback MCP server in every other workspace. Running `memo calibrate`
+once gives you both.
+
 ---
 
 ## Embedder contract

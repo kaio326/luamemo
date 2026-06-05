@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.3.6] — 2026-06-05
+
+- **VS Code Agent Plugin (Preview).** The luamemo repo is now a valid VS Code
+  agent plugin installable via **Chat: Install Plugin From Source →
+  `https://github.com/kaio326/luamemo`**. Ships five files (no Lua changes,
+  not part of the LuaRocks package):
+  - `plugin.json` — Copilot-format manifest (skills + agents)
+  - `.claude-plugin/plugin.json` — Claude-format manifest (adds MCP server)
+  - `skills/session-memory/SKILL.md` — on-demand skill: load context on open,
+    write decisions during work, summarise on close
+  - `agents/luamemo.agent.md` — memory-focused agent with on-activation
+    diagnostic flow (calls `memory_status`, auto-retries via `memory_reconnect`,
+    prints exact OS-specific fix commands for all four error states)
+  - `.mcp.json` — MCP server definition; uses `envFile: ${env:HOME}/.luamemorc`
+    so users who ran `memo calibrate` get DB connectivity automatically
+
+- **`memo calibrate` now installs the VS Code plugin automatically.**
+  A new `_calibrate_plugin_phase` step clones the repo into the VS Code
+  agentPlugins directory (`~/.config/Code/agentPlugins/github.com/kaio326/luamemo`
+  on Linux; `~/Library/Application Support/Code/agentPlugins/...` on macOS).
+  On subsequent runs it runs `git pull --ff-only` to keep the plugin current.
+  Skips silently if `git` is not on PATH or VS Code is not installed.
+  Pass `--no-plugin` to opt out.
+
+- **`memo calibrate --help` / `-h` flag.** Prints a concise reference of all
+  supported flags and exits 0. Previously there was no discoverable flag
+  reference without reading the source or README.
+
+## 0.3.6 — 2026-05-31
+
+- **Bug fix — `memo ping --embedder` crashed when `MEMO_EMBED_DIM` was not set.**
+  `ping.lua`'s `check_embedder()` called `embed.configure()` without `embed_dim`.
+  Inside `embed.lua`, the dimension-mismatch guard ran unconditionally: when
+  `cfg.embed_dim` is nil, `#vec ~= nil` evaluates to `true` and the branch falls
+  through to `string.format("%d", nil)`, raising a hard Lua error.  The embedding
+  itself had already succeeded.  Fix: guard the check with
+  `cfg.embed_dim and cfg.embed_dim > 0` so it only fires when a dimension
+  expectation was actually configured.  Applied to both `M.embed()` and the async
+  variant `M.embed_async()` in `luamemo/embed.lua`.
+
+- **`memo ping --embedder` now reads the full embedder config from env.**
+  `ping.lua` previously read only `MEMO_EMBEDDER_URL` and `MEMO_EMBEDDER_ADAPTER`,
+  ignoring `MEMO_EMBED_DIM`, `MEMO_EMBEDDER_MODEL`, and `MEMO_EMBED_MAX_CHARS`.
+  This made `memo ping` an unreliable proxy for whether `write`/`calibrate` would
+  work.  `check_embedder()` now reads all five env vars and passes them to
+  `embed.configure()`, matching the config surface used by the rest of the CLI.
+
+- **HTTP errors now include the target URL and raw socket error.**
+  `http.lua`'s `try_socket()` returned generic strings such as
+  `"http: request failed (network error)"` with no indication of which URL was
+  attempted or what the underlying socket error was.  All three error paths in
+  `try_socket()` now append `" — <url>"` and, where available, the socket-level
+  error string (e.g. `"connection refused"`, `"timeout"`).
+
+- **`memo calibrate --keep-embedder` flag added.**
+  Passing `--keep-embedder` skips the probe-and-persist step so that an existing
+  working embedder config in `.luamemorc` is preserved.  Useful when re-running
+  calibrate to ingest new commits on a machine where the GPU probe would recommend
+  a TEI endpoint that is not running.
+
 ## 0.3.5 — 2026-05-28
 
 - **`memo setup` subcommand.** Creates a `SETUP_CHECK` file in the project root

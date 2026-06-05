@@ -86,7 +86,7 @@ function M.embed(text)
     end
     if not vec then return nil, err end
 
-    if #vec ~= cfg.embed_dim then
+    if cfg.embed_dim and cfg.embed_dim > 0 and #vec ~= cfg.embed_dim then
         return nil, ("embed: dimension mismatch: got %d, expected %d")
             :format(#vec, cfg.embed_dim)
     end
@@ -145,7 +145,7 @@ function M.embed_async(text, wait_fn)
     local vec, vec_err = impl.parse_response(payload, cfg)
     if not vec then return nil, "embed: " .. (vec_err or "parse_response failed") end
 
-    if #vec ~= cfg.embed_dim then
+    if cfg.embed_dim and cfg.embed_dim > 0 and #vec ~= cfg.embed_dim then
         return nil, ("embed: dimension mismatch: got %d, expected %d")
             :format(#vec, cfg.embed_dim)
     end

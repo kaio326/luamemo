@@ -47,8 +47,13 @@
 #   memo calibrate  [--scope SCOPE] [--root DIR] [--no-git] [--no-comments]
 #                   [--probe-only] [--multilingual] [--long] [--hosted]
 #                   [--allow-hash] [--write PATH] [--no-migrate] [--no-mcp]
-#                   [--docker-compose FILE] [--dry-run]
+#                   [--no-plugin] [--docker-compose FILE] [--dry-run]
+#                   [--keep-embedder] [-h|--help]
 #                   (probe host + recommend embedder + ingest codebase)
+#                   --keep-embedder: skip probe-and-persist, preserve existing
+#                   embedder config in .luamemorc
+#                   --no-plugin: skip VS Code agent plugin install
+#                   -h, --help: show calibrate flag reference and exit
 #
 #   memo ping       [--db] [--table] [--embedder]   Connectivity check (exit 0/1)
 #
@@ -970,11 +975,38 @@ SETUP_EOF
 # ---------------------------------------------------------------------------
 cmd_calibrate() {
     local root="." scope="" dry_run=false no_git=false no_comments=false probe_only=false
-    local no_migrate=false no_mcp=false dc_file=""
+    local no_migrate=false no_mcp=false no_plugin=false dc_file="" keep_embedder=false
     local lua_extra_flags=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -h|--help)
+                cat <<'EOF'
+Usage: memo calibrate [OPTIONS]
+
+Probe the environment, configure luamemo, and write .vscode/mcp.json.
+
+Options:
+  --scope SCOPE         Memory scope for calibration (default: repo:<basename>)
+  --root DIR            Project root directory (default: .)
+  --no-mcp              Skip writing .vscode/mcp.json
+  --no-plugin           Skip installing the VS Code agent plugin
+  --keep-embedder       Do not overwrite existing embedder config in .luamemorc
+  --probe-only          Run host probe only; skip codebase ingest
+  --no-migrate          Skip applying DB migrations
+  --no-git              Skip git-history scan
+  --no-comments         Skip code comment extraction
+  --docker-compose FILE Parse DB credentials from a docker-compose file
+  --dry-run             Show what would be written without writing
+  --multilingual        Include non-Lua source files in scan
+  --long                Allow longer memory bodies
+  --hosted              Optimise for hosted (non-local) embedder
+  --allow-hash          Allow hash embedder (normally skipped in calibrate)
+  --write PATH          Write scan output to a file instead of DB
+  -h, --help            Show this help and exit
+EOF
+                exit 0
+                ;;
             --root)        root="$2";        shift 2 ;;
             --scope)       scope="$2";       shift 2 ;;
             --dry-run)     dry_run=true;     shift   ;;
@@ -983,6 +1015,8 @@ cmd_calibrate() {
             --probe-only)  probe_only=true;  shift   ;;
             --no-migrate)  no_migrate=true;  shift   ;;
             --no-mcp)      no_mcp=true;      shift   ;;
+            --no-plugin)   no_plugin=true;   shift   ;;
+            --keep-embedder) keep_embedder=true; shift ;;
             --docker-compose) dc_file="$2";  shift 2 ;;
             --non-interactive|--multilingual|--long|--hosted|--allow-hash)
                 lua_extra_flags+="[==[${1}]==],"; shift ;;
@@ -1032,7 +1066,9 @@ cmd_calibrate() {
     # (e.g. a host-side MEMO_EMBEDDER_URL set by a prior docker-compose detect)
     # are never clobbered by the probe, which just echoes back whatever URL was
     # already in the environment.
-    if [[ -n "${MEMO_DB_URL:-}" ]]; then
+    # --keep-embedder skips this block entirely so users can re-run calibrate
+    # without touching their working embedder config.
+    if [[ "$keep_embedder" != true ]] && [[ -n "${MEMO_DB_URL:-}" ]]; then
         [[ -n "$_probe_eadp" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBEDDER_ADAPTER" "$_probe_eadp"
         [[ -n "$_probe_eurl" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBEDDER_URL"     "$_probe_eurl"
         [[ -n "$_probe_emdl" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBEDDER_MODEL"   "$_probe_emdl"
@@ -1276,11 +1312,97 @@ cmd_calibrate() {
         _calibrate_mcp_phase "$root" "$scope"
     fi
 
+    # ── Phase 6: VS Code agent plugin install ────────────────────────────────
+    if [[ "${no_plugin:-false}" != "true" ]]; then
+        _calibrate_plugin_phase
+    fi
+
     # ── Cleanup: remove SETUP_CHECK on successful first-run ──────────────────
     if [[ "$dry_run" != true ]] && [[ -f "${root}/SETUP_CHECK" ]]; then
         rm -f "${root}/SETUP_CHECK"
         echo ""
         echo "  First-run complete: SETUP_CHECK removed."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# VS Code agent plugin installer (called from cmd_calibrate phase 6)
+# ---------------------------------------------------------------------------
+
+# Echoes both the stable and Insiders plugin directories (one per line).
+# Calling uname once and building both paths avoids two subshell forks.
+_plugin_dirs() {
+    local _os; _os="$(uname -s 2>/dev/null)"
+    local _base
+    if [[ "$_os" == "Darwin" ]]; then
+        _base="$HOME/Library/Application Support"
+    else
+        _base="${XDG_CONFIG_HOME:-$HOME/.config}"
+    fi
+    echo "$_base/Code/agentPlugins/github.com/kaio326/luamemo"
+    echo "$_base/Code - Insiders/agentPlugins/github.com/kaio326/luamemo"
+}
+
+# Prints the manual-install instructions; shared by two branches below.
+_plugin_manual_msg() {
+    echo "  To install manually: in VS Code Chat run 'Chat: Install Plugin From Source'"
+    echo "  URL: https://github.com/kaio326/luamemo"
+}
+
+_calibrate_plugin_phase() {
+    if ! command -v git &>/dev/null; then
+        echo "  [plugin] git not found — skipping plugin install."
+        _plugin_manual_msg; return
+    fi
+
+    local _installed=false
+    local _dir
+    while IFS= read -r _dir; do
+        # Guard against empty path (e.g. $HOME unset in some containers).
+        [[ -n "$_dir" ]] || continue
+
+        # Skip if the VS Code agentPlugins parent directory doesn't exist.
+        # On headless servers without VS Code this will always be absent.
+        local _parent; _parent="$(dirname "$(dirname "$(dirname "$_dir")")")" 
+        [[ -d "$_parent" ]] || continue
+
+        if [[ -d "$_dir/.git" ]]; then
+            # Skip the network pull if the plugin was fetched less than 24 h ago.
+            # Clamp _age to 999999 on clock skew (negative result) to force pull.
+            local _fetch_head="$_dir/.git/FETCH_HEAD"
+            local _age=999999
+            if [[ -f "$_fetch_head" ]]; then
+                local _now _mtime
+                _now=$(date +%s 2>/dev/null) || _now=0
+                _mtime=$(date -r "$_fetch_head" +%s 2>/dev/null) || _mtime=0
+                _age=$(( _now - _mtime ))
+                (( _age < 0 )) && _age=999999
+            fi
+            if (( _age < 86400 )); then
+                echo "  [plugin] Plugin is current (last checked < 24h ago)."
+            else
+                echo "  [plugin] Updating plugin at ${_dir} ..."
+                git -C "$_dir" pull --ff-only --quiet 2>/dev/null \
+                    && echo "  [plugin] Plugin up to date." \
+                    || echo "  [plugin] Update skipped (local changes or no network)."
+            fi
+        else
+            echo "  [plugin] Installing luamemo VS Code plugin ..."
+            mkdir -p "$(dirname "$_dir")"
+            git clone --depth 1 --quiet \
+                https://github.com/kaio326/luamemo "$_dir" 2>/dev/null \
+                && echo "  [plugin] Installed. Reload VS Code (Developer: Reload Window) to activate." \
+                || echo "  [plugin] Clone failed — check network or install manually via 'Chat: Install Plugin From Source'."
+        fi
+        _installed=true
+    done < <(_plugin_dirs)
+
+    if [[ "$_installed" == false ]]; then
+        echo "  [plugin] VS Code not detected — skipping plugin install."
+        _plugin_manual_msg
+    else
+        echo "  Tip: add \"chat.mcp.autoStart\": true to VS Code settings so the"
+        echo "       MCP server starts automatically when VS Code opens."
     fi
 }
 

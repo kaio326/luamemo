@@ -84,13 +84,20 @@ local function check_embedder()
         return true  -- not a failure — hash embedder needs no network
     end
 
-    -- Detect adapter from MEMO_EMBEDDER_ADAPTER env var; default to "generic".
-    local adapter = os.getenv("MEMO_EMBEDDER_ADAPTER") or "generic"
+    -- Load the same config vars as the rest of the CLI so that ping results
+    -- are a reliable proxy for write/calibrate behaviour.
+    local adapter      = os.getenv("MEMO_EMBEDDER_ADAPTER") or "generic"
+    local model        = os.getenv("MEMO_EMBEDDER_MODEL")
+    local cfg_embed_dim = tonumber(os.getenv("MEMO_EMBED_DIM"))
+    local max_chars    = tonumber(os.getenv("MEMO_EMBED_MAX_CHARS"))
 
     local embed = require("luamemo.embed")
     embed.configure({
-        embedder_url     = url,
-        embedder_adapter = adapter,
+        embedder_url      = url,
+        embedder_adapter  = adapter,
+        embedder_model    = model,
+        embed_dim         = cfg_embed_dim,  -- may be nil; embed.lua guards for nil
+        embed_max_chars   = max_chars,
     })
 
     local dim, err = embed.probe()

@@ -1,0 +1,7 @@
+{
+  "name": "luamemo",
+  "description": "Persistent semantic memory for AI agents — skills, agents, and MCP tools.",
+  "author": { "name": "kaio326", "url": "https://github.com/kaio326/luamemo" },
+  "skills": "skills/",
+  "agents": "agents/"
+}
