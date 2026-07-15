@@ -30,7 +30,16 @@ services:
       MODEL_ID: BAAI/bge-m3
       DTYPE: float16
       MAX_CLIENT_BATCH_SIZE: "32"
-      MAX_BATCH_TOKENS: "4096"
+      # MAX_BATCH_TOKENS must be >= any single input's token count, or TEI
+      # stalls the whole request (no error, just hangs) on an input it can't
+      # pack into a batch. LME oracle sessions reach ~7k tokens and ~30% exceed
+      # the old 4096 default. bge-m3's model max is 8192, but 8192-token warmup
+      # batches OOM a 6 GB RTX 2060 (Turing); 7168 is the VRAM ceiling here.
+      # AUTO_TRUNCATE flips the leftover >7168-token tail from a 120 s hang to
+      # a fast 424; the eval also caps bodies via EMBED_MAX_CHARS so nothing
+      # exceeds the batch. Raise to 8192 on a >=8 GB GPU.
+      MAX_BATCH_TOKENS: "7168"
+      AUTO_TRUNCATE: "true"
     volumes:
       - tei_embed_cache:/data
     ports:

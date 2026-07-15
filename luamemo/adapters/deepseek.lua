@@ -5,7 +5,7 @@
 -- (https://api-docs.deepseek.com/). DeepSeek's API is OpenAI-compatible,
 -- so when/if they add embeddings the OpenAI adapter will likely "just work"
 -- by pointing embedder_url at https://api.deepseek.com/v1/embeddings and
--- using embedder_adapter = "openai".
+-- using embedder_adapter = "openai_compatible".
 --
 -- This file is a stub kept for symmetry. Selecting it returns a clear
 -- error directing you at the working alternatives.
@@ -23,7 +23,7 @@ return {
     build_request = function(text, cfg)
         return nil, "DeepSeek does not currently offer an embeddings API "
             .. "(chat completions only). When they add one, switch to "
-            .. "embedder_adapter = 'openai' with embedder_url pointed at "
+            .. "embedder_adapter = 'openai_compatible' with embedder_url pointed at "
             .. "the DeepSeek embeddings endpoint. For now use 'voyage', "
             .. "'openai', 'cohere', 'ollama', or embedder_local = 'hash'."
     end,

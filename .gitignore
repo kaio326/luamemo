@@ -2,6 +2,7 @@
 eval/data/
 eval/results/
 eval/*.json
+eval/tmp/
 *.log
 *.swp
 *~
@@ -21,3 +22,10 @@ research/
 
 # Workspace-local MCP config written by memo calibrate
 .vscode/mcp.json
+
+# Per-project local config written by memo calibrate (embedder/DB selection)
+.luamemorc
+
+# Phase 7 native embedder — built locally, never committed
+luamemo/embedders/native/*.so
+*.gguf

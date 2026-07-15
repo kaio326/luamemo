@@ -152,6 +152,17 @@ do
     local R = require("luamemo.cli.recommend")
 
     local cases = {
+        -- In-process GGUF is the preferred default whenever the host can run it.
+        { "GGUF-capable -> in-process GGUF (preferred default)",
+          { gguf_capable=true },
+          "gguf", "embeddinggemma-300M" },
+        { "GGUF-capable preempts the GPU+Docker service ladder",
+          { gguf_capable=true, has_gpu=true, gpu_free_mb=8192, has_docker=true },
+          "gguf", "embeddinggemma-300M" },
+        { "GGUF opted out (--no-gguf) -> falls back to service ladder",
+          { gguf_capable=true, allow_gguf=false, has_docker=true, ram_mb=8192, has_ollama=true },
+          "ollama", "nomic-embed-text" },
+        -- Service ladder (no gguf capability) is unchanged.
         { "GPU+Docker, multilingual",
           { has_gpu=true, gpu_free_mb=4096, has_docker=true, multilingual=true },
           "tei", "BAAI/bge-m3" },
@@ -170,12 +181,10 @@ do
         { "No GPU, Docker+RAM, English short, ollama reachable -> nomic CPU",
           { has_docker=true, ram_mb=8192, has_ollama=true },
           "ollama", "nomic-embed-text" },
-        { "No GPU, Docker, low RAM, hosted ok -> openai",
-          { has_docker=true, ram_mb=1024, allow_hosted=true },
-          "openai", "text-embedding-3-small" },
-        { "Nothing local, hosted ok -> openai",
+        -- OpenAI/hosted was removed from the auto-recommend ladder.
+        { "No local, hosted flag set -> nil (OpenAI dropped from ladder)",
           { allow_hosted=true },
-          "openai", "text-embedding-3-small" },
+          nil, nil },
         { "Nothing, allow_hash -> hash",
           { allow_hash=true },
           "hash", "hash" },
@@ -184,7 +193,10 @@ do
     for _, c in ipairs(cases) do
         local name, profile, want_a, want_m = c[1], c[2], c[3], c[4]
         local rec, err = R.decide(profile)
-        if not rec then
+        if want_a == nil then
+            check("recommend: " .. name, rec == nil,
+                rec and ("unexpectedly got " .. (rec.adapter or "?")) or nil)
+        elseif not rec then
             check("recommend: " .. name, false, "nil (err=" .. tostring(err) .. ")")
         elseif rec.adapter ~= want_a or rec.model ~= want_m then
             check("recommend: " .. name, false,

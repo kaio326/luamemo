@@ -1,0 +1,36 @@
+{"query":"Can I commit and push the work now that it's finished and tested?","gold_id":"never-commit-autonomously","lexical_overlap":"med"}
+{"query":"Am I allowed to run git tag and luarocks upload on my own?","gold_id":"never-commit-autonomously","lexical_overlap":"high"}
+{"query":"How should I change a file — can I use sed -i or echo redirection?","gold_id":"no-terminal-file-edits","lexical_overlap":"high"}
+{"query":"Is it safe to push the planner and instructions files in .github?","gold_id":"github-md-gitignored","lexical_overlap":"med"}
+{"query":"Which benchmark result files are tracked in git and which are local-only?","gold_id":"eval-results-gitignored","lexical_overlap":"med"}
+{"query":"Why can't I use goto or bitwise operators in this codebase?","gold_id":"lua51-only","lexical_overlap":"med"}
+{"query":"What interpreter constraint do I have to respect when writing code here?","gold_id":"lua51-only","lexical_overlap":"low"}
+{"query":"What library talks to Postgres and how does it get credentials?","gold_id":"pgmoon-over-luadbi","lexical_overlap":"low"}
+{"query":"Why does semantic search do poorly with the default embedder?","gold_id":"hash-is-lexical","lexical_overlap":"low"}
+{"query":"What exactly does the hash embedder compute?","gold_id":"hash-is-lexical","lexical_overlap":"high"}
+{"query":"How is the candidate pool built for a search — is it just nearest vectors?","gold_id":"hybrid-search-union","lexical_overlap":"med"}
+{"query":"How do I store a row that only needs full-text search and no vector?","gold_id":"no-embed-null","lexical_overlap":"med"}
+{"query":"What's the difference between the two storage backends?","gold_id":"bruteforce-vs-pgvector","lexical_overlap":"med"}
+{"query":"How does the MCP server find its Lua modules without LUA_PATH?","gold_id":"mcp-self-locate","lexical_overlap":"high"}
+{"query":"My session-start hook prints to stdout but nothing shows up in context. Why?","gold_id":"sessionstart-additionalcontext","lexical_overlap":"low"}
+{"query":"Do indexed file entries get embeddings by default?","gold_id":"file-rows-fts-only","lexical_overlap":"med"}
+{"query":"How are symbols extracted for a Go or Rust file with no native parser?","gold_id":"ctags-optional","lexical_overlap":"high"}
+{"query":"Which hashing function does change-detection use, and why not the other one?","gold_id":"djb2-not-fnv","lexical_overlap":"med"}
+{"query":"Should I trust the index as the source of truth before editing a file?","gold_id":"map-locates-disk-truth","lexical_overlap":"med"}
+{"query":"What prefix do I use to namespace memories for one repository?","gold_id":"scope-conventions","lexical_overlap":"low"}
+{"query":"Does the approximate vector index lose accuracy versus exact search?","gold_id":"pgvector-equals-bruteforce","lexical_overlap":"low"}
+{"query":"Did adding a cross-encoder reranker improve our numbers?","gold_id":"reranking-is-noop","lexical_overlap":"med"}
+{"query":"The embedding sidecar freezes on long documents instead of returning an error. What's going on?","gold_id":"tei-batch-hang","lexical_overlap":"low"}
+{"query":"Which embedding model gives the best retrieval on our tests?","gold_id":"embedder-quality-ranking","lexical_overlap":"med"}
+{"query":"When we say we'll use Gemma for embeddings, which Gemma do we mean?","gold_id":"embeddinggemma-not-generative","lexical_overlap":"med"}
+{"query":"What usage signal should the learning layer trust most?","gold_id":"corrections-over-frequency","lexical_overlap":"low"}
+{"query":"Should I treat LoCoMo and ConvoMem scores as the goal to maximize?","gold_id":"benchmarks-are-rail","lexical_overlap":"low"}
+{"query":"Why did the hybrid, pgvector, and rerank changes all fail to move recall?","gold_id":"ordering-vs-coverage","lexical_overlap":"med"}
+{"query":"What are the names of the benchmark databases and their dimensions?","gold_id":"eval-dbs","lexical_overlap":"high"}
+{"query":"What embedder and database do the tests use by default?","gold_id":"memo-embedder-hash-default","lexical_overlap":"med"}
+{"query":"If we switch from Claude to another model, does the stored memory still work?","gold_id":"own-embedder-durability","lexical_overlap":"low"}
+{"query":"How do we know if the learned reranker is actually helping if benchmarks can't show it?","gold_id":"learned-reranker-metric","lexical_overlap":"low"}
+{"query":"How does bulk writing of memories handle embeddings and inserts?","gold_id":"write-many-batch","lexical_overlap":"med"}
+{"query":"What happens to the request timeout when an embed input is too large for the batch?","gold_id":"tei-batch-hang","lexical_overlap":"low"}
+{"query":"Where do project-specific decisions get documented versus phased plans?","gold_id":"github-md-gitignored","lexical_overlap":"low"}
+{"query":"Is it okay to overwrite the existing embedder config during setup?","gold_id":"memo-embedder-hash-default","lexical_overlap":"low"}

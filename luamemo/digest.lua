@@ -53,6 +53,7 @@ local DEFAULTS = {
     digest_escalate_alpha   = 0.4,
     digest_promote_tier2_at = 3,
     digest_promote_tier3_at = 5,
+    auto_digest_interval    = 3600,   -- min seconds between lazy auto-digests per scope
 }
 
 function M.configure(cfg)
@@ -76,10 +77,43 @@ end
 -- Check whether a scope is idle long enough to trigger a digest.
 -- Returns true if the scope has had at least one write AND has been quiet
 -- for >= digest_idle_seconds. Never fires for scopes that never had a write.
+-- (In-memory; only meaningful inside a long-lived process such as the MCP server.)
 function M.should_run(scope)
     local t = _last_write[scope]
     if not t then return false end
     return (os.time() - t) >= (_cfg.digest_idle_seconds or 1800)
+end
+
+-- Lazy, debounced auto-trigger for STATELESS callers (the CLI): piggyback a
+-- maintenance digest on an ordinary operation, but at most once per
+-- auto_digest_interval per scope. State lives in lm_digest_state so the debounce
+-- survives across process invocations. The claim is a single atomic upsert whose
+-- WHERE guard means only ONE concurrent caller wins the slot — a race can't double
+-- run the digest. Fail-soft; returns the digest result, or false if not due /
+-- unavailable. This is how the loop keeps maintaining itself without any external
+-- trigger (agent or cron) having to remember.
+local _running = false
+function M.maybe_run(scope, opts)
+    if _running then return false end
+    if not scope or scope == "" then return false end
+    if not util.table_exists("lm_digest_state") then return false end
+    local interval = math.floor(tonumber(_cfg.auto_digest_interval) or 3600)
+    if interval < 0 then interval = 0 end
+
+    -- Atomic "claim the slot if due" — inserts on first sight, else updates only
+    -- when the cursor is older than the interval. RETURNING tells us if we won it.
+    local claim = db.query(
+        "INSERT INTO lm_digest_state (scope, last_digested_at) VALUES ("
+        .. db.escape_literal(scope) .. ", now()) "
+        .. "ON CONFLICT (scope) DO UPDATE SET last_digested_at = now() "
+        .. "WHERE lm_digest_state.last_digested_at <= now() - interval '"
+        .. interval .. " seconds' RETURNING scope")
+    if not (claim and claim[1]) then return false end   -- not due, or lost the race
+
+    _running = true
+    local ok, res = pcall(M.run, scope, opts or {})
+    _running = false
+    return ok and res or false
 end
 
 -- ---------------------------------------------------------------------------
@@ -108,6 +142,19 @@ local function _diminish(current, delta)
     return math.max(0.0, math.min(1.0, new))
 end
 
+-- Miss reinforcement: retrieval failed to surface a memory that was needed, so
+-- nudge its importance UP toward 1.0 (scaled by delta) — the direct remedy that
+-- makes it rank higher / surface next time, independent of the learned models.
+-- Only ever moves upward (never diminishes a proven-relevant memory).
+--   delta = 1.0 → new = current + (1 - current) * 0.5   (halfway to ceiling)
+--   delta = 0.5 → new = current + (1 - current) * 0.25
+local function _reinforce_relevance(current, delta)
+    local c = tonumber(current) or 0.5
+    local d = math.min(math.abs(tonumber(delta) or 0.5), 1.0)
+    local new = c + (1.0 - c) * d * 0.5
+    return math.max(c, math.min(1.0, new))
+end
+
 -- Derive tier from importance via the shared formula in util.
 local _tier_from_imp = util.importance_to_tier
 
@@ -126,7 +173,7 @@ function M.record_event(memory_id, scope, event_type, delta, note)
     if not memory_id or not scope then return end
     local valid_types = {
         direct_command = true, mistake = true,
-        reversal = true, praise = true,
+        reversal = true, praise = true, miss = true,
     }
     if not valid_types[event_type] then return end
 
@@ -149,13 +196,17 @@ function M.record_event(memory_id, scope, event_type, delta, note)
     db.query(sql)  -- fire-and-forget; errors silently discarded
 
     -- Reversal: immediately apply importance diminishment + tier demotion.
-    if event_type == "reversal" then
+    -- Miss: immediately apply an importance BUMP + tier promotion so the memory
+    -- that retrieval failed to surface becomes more findable next time.
+    if event_type == "reversal" or event_type == "miss" then
         local mem_rows = db.query(
             "SELECT importance FROM lm_memories WHERE id = "
             .. mid .. " LIMIT 1")
         if mem_rows and mem_rows[1] then
             local cur_imp = tonumber(mem_rows[1].importance) or 0.5
-            local new_imp  = _diminish(cur_imp, clamped_delta)
+            local new_imp = (event_type == "miss")
+                and _reinforce_relevance(cur_imp, clamped_delta)
+                or  _diminish(cur_imp, clamped_delta)
             local new_tier = _tier_from_imp(new_imp)
             db.query(([[
                 UPDATE lm_memories

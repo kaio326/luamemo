@@ -8,6 +8,7 @@ local summarizer  = require("luamemo.summarizer")
 local rerank      = require("luamemo.rerank")
 local secrets     = require("luamemo.secrets")
 local patterns    = require("luamemo.patterns")
+local index       = require("luamemo.index")
 
 local M = {}
 
@@ -133,6 +134,23 @@ M.config = {
     rerank_timeout_ms   = 30000,
     rerank_top_n        = 20,
     rerank_enabled      = false,
+    -- Learned-from-usage substrate (luamemo.feedback). When true, store.search
+    -- append-only logs each retrieval event (query + candidate ids) so a later
+    -- reinforcement can form a training triple. OFF by default (inert, no cost).
+    feedback_enabled    = false,
+    -- Retrieval-miss detection (gated on feedback_enabled): a near-duplicate write
+    -- at cosine >= miss_threshold means retrieval failed to surface an existing
+    -- memory, so store.write records a 'miss' on it (importance bump + ranker
+    -- signal). Lower than dedup_threshold so reworded near-duplicates still count.
+    miss_threshold      = 0.90,
+    -- Lazy auto-digest: when true, an ordinary write opportunistically runs a
+    -- debounced maintenance digest (tier promotion / consolidation / decay) for
+    -- its scope — at most once per auto_digest_interval seconds, tracked in
+    -- lm_digest_state so it survives across stateless CLI invocations. This keeps
+    -- memory maintaining itself without relying on an agent or scheduler to call
+    -- `memo digest`. OFF by default (zero-regression); calibrate can enable it.
+    auto_digest_enabled  = false,
+    auto_digest_interval = 3600,
     -- Optional hook called for every API request before auth_fn.
     -- Use this to enforce CSRF, rate limits, etc.
     before_request = nil,
@@ -190,6 +208,7 @@ function M.setup(opts)
     rerank.configure(M.config)
     secrets.configure(M.config)
     patterns.configure(M.config)
+    index.configure(M.config)
 
     -- Fail-fast embedder health check.
     local probe_ok, probe_err = M._init_embedder(M.config)
@@ -381,6 +400,8 @@ M.hooks   = require("luamemo.hooks")
 M.tune_weights = require("luamemo.tune_weights")
 M.kg      = require("luamemo.kg")
 M.secrets = secrets
+M.index   = index
+M.delete_where = function(args) return store.delete_where(args) end
 
 --- Manual one-shot summariser cycle (no timer).
 M.summarize = function(opts) return summarizer.run(opts) end

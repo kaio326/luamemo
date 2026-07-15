@@ -1096,3 +1096,85 @@ All other fixes are in non-retrieval code paths.
 | MRR    | 0.630  | 0.630  | 0 |
 | miss   | 43     | 43     | 0 |
 
+## v0.4.0 — codebase index + hybrid-search rewrite (2026-07-08)
+
+**Changes vs v0.3.2:** new codebase-index subsystem (`luamemo.index`), MCP
+`index_*` tools, session digest (`memo brief`). In `store.lua`, the pgvector
+search (`_search_pgvector`) candidate pool became the **union of the
+vector-nearest rows and the top FTS matches** (was vector-nearest only, then
+re-ranked); plus `write_many` `no_embed`/NULL-embedding support, `metadata_filter`,
+and `delete_where`.
+
+**Scope of the retrieval change:** the candidate-selection rewrite is on the
+**pgvector path only**. The brute-force path (`_search_bruteforce`) — which this
+suite runs — is unchanged (its candidates were already FTS-ranked). These
+hash/bruteforce runs are therefore the **regression guard** for the non-pgvector
+path; they do **not** measure the hybrid-union improvement, which requires a
+pgvector-backed run (future work).
+
+**Verdict:** no regression — re-ran n=500 hash/bruteforce; numbers byte-identical
+to v0.3.2. Result: `eval/results/longmemeval_hash_v040.json`.
+
+### v0.3.2 → v0.4.0 delta (hash, bruteforce, n=500)
+
+| metric | v0.3.2 | v0.4.0 | Δ |
+|--------|-------:|-------:|--:|
+| R@1    | 54.0%  | 54.0%  | 0 |
+| R@5    | 73.6%  | 73.6%  | 0 |
+| R@10   | 83.4%  | 83.4%  | 0 |
+| R@20   | 91.4%  | 91.4%  | 0 |
+| MRR    | 0.630  | 0.630  | 0 |
+| miss   | 43     | 43     | 0 |
+
+### pgvector validation (2026-07-09) — the "future work" above, done
+
+Two follow-up sweeps close the gap left by the regression-guard runs.
+
+**(a) Hybrid-union A/B (hash, pgvector).** New union pool (`vector-nearest ∪
+top-FTS`) vs the old vector-nearest-only pool, both on the pgvector backend:
+**byte-identical** here (R@1 54.0 / R@10 83.4 / MRR 0.630 either way). On prose
+NL-QA the vector-nearest pool already contains the top-FTS rows, so the union is
+a no-op; its payoff is the FTS-only / lexically-distant case (code index,
+`no_embed` rows) that this corpus doesn't contain.
+
+**(b) pgvector (HNSW approx) vs bruteforce (exact), real embedders.** bge-m3
+(1024-dim, TEI) and ollama `nomic-embed-text` (768-dim), each backend pair on
+identical embedder config (`EMBED_MAX_CHARS` 24000 / 8000) so only the
+storage/search backend differs:
+
+| embedder | backend | R@1 | R@5 | R@10 | MRR |
+|----------|---------|----:|----:|-----:|----:|
+| bge-m3 (1024) | pgvector   | 100.0% | 100.0% | 100.0% | 1.000 |
+| bge-m3 (1024) | bruteforce | 100.0% | 100.0% | 100.0% | 1.000 |
+| nomic (768)   | pgvector   |  99.8% |  99.8% |  99.8% | 0.998 |
+| nomic (768)   | bruteforce |  99.8% |  99.8% |  99.8% | 0.998 |
+
+LME-oracle has only the 2 answer sessions per question, so any competent
+embedder saturates (contrast the hash 54% above — hash is a non-semantic
+embedder). The pgvector/bruteforce delta is **0** here; the discriminating
+comparisons are in `locomo.md` / `convomem.md` (max Δ 0.4pp R@1). Results:
+`longmemeval_{tei,ollama}_{pgvector,bruteforce}.json`.
+
+> **Eval-infra fix.** TEI hung the full request timeout (no error) on any single
+> input over `MAX_BATCH_TOKENS`; ~30% of LME-oracle sessions exceed the old 4096
+> default. Raised to 7168 (6 GB RTX 2060 VRAM ceiling; 8192 OOMs) + `AUTO_TRUNCATE`
+> (hang → 424) + `EMBED_MAX_CHARS`. bge-m3's longest ~2% of sessions are
+> tail-truncated. `nomic` LME had 16 deterministic write-fails (identical in both
+> backends → cancels in the delta; recall still 99.8%).
+
+## In-process EmbeddingGemma (gguf_ffi) placement (2026-07-13)
+
+`embedder_local="gguf_ffi"` runs EmbeddingGemma-300M **in-process via LuaJIT FFI** over a C shim
+linked to llama.cpp — no sidecar, no GPU, no vendor, owned/pinned weights. Full frozen suite,
+bruteforce, raw text (fair vs the bge-m3/nomic bruteforce runs), overall R@1 / MRR:
+
+| benchmark | gguf/EmbeddingGemma-300M (in-proc CPU) | bge-m3 (1024, GPU TEI) | nomic (768) |
+|-----------|---------------------------------------:|-----------------------:|------------:|
+| LME       | 99.4% / 0.994 | 100% / 1.000 | 99.8% / 0.998 |
+| LoCoMo    | **58.9% / 0.701** | 58.4% / 0.698 | 52.8% / 0.638 |
+| ConvoMem  | 90.5% / 0.929 | 92.1% / 0.942 | 90.2% / 0.931 |
+
+**A 300M in-process CPU model matches the 568M GPU-sidecar bge-m3** — slightly beats it on LoCoMo,
+~1.6pp behind on ConvoMem, tied on LME — and clearly beats nomic. This is why `gguf_ffi` is now the
+default-when-capable embedder (calibrate). Results: `*_gguf_bruteforce.json`.
+

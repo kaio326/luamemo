@@ -168,6 +168,13 @@ elseif args.embedder == "openai" then
     setup_opts.embedder_model   = os.getenv("OPENAI_MODEL") or "text-embedding-3-small"
     setup_opts.embedder_headers = { Authorization = "Bearer " .. key }
     setup_opts.embed_dim        = tonumber(os.getenv("OPENAI_DIM") or "1536")
+elseif args.embedder == "gguf" then
+    -- In-process GGUF embedder (EmbeddingGemma via LuaJIT FFI). Run this runner
+    -- under `luajit`. Raw text (no task prompts) for a fair bge-m3 comparison.
+    setup_opts.embedder_local = "gguf_ffi"
+    setup_opts.embedder_model = os.getenv("MEMO_GGUF_MODEL")
+        or (os.getenv("HOME") .. "/models/embeddinggemma-300M-Q8_0.gguf")
+    setup_opts.embed_dim      = tonumber(os.getenv("MEMO_GGUF_DIM") or "768")
 else
     io.stderr:write("unknown --embedder: " .. tostring(args.embedder) .. "\n")
     os.exit(2)

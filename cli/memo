@@ -3,9 +3,10 @@
 #
 # Stores and retrieves memories in PostgreSQL using hybrid vector + full-text
 # search. Supports pluggable embedders (Ollama, OpenAI, TEI, built-in hash),
-# knowledge graphs, encrypted secrets, memory tiers (0–3), and an MCP stdio
-# server so AI agents can read and write memory directly. Works with plain
-# PostgreSQL + Lua 5.1 — no OpenResty required.
+# knowledge graphs, encrypted secrets, memory tiers (0–3), a whole-repo codebase
+# index (memo index), and an MCP stdio server so AI agents can read/write memory
+# and query the code map directly. Works with plain PostgreSQL + Lua 5.1 — no
+# OpenResty required.
 #
 # Configuration (env vars or ~/.memorc):
 #   MEMO_DB_URL   PostgreSQL connection URL, e.g.
@@ -31,6 +32,10 @@
 #   memo context    QUERY [--scope SCOPE] [--limit N] [--no-kg] [--format text|json]
 #                   (search + KG facts in one call, formatted for agent consumption)
 #
+#   memo brief      [--scope SCOPE]
+#                   (tiny session-start digest: memory count + codebase-map size +
+#                    tool hints; fail-soft, for auto-injection via a SessionStart hook)
+#
 #   memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
 #                    [--decay-threshold F] [--max-rows N]
 #                    (cluster related memories into observations)
@@ -38,11 +43,28 @@
 #   memo digest     [--scope SCOPE] [--dry-run] [--threshold F]
 #                   (hippocampus digest: promote tiers, delete stale ephemeral rows)
 #
+#   memo sense      --scope SCOPE [--generative] [--min-similarity F]
+#                   (stdin: JSON array of {role,text} turns → record reinforcements)
+#
+#   memo learn      <scope> [--dry-run] [--min-samples N] [--margin F]
+#                   (per-scope promotion harness: harvest → train → gated-promote reranker)
+#
 #   memo promote    --from FROM_SCOPE --to TO_SCOPE [--delete-source] [--dry-run]
 #                   [--limit N]
 #
 #   memo summarize  [--scope S] [--dry-run] [--weight-threshold F]
 #                   [--retention-days N]
+#
+#   memo index      ingest [--root .] [--scope codeindex:proj] [--extensions csv|*]
+#                          [--no-symbols] [--embed-file-rows] [--exclude a,b] [--dry-run]
+#                   update [--root .] [--scope codeindex:proj]
+#                   search  <query>  [--scope codeindex:proj] [--kind symbol] [--limit N]
+#                   explore <query>  [--scope codeindex:proj] [--limit N]
+#                   status           [--scope codeindex:proj]
+#                   invalidate <file|scope>
+#                   diff   --commit SHA | --file FILE | --stdin [--scope codeindex:proj]
+#                   (index a repo into codeindex:<project> — files/symbols/deps/diffs;
+#                    Lua/Python/JS-TS parsers + universal-ctags for other languages)
 #
 #   memo calibrate  [--scope SCOPE] [--root DIR] [--no-git] [--no-comments]
 #                   [--probe-only] [--multilingual] [--long] [--hosted]
@@ -109,7 +131,15 @@ require_jq() {
 }
 
 find_lua() {
-    for cand in lua5.1 luajit lua5.3 lua5.4 lua; do
+    # The in-process GGUF embedder (MEMO_EMBEDDER=gguf_ffi) needs LuaJIT's FFI, so
+    # prefer luajit when it is the selected embedder; otherwise the standard
+    # lua5.1-first order. (.luamemorc is sourced with `set -a`, so MEMO_EMBEDDER is
+    # in the environment here.) Mirrors the MCP config writer's luajit selection.
+    local order="lua5.1 luajit lua5.3 lua5.4 lua"
+    if [[ "${MEMO_EMBEDDER:-}" == "gguf_ffi" ]]; then
+        order="luajit lua5.1 lua5.3 lua5.4 lua"
+    fi
+    for cand in $order; do
         if command -v "$cand" >/dev/null; then echo "$cand"; return 0; fi
     done
     return 1
@@ -374,7 +404,7 @@ _build_pg_url() {
 }
 
 # ---------------------------------------------------------------------------
-# _cmd_migrate_sql: emit full idempotent schema SQL (migrations 001–009).
+# _cmd_migrate_sql: emit full idempotent schema SQL (migrations 001–011).
 # Outputs vector(384) — callers pipe through sed to substitute embed_dim.
 # ---------------------------------------------------------------------------
 _cmd_migrate_sql() {
@@ -563,7 +593,7 @@ CREATE TABLE IF NOT EXISTS lm_reinforcements (
     memory_id   BIGINT NOT NULL REFERENCES lm_memories(id) ON DELETE CASCADE,
     scope       TEXT NOT NULL,
     event_type  TEXT NOT NULL CHECK (event_type IN
-                    ('direct_command','mistake','reversal','praise')),
+                    ('direct_command','mistake','reversal','praise','miss')),
     delta       REAL NOT NULL,
     note        TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -573,6 +603,65 @@ CREATE INDEX IF NOT EXISTS lm_reinforcements_memory_idx
     ON lm_reinforcements (memory_id);
 CREATE INDEX IF NOT EXISTS lm_reinforcements_scope_type_idx
     ON lm_reinforcements (scope, event_type);
+
+-- migration 010 / retrieval feedback event log -----------------------------
+
+CREATE TABLE IF NOT EXISTS lm_retrieval_feedback (
+    id            BIGSERIAL   PRIMARY KEY,
+    scope         TEXT        NOT NULL,
+    query         TEXT        NOT NULL,
+    candidate_ids BIGINT[]    NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS lm_retrieval_feedback_scope_idx
+    ON lm_retrieval_feedback (scope, created_at DESC);
+CREATE INDEX IF NOT EXISTS lm_retrieval_feedback_candidates_idx
+    ON lm_retrieval_feedback USING GIN (candidate_ids);
+
+-- migration 011 / 'miss' reinforcement event type (retrieval-miss signal) -----
+-- A miss = retrieval failed to surface a memory that was needed (opposite of a
+-- content mistake). Upgrades an existing DB by swapping the CHECK. Idempotent.
+ALTER TABLE lm_reinforcements DROP CONSTRAINT IF EXISTS lm_reinforcements_event_type_check;
+ALTER TABLE lm_reinforcements ADD CONSTRAINT lm_reinforcements_event_type_check
+    CHECK (event_type IN ('direct_command','mistake','reversal','praise','miss'));
+
+-- migration 012 / persisted per-scope digest cursor (lazy auto-trigger) -------
+CREATE TABLE IF NOT EXISTS lm_digest_state (
+    scope            TEXT PRIMARY KEY,
+    last_digested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- migration 013 / per-scope learner weights + promotion audit -----------------
+CREATE TABLE IF NOT EXISTS lm_learner_weights (
+    id          BIGSERIAL   PRIMARY KEY,
+    scope       TEXT        NOT NULL,
+    kind        TEXT        NOT NULL,
+    version     INTEGER     NOT NULL,
+    weights     JSONB       NOT NULL,
+    score       REAL,
+    note        TEXT,
+    is_current  BOOLEAN     NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (scope, kind, version)
+);
+CREATE INDEX IF NOT EXISTS lm_learner_weights_current_idx
+    ON lm_learner_weights (scope, kind, is_current);
+CREATE TABLE IF NOT EXISTS lm_promotion_runs (
+    id              BIGSERIAL   PRIMARY KEY,
+    scope           TEXT        NOT NULL,
+    kind            TEXT        NOT NULL,
+    decision        TEXT        NOT NULL,
+    new_score       REAL,
+    incumbent_score REAL,
+    n_train         INTEGER,
+    n_gate          INTEGER,
+    version         INTEGER,
+    note            TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS lm_promotion_runs_scope_idx
+    ON lm_promotion_runs (scope, kind, created_at DESC);
 MIGRATE_EOF
 }
 
@@ -740,6 +829,39 @@ cmd_context() {
     fi
 }
 
+# memo brief [--scope SCOPE]
+# Print a tiny session-start digest (memory + codebase-map status + tool hints).
+# No query required. Defaults --scope to $MEMO_SCOPE. Never fails the caller —
+# designed to be run from a SessionStart hook and injected into the session.
+cmd_brief() {
+    require_jq
+    local scope="${MEMO_SCOPE:-}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scope) scope="$2"; shift 2 ;;
+            *) shift ;;   # ignore unknown args to stay robust in hook contexts
+        esac
+    done
+
+    local json; json=$(jq -n --arg scope "$scope" \
+        '{} | if $scope != "" then . + {scope: $scope} else . end')
+
+    local lua; lua=$(find_lua) || return 0
+
+    # Hard cap: a session-start hook must never block. If the DB is slow or
+    # unreachable and the query hangs, `timeout` kills it and we print nothing.
+    # -k 2: if the process ignores SIGTERM (e.g. blocked in a socket syscall),
+    # SIGKILL it 2s later so no orphan lua process lingers after the hook.
+    local runner=""
+    command -v timeout >/dev/null 2>&1 && runner="timeout -k 2 ${MEMO_BRIEF_TIMEOUT:-5}"
+    local result; result=$(printf '%s' "$json" | $runner "$lua" -e \
+        "package.path='./?/init.lua;'..package.path; require('luamemo.cli.api').dispatch('brief')" \
+        2>/dev/null) || true
+    local text; text=$(printf '%s' "$result" | jq -r '.text // empty' 2>/dev/null) || true
+    [[ -n "$text" ]] && printf '%s\n' "$text"
+    return 0
+}
+
 # memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
 #                  [--decay-threshold F] [--max-rows N]
 # memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
@@ -780,6 +902,52 @@ cmd_digest() {
         esac
     done
     printf '%s' "$json" | api_call digest | jq .
+}
+
+# memo sense — record reinforcements from relayed conversation turns (Phase 9).
+# stdin: a JSON ARRAY of {role,text} turns (oldest first). The agent relays these
+# since luamemo can't read the chat. Heuristics always run; --generative also runs
+# the in-process instruct model (needs MEMO_GEN_MODEL + LuaJIT). Idempotent.
+cmd_sense() {
+    require_jq
+    local scope="${MEMO_SCOPE:-}"
+    local generative=false
+    local extra='{}'
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scope)          scope="$2"; shift 2 ;;
+            --generative)     generative=true; shift ;;
+            --min-similarity) extra=$(printf '%s' "$extra" | jq --argjson v "$2" '. + {min_similarity: $v}'); shift 2 ;;
+            *) echo "memo sense: unknown arg: $1" >&2; exit 1 ;;
+        esac
+    done
+    if [[ -z "$scope" ]]; then
+        echo "memo sense: --scope required (or set MEMO_SCOPE)" >&2; exit 1
+    fi
+    local turns; turns=$(cat); [[ -z "$turns" ]] && turns='[]'
+    printf '%s' "$turns" \
+        | jq --arg s "$scope" --argjson g "$generative" --argjson e "$extra" \
+             '{scope: $s, turns: ., generative: $g} + $e' \
+        | api_call sense | jq .
+}
+
+# memo learn <scope> — per-scope promotion harness (Phase 11). Harvests the
+# scope's feedback, trains the reranker, gates on a held-out split, and promotes
+# only if it beats the incumbent. --dry-run trains + gates but never promotes.
+cmd_learn() {
+    require_jq
+    local json='{}'
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scope)       json=$(printf '%s' "$json" | jq --arg v "$2" '. + {scope: $v}'); shift 2 ;;
+            --dry-run)     json=$(printf '%s' "$json" | jq '. + {dry_run: true}'); shift ;;
+            --min-samples) json=$(printf '%s' "$json" | jq --argjson v "$2" '. + {min_samples: $v}'); shift 2 ;;
+            --margin)      json=$(printf '%s' "$json" | jq --argjson v "$2" '. + {margin: $v}'); shift 2 ;;
+            --*)           echo "memo learn: unknown arg: $1" >&2; exit 1 ;;
+            *)             json=$(printf '%s' "$json" | jq --arg v "$1" '. + {scope: $v}'); shift ;;
+        esac
+    done
+    printf '%s' "$json" | api_call learn | jq .
 }
 # Used by --docker-compose FILE flag in cmd_calibrate.
 # Parses a docker-compose.yml for Postgres credentials and host port,
@@ -1050,13 +1218,14 @@ EOF
         local _awk_out
         _awk_out=$(awk '
             /embed_dim[[:space:]]*=[[:space:]]*[0-9]/{match($0,/[0-9]+/);dim=substr($0,RSTART,RLENGTH)}
+            /embedder_local[[:space:]]*=/{match($0,/"[^"]*"/);loc=substr($0,RSTART+1,RLENGTH-2)}
             /embedder_adapter[[:space:]]*=/{match($0,/"[^"]*"/);adp=substr($0,RSTART+1,RLENGTH-2)}
             /embedder_url[[:space:]]*=/{match($0,/"[^"]*"/);url=substr($0,RSTART+1,RLENGTH-2)}
             /embedder_model[[:space:]]*=/{match($0,/"[^"]*"/);mdl=substr($0,RSTART+1,RLENGTH-2)}
             /embed_max_chars[[:space:]]*=[[:space:]]*[0-9]/{match($0,/[0-9]+/);mxc=substr($0,RSTART,RLENGTH)}
-            END{printf "%s\t%s\t%s\t%s\t%s\n",dim,adp,url,mdl,mxc}
+            END{printf "%s\t%s\t%s\t%s\t%s\t%s\n",dim,loc,adp,url,mdl,mxc}
         ' "$_probe_tmp")
-        IFS=$'\t' read -r _probe_embed_dim _probe_eadp _probe_eurl _probe_emdl _probe_emxc <<< "$_awk_out"
+        IFS=$'\t' read -r _probe_embed_dim _probe_eloc _probe_eadp _probe_eurl _probe_emdl _probe_emxc <<< "$_awk_out"
         [[ -n "$_probe_embed_dim" ]] || _probe_embed_dim=384
     fi
     rm -f "$_probe_tmp"
@@ -1069,11 +1238,19 @@ EOF
     # --keep-embedder skips this block entirely so users can re-run calibrate
     # without touching their working embedder config.
     if [[ "$keep_embedder" != true ]] && [[ -n "${MEMO_DB_URL:-}" ]]; then
+        # Local embedder selector (hash / gguf_ffi / …). For gguf_ffi the user
+        # also sets MEMO_GGUF_MODEL after downloading the model (see the guide
+        # printed by `memo calibrate`).
+        [[ -n "$_probe_eloc" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBEDDER" "$_probe_eloc"
         [[ -n "$_probe_eadp" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBEDDER_ADAPTER" "$_probe_eadp"
         [[ -n "$_probe_eurl" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBEDDER_URL"     "$_probe_eurl"
         [[ -n "$_probe_emdl" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBEDDER_MODEL"   "$_probe_emdl"
         _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBED_DIM" "$_probe_embed_dim"
         [[ -n "$_probe_emxc" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBED_MAX_CHARS"  "$_probe_emxc"
+        # Self-maintaining memory: a debounced digest piggybacks on writes so tier
+        # promotion / consolidation / decay run without any agent or scheduler
+        # having to call `memo digest`. Write-if-absent, so an explicit 0 is kept.
+        _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_AUTO_DIGEST" "1"
     fi
     [[ "$probe_only" == true ]] && return 0
 
@@ -1413,6 +1590,22 @@ _calibrate_mcp_phase() {
     local root="$1" scope="$2"
 
     local lua_bin; lua_bin=$(find_lua) || lua_bin="lua"
+    # The in-process GGUF embedder (embedder_local=gguf_ffi) needs LuaJIT (FFI),
+    # so the MCP server must launch under `luajit`, not lua5.1. Detect the chosen
+    # embedder from the env or the persisted .luamemorc.
+    local _mcp_embedder="${MEMO_EMBEDDER:-}"
+    if [[ -z "$_mcp_embedder" && -f "$PWD/.luamemorc" ]]; then
+        _mcp_embedder=$(grep -E '^MEMO_EMBEDDER=' "$PWD/.luamemorc" 2>/dev/null | tail -1 | cut -d= -f2-)
+    fi
+    if [[ "$_mcp_embedder" == "gguf_ffi" ]]; then
+        if command -v luajit >/dev/null 2>&1; then
+            lua_bin="luajit"
+            echo "  (embedder is gguf_ffi → MCP server will launch under luajit for FFI)"
+        else
+            echo "  WARNING: embedder=gguf_ffi needs luajit but it was not found;" >&2
+            echo "           MCP server will use $lua_bin and in-process embedding will fail." >&2
+        fi
+    fi
     local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     # Resolve absolute path to mcp/server.lua.
     # When installed via LuaRocks, this script lands in a bin/ directory and
@@ -1530,13 +1723,15 @@ _calibrate_mcp_phase() {
         --arg eadp "${MEMO_EMBEDDER_ADAPTER:-}" \
         --arg emdl "${MEMO_EMBEDDER_MODEL:-}" \
         --arg edim "${MEMO_EMBED_DIM:-}" \
-        --arg eloc "${MEMO_EMBEDDER:-}" \
+        --arg eloc "${_mcp_embedder:-}" \
+        --arg gmdl "${MEMO_GGUF_MODEL:-}" \
         '{"MEMO_DB_URL": $db, "MEMO_SCOPE": $sc}
          | if $eurl != "" then . + {"MEMO_EMBEDDER_URL": $eurl} else . end
          | if $eadp != "" then . + {"MEMO_EMBEDDER_ADAPTER": $eadp} else . end
          | if $emdl != "" then . + {"MEMO_EMBEDDER_MODEL": $emdl} else . end
          | if $edim != "" then . + {"MEMO_EMBED_DIM": $edim} else . end
-         | if $eurl == "" and $eloc != "" then . + {"MEMO_EMBEDDER": $eloc} else . end')
+         | if $eurl == "" and $eloc != "" then . + {"MEMO_EMBEDDER": $eloc} else . end
+         | if $gmdl != "" then . + {"MEMO_GGUF_MODEL": $gmdl} else . end')
 
     # Build the VS Code / Claude Desktop / Cursor MCP entry (JSON).
     local vscode_entry
@@ -1807,8 +2002,12 @@ case "$sub" in
     summarize) cmd_summarize "$@" ;;
     promote) cmd_promote "$@" ;;
     context) cmd_context "$@" ;;
+    brief)  cmd_brief   "$@" ;;
     consolidate) cmd_consolidate "$@" ;;
     digest) cmd_digest "$@" ;;
+    sense)  cmd_sense  "$@" ;;
+    learn)  cmd_learn  "$@" ;;
+    index)     cmd_local_lua index "$@" ;;
     calibrate) cmd_calibrate "$@" ;;
     setup)     cmd_setup     "$@" ;;
     secret-store)   cmd_secret_store   "$@" ;;

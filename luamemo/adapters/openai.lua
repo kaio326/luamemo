@@ -1,29 +1,8 @@
--- OpenAI embedder adapter.
--- Configure setup() with:
---   embedder_url = "https://api.openai.com/v1/embeddings"
---   embedder_adapter = "openai"
---   embedder_model = "text-embedding-3-small"
---   embedder_headers = { Authorization = "Bearer " .. os.getenv("OPENAI_API_KEY") }
-
-local json = require("luamemo.json")
-
-return {
-    extra_headers = {},
-
-    url = function(cfg) return cfg.embedder_url end,
-
-    build_request = function(text, cfg)
-        return json.encode({
-            model = cfg.embedder_model or "text-embedding-3-small",
-            input = text,
-        })
-    end,
-
-    parse_response = function(payload, cfg)
-        if type(payload.data) ~= "table" or not payload.data[1]
-            or type(payload.data[1].embedding) ~= "table" then
-            return nil, "OpenAI response missing data[0].embedding"
-        end
-        return payload.data[1].embedding
-    end,
-}
+-- Back-compat alias.
+--
+-- The OpenAI-compatible embeddings protocol adapter was renamed to
+-- `luamemo.adapters.openai_compatible` to make clear it is NOT OpenAI-only —
+-- it works with any /v1/embeddings-compatible endpoint (OpenAI, Azure, and
+-- self-hosted vLLM / LM Studio / LocalAI / llama-server). Existing configs that
+-- set embedder_adapter = "openai" keep working via this alias.
+return require("luamemo.adapters.openai_compatible")

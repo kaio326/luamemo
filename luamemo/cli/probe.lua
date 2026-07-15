@@ -90,4 +90,55 @@ function M.scan_project(root)
     return { ext_census = ext_census, multilingual_hint = multilingual_hint }
 end
 
+-- gguf: can this host run the in-process GGUF embedder (luamemo.embedders.gguf_ffi)?
+-- Needs LuaJIT (FFI) at runtime, plus a C toolchain + cmake to build the shim
+-- (and llama.cpp, if not already built). Reports which pieces are missing so the
+-- guide can tell the user exactly what to install.
+function M.gguf()
+    local have_luajit = M.has_command("luajit")
+    local have_cc     = M.has_command("cc") or M.has_command("gcc")
+    local have_cmake  = M.has_command("cmake")
+    local have_git    = M.has_command("git")
+    local missing = {}
+    if not have_luajit then missing[#missing + 1] = "luajit" end
+    if not have_cc     then missing[#missing + 1] = "cc/gcc" end
+    if not have_cmake  then missing[#missing + 1] = "cmake" end
+    if not have_git    then missing[#missing + 1] = "git" end
+    return {
+        ok      = have_luajit and have_cc and have_cmake and have_git,
+        luajit  = have_luajit, cc = have_cc, cmake = have_cmake, git = have_git,
+        missing = missing,
+    }
+end
+
+-- generative: recommend the in-process generative model for sensing "dreams"
+-- extraction (luamemo.sensing.generate). It runs on the SAME runtime as the gguf
+-- embedder. With a GPU that has enough free VRAM we recommend the 4B instruct
+-- model on GPU — it labels/extracts far more reliably than the 1B model, which
+-- is precision-first but weak at open extraction. Otherwise the 1B model on CPU,
+-- the zero-dependency floor. NOTE: GPU offload (n_gpu != 0) additionally requires
+-- a CUDA-built libllama; we surface that as a prerequisite rather than probe it.
+local VRAM_MB_FOR_4B = 3800   -- gemma-3-4b Q4_K_M weights (~2.6GB) + context/KV headroom
+
+function M.generative()
+    local g = M.gguf()
+    if not g.ok then
+        return { ok = false, err = "generative sensing needs the gguf runtime (LuaJIT + toolchain)",
+                 missing = g.missing }
+    end
+    local gpu = M.gpu()
+    if gpu.ok and gpu.value and (tonumber(gpu.value.free_mb) or 0) >= VRAM_MB_FOR_4B then
+        return {
+            ok = true, device = "gpu", model = "gemma-3-4b-it", quant = "Q4_K_M", n_gpu = -1,
+            gpu = gpu.value,
+            note = "GPU offload requires a CUDA-built libllama — rebuild llama.cpp with -DGGML_CUDA=ON, "
+                .. "then set MEMO_GEN_NGL=-1.",
+        }
+    end
+    return {
+        ok = true, device = "cpu", model = "gemma-3-1b-it", quant = "Q4_K_M", n_gpu = 0,
+        gpu = (gpu.ok and gpu.value) or nil,
+    }
+end
+
 return M

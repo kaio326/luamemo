@@ -377,6 +377,7 @@ local function parse_flags(argv)
         long            = false,
         hosted          = false,
         allow_hash      = false,
+        no_gguf         = false,
         write           = nil,
     }
     local i = 1
@@ -394,6 +395,7 @@ local function parse_flags(argv)
         elseif a == "--long"            then f.long = true
         elseif a == "--hosted"          then f.hosted = true
         elseif a == "--allow-hash"      then f.allow_hash = true
+        elseif a == "--no-gguf"         then f.no_gguf = true
         elseif a == "--write"           then f.write = argv[i+1]; i = i+1
         else
             io.stderr:write("memo calibrate: unknown flag: " .. a .. "\n")
@@ -442,6 +444,7 @@ function M.run(argv)
     local docker = probe.docker()
     local ollama = probe.ollama()
     local ram    = probe.ram_mb()
+    local gguf   = probe.gguf()
     local scan   = probe.scan_project(flags.root)
 
     io.write(string.format("  GPU:    %s\n",
@@ -454,6 +457,10 @@ function M.run(argv)
         ollama.ok and ("reachable at " .. ollama.value) or ("none (" .. ollama.err .. ")")))
     io.write(string.format("  RAM:    %s\n",
         ram.ok and (ram.value .. " MiB available") or ("unknown (" .. ram.err .. ")")))
+    io.write(string.format("  GGUF:   %s\n",
+        gguf.ok
+            and "capable (LuaJIT + C toolchain) — in-process embedder available"
+            or  ("not available (missing: " .. table.concat(gguf.missing, ", ") .. ")")))
 
     io.write("\nProject scan (root=" .. flags.root .. "):\n")
     if #scan.ext_census == 0 then
@@ -486,6 +493,8 @@ function M.run(argv)
         long_rows    = long,
         allow_hosted = hosted,
         allow_hash   = allow_hash or flags.allow_hash,
+        gguf_capable = gguf.ok,
+        allow_gguf   = not flags.no_gguf,   -- --no-gguf opts out of the in-process default
     }
 
     local rec, err = recommend.decide(profile)
@@ -512,6 +521,37 @@ function M.run(argv)
     local snippet = fmt_snippet(rec)
     io.write("\nSnippet (paste into your app startup):\n\n")
     io.write(snippet .. "\n")
+
+    if rec.gguf then
+        io.write([[
+
+In-process embedder — one-time setup (detect + guide)
+-----------------------------------------------------
+The recommended embedder runs a GGUF model INSIDE your process via LuaJIT FFI —
+no sidecar, no vendor API, owned weights (survives provider changes). It needs a
+small native build + a model download, done once. This host has the prerequisites.
+
+  1. Build llama.cpp (shared libs) and the shim:
+       git clone --depth 1 https://github.com/ggml-org/llama.cpp ~/llama.cpp
+       cmake -B ~/llama.cpp/build -S ~/llama.cpp -DBUILD_SHARED_LIBS=ON \
+             -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+             -DLLAMA_BUILD_TOOLS=OFF -DCMAKE_BUILD_TYPE=Release
+       cmake --build ~/llama.cpp/build --target llama -j
+       LLAMA_DIR=~/llama.cpp bash <luamemo>/embedders/native/build.sh
+
+  2. Download the model (EmbeddingGemma-300M recommended; ~320 MB):
+       mkdir -p ~/models && curl -sL -o ~/models/embeddinggemma-300M-Q8_0.gguf \
+         https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf
+     Want a different / newer open-weights model instead? Point MEMO_GGUF_MODEL
+     at ANY llama.cpp-compatible GGUF embedding model — gemma is just the default.
+
+  3. Set MEMO_GGUF_MODEL=<path-to.gguf> and run your app / MCP server under `luajit`.
+
+Opt out: re-run `memo calibrate --no-gguf` to fall back to the next-best embedder
+(GPU/Docker sidecar, or --allow-hash for the semantically-blind FTS-only mode).
+]])
+    end
 
     if flags.write then
         local f, ferr = io.open(flags.write, "w")

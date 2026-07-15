@@ -1,0 +1,15 @@
+{
+  "_note": "SessionStart hook: injects a tiny luamemo digest into session context so the agent knows what persistent memory + codebase map exist without being asked. Sources ~/.luamemorc (KEY=VALUE via set -a) so MEMO_DB_URL/MEMO_SCOPE reach `memo brief`, then wraps its output as hookSpecificOutput.additionalContext (plain stdout is NOT reliably injected). memo brief is hard-capped by timeout and fail-soft (emits nothing if the DB is unreachable), so the hook never blocks or errors the session.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'set -a; [ -f \"$HOME/.luamemorc\" ] && . \"$HOME/.luamemorc\"; set +a; d=$(\"$CLAUDE_PLUGIN_ROOT/cli/memo\" brief 2>/dev/null); [ -n \"$d\" ] && printf \"%s\" \"$d\" | jq -Rs \"{hookSpecificOutput:{hookEventName:\\\"SessionStart\\\",additionalContext:.}}\" || true'"
+          }
+        ]
+      }
+    ]
+  }
+}

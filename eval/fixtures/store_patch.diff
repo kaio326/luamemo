@@ -1,0 +1,69 @@
+diff --git a/luamemo/store.lua b/luamemo/store.lua
+index 4d817f0..ce90811 100644
+--- a/luamemo/store.lua
++++ b/luamemo/store.lua
+@@ -74,16 +74,33 @@ local function _get_luamemo()
+     return _luamemo_ref
+ end
+ 
+--- Probe Postgres for the `vector` extension. Wrapped in pcall so a DB
+--- that's not yet reachable at configure() time doesn't crash startup —
+--- in that case we default to "pgvector" and the first real query surfaces
+--- the error normally.
+-local function _probe_backend()
+-    local ok, rows = pcall(db.query,
++-- Probe Postgres for the `vector` extension AND verify that the embedding
++-- column was created as the pgvector `vector` type (not `real[]`). Both must
++-- be true to use the pgvector backend. Wrapped in pcall so a DB that is not
++-- yet reachable at configure() time doesn't crash startup — in that case we
++-- default to "pgvector" and the first real query surfaces the error normally.
++--
++-- Guards the common misconfiguration: pgvector extension installed on a DB
++-- whose lm_memories table was created from schema_bruteforce.sql (real[]).
++-- In that case auto-detection now falls back to "bruteforce" instead of
++-- crashing with "malformed array literal" on the first write.
++local function _probe_backend(tbl_name)
++    -- 1. Check whether the pgvector extension is installed.
++    local ok, ext_rows = pcall(db.query,
+         "SELECT 1 AS present FROM pg_extension WHERE extname = 'vector'")
+-    if not ok then return "pgvector" end
+-    if rows and rows[1] then return "pgvector" end
+-    return "bruteforce"
++    if not ok then return "pgvector" end        -- unreachable DB → assume pgvector
++    if not (ext_rows and ext_rows[1]) then return "bruteforce" end
++
++    -- 2. Extension present — also verify the embedding column is actually
++    --    vector type, not real[] (brute-force schema).
++    local col_ok, col_rows = pcall(db.query,
++        "SELECT t.typname FROM pg_attribute a " ..
++        "JOIN pg_class c ON a.attrelid = c.oid " ..
++        "JOIN pg_type t ON a.atttypid = t.oid " ..
++        "WHERE c.relname = " .. db.escape_literal(tbl_name) ..
++        " AND a.attname = 'embedding' AND a.attnum > 0")
++    if not col_ok or not (col_rows and col_rows[1]) then return "pgvector" end
++    return (col_rows[1].typname == "vector") and "pgvector" or "bruteforce"
+ end
+ 
+ function M.configure(config)
+@@ -92,7 +109,7 @@ function M.configure(config)
+     digest.configure(config)
+     local requested = config.backend or "auto"
+     if requested == "auto" then
+-        _backend = _probe_backend()
++        _backend = _probe_backend(cfg.db_table or "lm_memories")
+     elseif requested == "pgvector" or requested == "bruteforce" then
+         _backend = requested
+     else
+@@ -191,7 +208,11 @@ local function pg_array(arr)
+     if not arr or #arr == 0 then return "'{}'" end
+     local parts = {}
+     for i, v in ipairs(arr) do
+-        parts[i] = '"' .. tostring(v):gsub('"', '\\"') .. '"'
++        local s = tostring(v)
++            :gsub("\\", "\\\\")  -- backslash first (array element escaping)
++            :gsub('"',  '\\"')   -- double-quote (array element escaping)
++            :gsub("'",  "''")    -- single-quote (SQL string escaping)
++        parts[i] = '"' .. s .. '"'
+     end
+     return "'{" .. table.concat(parts, ",") .. "}'"
+ end

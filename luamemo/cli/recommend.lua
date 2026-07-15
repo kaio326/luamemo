@@ -63,10 +63,37 @@ function M.decide(profile)
     local long_rows     = profile.long_rows
     local allow_hosted  = profile.allow_hosted
     local allow_hash    = profile.allow_hash
+    local gguf_capable  = profile.gguf_capable        -- LuaJIT + C toolchain present
+    local allow_gguf    = profile.allow_gguf ~= false -- opt-out via --no-gguf / --embedder
 
     local result = nil
 
-    if has_gpu and has_docker then
+    -- Preferred default: in-process GGUF embedder (llama.cpp via LuaJIT FFI).
+    -- Self-contained (no sidecar/service), owned pinned weights (durable across
+    -- provider changes — goal 1), and high quality (EmbeddingGemma-300M scores
+    -- far above hash, near a bge-m3-class model). Chosen whenever the machine can
+    -- run it, unless opted out. The model is swappable — EmbeddingGemma-300M is
+    -- just the recommended default; point embedder_model at any open-weights GGUF.
+    if gguf_capable and allow_gguf then
+        note("LuaJIT + C toolchain detected -> in-process GGUF embedder "
+            .. "(EmbeddingGemma-300M): self-contained, no sidecar, owned weights -> recommended default")
+        result = {
+            adapter = "gguf",
+            model   = "embeddinggemma-300M",
+            dim     = 768,
+            embed_max_chars = 8000,          -- ~2048-token context
+            gguf = true,
+            setup_keys = {
+                embedder_local  = "gguf_ffi",
+                embed_dim       = 768,
+                embed_max_chars = 8000,
+                -- embedder_model (path to the .gguf) is filled in by the
+                -- calibrate provisioning step once the model is present.
+            },
+        }
+    end
+
+    if not result and has_gpu and has_docker then
         if multilingual or long_rows then
             note("GPU + Docker available; multilingual or long rows detected -> bge-m3 via TEI sidecar")
             result = {
@@ -99,7 +126,7 @@ function M.decide(profile)
                 },
             }
         end
-    elseif has_docker and has_ram then
+    elseif not result and has_docker and has_ram then
         if multilingual or long_rows then
             note("No GPU (or insufficient free VRAM); Docker + 4GB RAM; multilingual or long rows -> bge-m3 via TEI (CPU)")
             result = {
@@ -134,23 +161,15 @@ function M.decide(profile)
         end
     end
 
-    if not result and allow_hosted then
-        note("Falling back to hosted API (OpenAI text-embedding-3-small)")
-        result = {
-            adapter = "openai",
-            model   = "text-embedding-3-small",
-            dim     = 1536,
-            embed_max_chars = M.SAFE_CHARS["text-embedding-3-small"],
-            setup_keys = {
-                embedder_adapter = "openai",
-                embedder_url     = "https://api.openai.com/v1/embeddings",
-                embedder_model   = "text-embedding-3-small",
-                embed_dim        = 1536,
-                embed_max_chars  = M.SAFE_CHARS["text-embedding-3-small"],
-                embedder_headers = { Authorization = "Bearer ${OPENAI_API_KEY}" },
-            },
-        }
-    end
+    -- NOTE: the hosted-API branch was removed from the auto-recommendation ladder
+    -- (2026-07-12). Defaulting to a cloud vendor contradicts the durability /
+    -- local-first goal, and the in-process GGUF path now covers the "capable, no
+    -- service" niche for free. The OpenAI-COMPATIBLE protocol adapter
+    -- (embedder_adapter="openai_compatible") remains available for explicit manual
+    -- config — it points at ANY /v1/embeddings endpoint, cloud OR self-hosted
+    -- (vLLM / LM Studio / LocalAI) — it is simply not recommended by default.
+    -- `allow_hosted` is retained as an inert flag.
+    local _ = allow_hosted
 
     if not result then
         if allow_hash then
@@ -166,7 +185,9 @@ function M.decide(profile)
                 },
             }
         else
-            note("No GPU, no Docker+RAM, no hosted budget. Re-run with --allow-hash for FTS-only mode, or install Docker/Ollama, or pass --hosted.")
+            note("No in-process GGUF capability (need LuaJIT + a C toolchain), no GPU, "
+                .. "no Docker+RAM. Install LuaJIT + build tools for the recommended local "
+                .. "embedder, or install Docker/Ollama, or re-run with --allow-hash for FTS-only mode.")
             return nil, table.concat(rationale, "\n")
         end
     end

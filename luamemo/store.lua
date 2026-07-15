@@ -280,6 +280,9 @@ M._get_lsh   = _get_lsh   -- exposed for tests (trigger lazy rebuild)
 
 -- Format an embedding for INSERT depending on backend.
 local function _embed_literal(vec)
+    -- A nil vector means "store no embedding" (FTS-only row); write SQL NULL.
+    -- The embedding column is nullable in both schemas.
+    if vec == nil then return "NULL" end
     if _backend == "bruteforce" then
         return embed.to_pg_array(vec)
     end
@@ -333,7 +336,7 @@ local function _find_near_duplicate(scope, vec, threshold)
         end
         if best and best_sim >= threshold then
             best.embedding = nil
-            return best
+            return best, best_sim
         end
         return nil
     end
@@ -355,9 +358,10 @@ local function _find_near_duplicate(scope, vec, threshold)
     local rows = db.query(sql)
     if not rows or #rows == 0 then return nil end
     local row = rows[1]
-    if (tonumber(row.sim) or 0) >= threshold then
+    local sim = tonumber(row.sim) or 0
+    if sim >= threshold then
         row.sim = nil
-        return row
+        return row, sim
     end
     return nil
 end
@@ -423,18 +427,45 @@ function M.write(args)
 
     -- Dedup pre-search. Per-call dedup_strategy="append" disables dedup
     -- without touching global config; useful for migration/import scripts.
-    local strategy = args.dedup_strategy or cfg.dedup_strategy or "update"
-    if cfg.dedup_enabled and strategy ~= "append" then
-        local existing = _find_near_duplicate(
-            scope, vec, cfg.dedup_threshold or 0.95)
-        if existing then
-            if strategy == "skip" then
-                return existing, nil, "skipped"
-            elseif strategy == "update" then
-                local merged, merr = _merge_into(existing, args)
-                if not merged then return nil, merr end
-                return merged, nil, "merged"
+    --
+    -- Dedup and the retrieval-miss signal (learned-from-usage, opt-in via
+    -- feedback_enabled) both need the nearest existing memory, so run ONE lookup
+    -- at the lower of the two thresholds and classify by the returned similarity —
+    -- never two searches. A near-duplicate write means retrieval failed to surface
+    -- an existing memory (it got re-created): recording a 'miss' bumps that
+    -- memory's importance (more findable next time) and feeds the ranker.
+    local strategy     = args.dedup_strategy or cfg.dedup_strategy or "update"
+    local dedup_active = cfg.dedup_enabled and strategy ~= "append"
+    local miss_active  = cfg.feedback_enabled
+    local dedup_thr    = cfg.dedup_threshold or 0.95
+    local miss_thr     = cfg.miss_threshold or 0.90
+
+    local existing
+    if dedup_active or miss_active then
+        local low
+        if dedup_active and miss_active then low = math.min(dedup_thr, miss_thr)
+        elseif dedup_active then low = dedup_thr
+        else low = miss_thr end
+
+        local near, sim = _find_near_duplicate(scope, vec, low)
+        if near and near.id then
+            if miss_active and sim >= miss_thr then       -- retrieval miss (fail-soft)
+                pcall(function()
+                    require("luamemo.digest").record_event(
+                        near.id, scope, "miss", 0.5, "miss:duplicate-write")
+                end)
             end
+            if dedup_active and sim >= dedup_thr then existing = near end
+        end
+    end
+
+    if existing then
+        if strategy == "skip" then
+            return existing, nil, "skipped"
+        elseif strategy == "update" then
+            local merged, merr = _merge_into(existing, args)
+            if not merged then return nil, merr end
+            return merged, nil, "merged"
         end
     end
 
@@ -527,6 +558,14 @@ function M.write(args)
     -- Notify consolidation engine of new unprocessed memory.
     consolidate.notify(scope)
     digest.notify_write(scope)
+    -- Opportunistic maintenance: piggyback a debounced digest on the write so tier
+    -- promotion / consolidation / decay happen without depending on any external
+    -- trigger (agent or scheduler) remembering to. Opt-in (auto_digest_enabled);
+    -- atomically debounced inside maybe_run (at most once per interval per scope);
+    -- fail-soft; the _running guard makes re-entry via consolidate impossible.
+    if cfg.auto_digest_enabled then
+        pcall(function() digest.maybe_run(scope) end)
+    end
     return rows[1], nil, "inserted"
 end
 
@@ -558,8 +597,12 @@ function M.write_many(rows_in, opts)
 
     -- Phase A1: validate every row and collect an embed queue.
     -- Embedding is deferred so we can fan it out concurrently in A2.
+    -- Rows with args.no_embed = true skip embedding + dedup entirely and are
+    -- inserted with a NULL vector (FTS-only). Used for rows whose retrieval is
+    -- purely lexical (e.g. codebase file rows), to avoid paid embed calls.
     local prepared = {}
     local embed_queue = {}   -- { i, text, title, body, importance, decay_rate, args }
+    local noembed_rows = {}  -- { i, title, body, importance, decay_rate, args }
     for i, args in ipairs(rows_in) do
         if type(args) ~= "table" then
             results[i] = { row = nil, action = nil, error = "row must be a table" }
@@ -579,15 +622,26 @@ function M.write_many(rows_in, opts)
                         results[i] = { row = nil, action = nil, error = derr }
                     else
                         if decay_rate == nil then decay_rate = cfg.default_decay_rate or 0.0 end
-                        embed_queue[#embed_queue + 1] = {
-                            i          = i,
-                            text       = title .. "\n" .. body,
-                            title      = title,
-                            body       = body,
-                            importance = importance,
-                            decay_rate = decay_rate,
-                            args       = args,
-                        }
+                        if args.no_embed then
+                            noembed_rows[#noembed_rows + 1] = {
+                                i          = i,
+                                title      = title,
+                                body       = body,
+                                importance = importance,
+                                decay_rate = decay_rate,
+                                args       = args,
+                            }
+                        else
+                            embed_queue[#embed_queue + 1] = {
+                                i          = i,
+                                text       = title .. "\n" .. body,
+                                title      = title,
+                                body       = body,
+                                importance = importance,
+                                decay_rate = decay_rate,
+                                args       = args,
+                            }
+                        end
                     end
                 end
             end
@@ -808,6 +862,31 @@ function M.write_many(rows_in, opts)
         end
     end
 
+    -- no_embed rows: insert with a NULL vector, no embed call, no dedup.
+    for _, item in ipairs(noembed_rows) do
+        local i, args_i = item.i, item.args
+        local p_tier = args_i.tier
+        if p_tier ~= nil then
+            p_tier = math.max(0, math.min(3, math.floor(tonumber(p_tier) or 1)))
+        else
+            p_tier = _importance_to_tier(item.importance)
+        end
+        prepared[i] = {
+            scope      = args_i.scope or cfg.default_scope,
+            kind       = args_i.kind or "fact",
+            title      = item.title,
+            body       = item.body,
+            tags       = args_i.tags or {},
+            meta       = args_i.metadata or {},
+            vec        = nil,   -- FTS-only: _embed_literal(nil) → NULL
+            importance = item.importance,
+            decay_rate = item.decay_rate,
+            truncated  = false,
+            tier       = p_tier,
+            created_at = tonumber(args_i.created_at),
+        }
+    end
+
     -- Phase B: execute multi-VALUES INSERT chunks. We track the original
     -- index of each prepared row so RETURNING rows map back to caller order.
     local indices = {}
@@ -994,12 +1073,71 @@ function M.update(id, patch)
 end
 
 -- ---------------------------------------------------------------------------
+-- _build_metadata_conds  (shared by search and delete_where)
+-- ---------------------------------------------------------------------------
+local function _build_metadata_conds(metadata_filter)
+    if not metadata_filter then return end
+    local out = {}
+    for k, v in pairs(metadata_filter) do
+        -- Only allow string keys and string/number values to prevent injection.
+        if type(k) == "string" and k:match("^[%a_][%w_]*$") then
+            if type(v) == "string" or type(v) == "number" then
+                table.insert(out, "metadata->>" .. db.escape_literal(k) ..
+                    " = " .. db.escape_literal(tostring(v)))
+            end
+        end
+    end
+    return out
+end
+
+-- ---------------------------------------------------------------------------
 -- delete
 -- ---------------------------------------------------------------------------
 function M.delete(id)
     id = tonumber(id)
     if not id then return nil, "delete: invalid id" end
     return db.delete(cfg.db_table, { id = id })
+end
+
+-- ---------------------------------------------------------------------------
+-- delete_where  — bulk delete by scope/kind/metadata_filter
+--
+-- Collects matching row IDs via a raw SQL query (not store.search, which
+-- requires an embed call) and deletes them in batches of 500. Loops until
+-- the scope is empty of matching rows.
+--
+-- args: { scope?, kind?, metadata_filter? }
+-- Returns: total count of deleted rows, or nil, err on failure.
+-- ---------------------------------------------------------------------------
+function M.delete_where(args)
+    args = args or {}
+    local conds = {}
+    if args.scope then table.insert(conds, "scope = " .. db.escape_literal(args.scope)) end
+    if args.kind  then table.insert(conds, "kind  = " .. db.escape_literal(args.kind))  end
+    local meta_conds = _build_metadata_conds(args.metadata_filter)
+    if meta_conds then for _, c in ipairs(meta_conds) do table.insert(conds, c) end end
+
+    if #conds == 0 then return nil, "delete_where: at least one filter required" end
+
+    local where = "WHERE " .. table.concat(conds, " AND ")
+    local total = 0
+
+    while true do
+        local sel = ("SELECT id FROM %s %s LIMIT 500"):format(tbl(), where)
+        local rows, qerr = db.query(sel)
+        if not rows then return nil, "delete_where: " .. tostring(qerr) end
+        if #rows == 0 then break end
+
+        local ids = {}
+        for _, r in ipairs(rows) do ids[#ids + 1] = tostring(r.id) end
+        local del = ("DELETE FROM %s WHERE id IN (%s)"):format(tbl(), table.concat(ids, ","))
+        local _, derr = db.query(del)
+        if derr then return nil, "delete_where: " .. tostring(derr) end
+        total = total + #rows
+        if #rows < 500 then break end
+    end
+
+    return total
 end
 
 -- ---------------------------------------------------------------------------
@@ -1330,60 +1468,91 @@ end
 --                 computes cosine, normalises, blends, applies weight,
 --                 sorts. Same return shape so callers don't care.
 -- ---------------------------------------------------------------------------
-local function _search_pgvector(q, qvec, scope, kind, limit, wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max)
+-- Build a scope WHERE fragment. `scope` may be a single string (scope = 'x') or
+-- an array of strings — a scope SET, for hierarchical multi-scope search
+-- (scope = ANY(ARRAY[...])). Returns nil when there is no scope filter. Tier
+-- already factors into the candidate weight, so a higher-tier memory (e.g. an org
+-- directive) outranks a lower-tier one across the union automatically.
+local function _scope_sql(scope)
+    if type(scope) == "table" then
+        local parts = {}
+        for _, s in ipairs(scope) do
+            if s ~= nil and s ~= "" then parts[#parts + 1] = db.escape_literal(s) end
+        end
+        if #parts == 0 then return nil end
+        return "scope = ANY(ARRAY[" .. table.concat(parts, ",") .. "])"
+    elseif scope and scope ~= "" then
+        return "scope = " .. db.escape_literal(scope)
+    end
+    return nil
+end
+
+local function _search_pgvector(q, qvec, scope, kind, limit, wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max, metadata_filter)
     local qvec_lit = embed.to_pg_literal(qvec)
 
     local conds = {}
-    if scope    then table.insert(conds, "scope = " .. db.escape_literal(scope)) end
+    do local sc = _scope_sql(scope); if sc then table.insert(conds, sc) end end
     if kind     then table.insert(conds, "kind  = " .. db.escape_literal(kind))  end
     if since_sql then table.insert(conds, "updated_at >= " .. since_sql) end
     if until_sql then table.insert(conds, "updated_at <  " .. until_sql) end
     if tier_min then table.insert(conds, "tier >= " .. math.max(0, math.min(3, math.floor(tonumber(tier_min))))) end
     if tier_max then table.insert(conds, "tier <= " .. math.max(0, math.min(3, math.floor(tonumber(tier_max))))) end
+    local meta_conds = _build_metadata_conds(metadata_filter)
+    if meta_conds then for _, c in ipairs(meta_conds) do table.insert(conds, c) end end
     local where = #conds > 0 and ("WHERE " .. table.concat(conds, " AND ")) or ""
 
     local weight_expr = ignore_decay
         and "1.0"
         or  "importance * exp(-decay_rate * (EXTRACT(EPOCH FROM (now() - updated_at)) / 86400.0))"
 
-    local sql = ([[
-        WITH candidates AS (
-            SELECT id, scope, kind, title, body, tags, metadata,
-                   importance, decay_rate, created_at, updated_at, tier,
-                   (1 - (embedding <=> %s)) AS vec_score,
-                   ts_rank_cd(fts, plainto_tsquery('english', %s)) AS fts_score,
-                   (%s) AS weight
-            FROM %s
-            %s
-            ORDER BY embedding <=> %s
-            LIMIT %d
-        ),
-        normalised AS (
-            SELECT *,
-                   CASE WHEN max(vec_score) OVER () > 0
-                        THEN vec_score / max(vec_score) OVER ()
-                        ELSE 0 END AS vec_n,
-                   CASE WHEN max(fts_score) OVER () > 0
-                        THEN fts_score / max(fts_score) OVER ()
-                        ELSE 0 END AS fts_n
-            FROM candidates
-        )
-        SELECT id, scope, kind, title, body, tags, metadata,
-               importance, decay_rate, created_at, updated_at, tier,
-               vec_score, fts_score, weight,
-               ((%f * vec_n + %f * fts_n) * weight) AS score
-        FROM normalised
-        ORDER BY score DESC
-        LIMIT %d
-    ]]):format(qvec_lit,
-               db.escape_literal(q),
-               weight_expr,
-               tbl(),
-               where,
-               qvec_lit,
-               math.max(50, limit),
-               wv, wf,
-               limit)
+    -- True hybrid candidate selection: the candidate pool is the UNION of the
+    -- vector-nearest rows AND the top FTS-matching rows. Retrieving by vector
+    -- distance alone (the old approach) permanently excluded rows whose match is
+    -- lexical but vector-far — including rows with a NULL embedding (FTS-only),
+    -- which sort NULLS-LAST and never entered the top-N window. The FTS leg fixes
+    -- both: lexical hits are found regardless of vector distance, and
+    -- COALESCE(...,0) gives NULL-embedding rows a real (0) vector score so the
+    -- blend/sort is well-defined instead of NULL (which would sort first).
+    local T        = tbl()
+    local N        = math.max(50, math.floor(tonumber(limit) or 10))
+    local lim      = math.floor(tonumber(limit) or 10)
+    local qlit     = db.escape_literal(q)
+    local tsq      = "plainto_tsquery('english', " .. qlit .. ")"
+    local fts_match = "fts @@ " .. tsq
+    local fts_where = (where ~= "")
+        and (where .. " AND " .. fts_match)
+        or  ("WHERE " .. fts_match)
+    local wv_lit = ("%.6f"):format(wv)
+    local wf_lit = ("%.6f"):format(wf)
+
+    local sql =
+        "WITH vec_ids AS (" ..
+        "  SELECT id FROM " .. T .. " " .. where ..
+        "  ORDER BY embedding <=> " .. qvec_lit .. " LIMIT " .. N ..
+        "), fts_ids AS (" ..
+        "  SELECT id FROM " .. T .. " " .. fts_where ..
+        "  ORDER BY ts_rank_cd(fts, " .. tsq .. ") DESC LIMIT " .. N ..
+        "), cand_ids AS (" ..
+        "  SELECT id FROM vec_ids UNION SELECT id FROM fts_ids" ..
+        "), candidates AS (" ..
+        "  SELECT id, scope, kind, title, body, tags, metadata," ..
+        "         importance, decay_rate, created_at, updated_at, tier," ..
+        "         COALESCE(1 - (embedding <=> " .. qvec_lit .. "), 0) AS vec_score," ..
+        "         ts_rank_cd(fts, " .. tsq .. ") AS fts_score," ..
+        "         (" .. weight_expr .. ") AS weight" ..
+        "  FROM " .. T .. " WHERE id IN (SELECT id FROM cand_ids)" ..
+        "), normalised AS (" ..
+        "  SELECT *," ..
+        "         CASE WHEN max(vec_score) OVER () > 0" ..
+        "              THEN vec_score / max(vec_score) OVER () ELSE 0 END AS vec_n," ..
+        "         CASE WHEN max(fts_score) OVER () > 0" ..
+        "              THEN fts_score / max(fts_score) OVER () ELSE 0 END AS fts_n" ..
+        "  FROM candidates" ..
+        ") SELECT id, scope, kind, title, body, tags, metadata," ..
+        "         importance, decay_rate, created_at, updated_at, tier," ..
+        "         vec_score, fts_score, weight," ..
+        "         ((" .. wv_lit .. " * vec_n + " .. wf_lit .. " * fts_n) * weight) AS score" ..
+        "  FROM normalised ORDER BY score DESC LIMIT " .. lim
 
     local rows, qerr = db.query(sql)
     if not rows then return nil, "search: db error: " .. tostring(qerr) end
@@ -1394,23 +1563,27 @@ end
 -- FTS so lexically-relevant rows survive the cap; Lua computes cosine,
 -- normalises both signals, blends, applies the importance/decay weight,
 -- sorts, and trims. Returns rows in the same shape as the pgvector path.
-local function _search_bruteforce(q, qvec, scope, kind, limit, wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max)
+local function _search_bruteforce(q, qvec, scope, kind, limit, wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max, metadata_filter)
     local cap = tonumber(cfg.bruteforce_candidate_limit) or 1000
 
     local conds = {}
-    if scope    then table.insert(conds, "scope = " .. db.escape_literal(scope)) end
+    do local sc = _scope_sql(scope); if sc then table.insert(conds, sc) end end
     if kind     then table.insert(conds, "kind  = " .. db.escape_literal(kind))  end
     if since_sql then table.insert(conds, "updated_at >= " .. since_sql) end
     if until_sql then table.insert(conds, "updated_at <  " .. until_sql) end
     if tier_min then table.insert(conds, "tier >= " .. math.max(0, math.min(3, math.floor(tonumber(tier_min))))) end
     if tier_max then table.insert(conds, "tier <= " .. math.max(0, math.min(3, math.floor(tonumber(tier_max))))) end
+    local meta_conds = _build_metadata_conds(metadata_filter)
+    if meta_conds then for _, c in ipairs(meta_conds) do table.insert(conds, c) end end
     local where = #conds > 0 and ("WHERE " .. table.concat(conds, " AND ")) or ""
 
     -- When the LSH index is active for this scope, pre-filter candidates by
     -- vector proximity instead of doing a full-table FTS-ranked scan.
     -- LSH is only active for single-scope searches on the bruteforce backend.
     local lsh_sql
-    local lsh_idx = scope and _get_lsh(scope, qvec) or nil
+    -- LSH is per-scope; for a multi-scope SET fall through to the full FTS-ranked
+    -- scan (which honours scope = ANY(...) via `where`).
+    local lsh_idx = (type(scope) == "string") and _get_lsh(scope, qvec) or nil
     if lsh_idx then
         local cand_ids = lsh_idx:query(qvec, cap)
         if #cand_ids > 0 then
@@ -1509,7 +1682,7 @@ local function _search_temporal(scope, kind, window, fetch_limit, ignore_decay, 
     local half_secs  = math.max(1, window.half_secs)
 
     local conds = {}
-    if scope    then table.insert(conds, "scope = " .. db.escape_literal(scope)) end
+    do local sc = _scope_sql(scope); if sc then table.insert(conds, sc) end end
     if kind     then table.insert(conds, "kind  = " .. db.escape_literal(kind))  end
     if tier_min then table.insert(conds, "tier >= " .. math.max(0, math.min(3, math.floor(tonumber(tier_min))))) end
     if tier_max then table.insert(conds, "tier <= " .. math.max(0, math.min(3, math.floor(tonumber(tier_max))))) end
@@ -1558,10 +1731,33 @@ local function _search_temporal(scope, kind, window, fetch_limit, ignore_decay, 
     return rows
 end
 
+-- Resolve an effective scope SET from context parts, highest-authority first
+-- (org directives → project → personal → global). Nils/blanks skipped, duplicates
+-- removed. Ranking across the set is by tier/importance (not this order), so the
+-- order is only for readability. This is the seam Phase 12 (federation) plugs a
+-- git/identity-derived context into; today callers pass the parts explicitly.
+-- Pass the result as `search{ scopes = store.resolve_scopes{...}, query = ... }`.
+function M.resolve_scopes(ctx)
+    ctx = ctx or {}
+    local seen, out = {}, {}
+    local function add(s) if s and s ~= "" and not seen[s] then seen[s] = true; out[#out + 1] = s end end
+    add(ctx.org); add(ctx.repo); add(ctx.user); add(ctx.global)
+    return out
+end
+
 function M.search(args)
     assert(args and args.query, "search: query is required")
     local q     = args.query
     local scope = args.scope
+    -- Hierarchical multi-scope: `args.scopes` (a set) searches the UNION of scopes
+    -- with tier-priority (higher-tier memories surface first via the existing
+    -- weight); `args.scope` (single) is unchanged. `scope_arg` feeds the search
+    -- legs; `scope` stays the PRIMARY scope for feedback logging / callers.
+    local scope_arg = scope
+    if type(args.scopes) == "table" and #args.scopes > 0 then
+        scope_arg = args.scopes
+        if not scope or scope == "" then scope = args.scopes[1] end
+    end
     local kind  = args.kind
     local limit = math.min(tonumber(args.limit) or 10, 100)
     local ignore_decay = args.ignore_decay and true or false
@@ -1587,6 +1783,7 @@ function M.search(args)
     -- Optional tier bounds for structural filtering.
     local tier_min = (args.tier_min ~= nil) and tonumber(args.tier_min) or nil
     local tier_max = (args.tier_max ~= nil) and tonumber(args.tier_max) or nil
+    local metadata_filter = (type(args.metadata_filter) == "table") and args.metadata_filter or nil
 
     local qvec, err = embed.embed(q)
     if not qvec then return nil, err end
@@ -1612,11 +1809,11 @@ function M.search(args)
 
     local rows
     if _backend == "bruteforce" then
-        rows, err = _search_bruteforce(q, qvec, scope, kind, rrf_fetch,
-            wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max)
+        rows, err = _search_bruteforce(q, qvec, scope_arg, kind, rrf_fetch,
+            wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max, metadata_filter)
     else
-        rows, err = _search_pgvector(q, qvec, scope, kind, rrf_fetch,
-            wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max)
+        rows, err = _search_pgvector(q, qvec, scope_arg, kind, rrf_fetch,
+            wv, wf, ignore_decay, since_sql, until_sql, tier_min, tier_max, metadata_filter)
     end
     if not rows then return nil, err end
 
@@ -1624,7 +1821,7 @@ function M.search(args)
     -- all legs with RRF.  Fall back to weighted-blend when no temporal
     -- expression was found (unchanged behaviour for existing queries).
     if twindow then
-        local t_rows = _search_temporal(scope, kind, twindow, rrf_fetch, ignore_decay, tier_min, tier_max)
+        local t_rows = _search_temporal(scope_arg, kind, twindow, rrf_fetch, ignore_decay, tier_min, tier_max)
         -- Apply temporal proximity boost to the baseline rows, then re-sort
         -- so that RRF uses the boost-adjusted rank (not the raw vector rank).
         local alpha = (cfg.temporal_alpha) or 0.2
@@ -1714,6 +1911,8 @@ function M.search(args)
         local rerank = require("luamemo.rerank")
         local reranked, rerr = rerank.rerank(q, rows, {
             limit             = limit,
+            rerank_scope      = scope,   -- primary scope → per-scope learned weights (Phase 11)
+            rerank_weights    = args.rerank_weights,
             rerank_top_n      = args.rerank_top_n,
             rerank_adapter    = args.rerank_adapter,
             rerank_model      = args.rerank_model,
@@ -1730,6 +1929,23 @@ function M.search(args)
             final_rows = _trim(rows, limit)
         else
             final_rows = reranked
+        end
+    end
+
+    -- Phase 3: feedback capture. When enabled, append-only log the retrieval
+    -- event (query + candidate memory ids in final rank order) so a later
+    -- reinforcement on any candidate can form a (query, positive, negatives)
+    -- training triple. Off by default; fail-silent; never affects results.
+    if cfg.feedback_enabled and args.query and args.query ~= "" then
+        local ids = {}
+        for i = 1, #final_rows do
+            local r = final_rows[i]
+            if r and r.id then ids[#ids + 1] = r.id end
+        end
+        if #ids > 0 then
+            pcall(function()
+                require("luamemo.feedback").log_retrieval(scope, args.query, ids)
+            end)
         end
     end
 

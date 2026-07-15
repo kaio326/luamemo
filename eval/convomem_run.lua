@@ -127,6 +127,12 @@ elseif args.embedder == "tei" then
     setup_opts.embed_dim        = tonumber(os.getenv("TEI_DIM") or "1024")
     -- CPU TEI can take 30-90 s per request; override the library default.
     setup_opts.embed_timeout_ms = tonumber(os.getenv("EMBED_TIMEOUT_MS") or "120000")
+elseif args.embedder == "gguf" then
+    -- In-process GGUF embedder (EmbeddingGemma via LuaJIT FFI). Run under `luajit`.
+    setup_opts.embedder_local = "gguf_ffi"
+    setup_opts.embedder_model = os.getenv("MEMO_GGUF_MODEL")
+        or (os.getenv("HOME") .. "/models/embeddinggemma-300M-Q8_0.gguf")
+    setup_opts.embed_dim      = tonumber(os.getenv("MEMO_GGUF_DIM") or "768")
 else
     io.stderr:write("unknown --embedder: " .. tostring(args.embedder) .. "\n")
     os.exit(2)

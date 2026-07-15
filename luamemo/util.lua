@@ -235,4 +235,23 @@ function M.table_exists(name)
     return false
 end
 
+-- ---------------------------------------------------------------------------
+-- DJB2 polynomial hash (pure Lua 5.1, no bit library) mod 2^32. The project's
+-- checksum of choice for change-detection and dedup markers. NOTE: this is NOT
+-- the embedder's hash (luamemo.embedders.hash uses a different modulus and must
+-- stay byte-stable for stored embeddings — do not route it through here).
+-- ---------------------------------------------------------------------------
+local _DJB2_MASK = 4294967296  -- 2^32
+
+function M.djb2(s)
+    local h = 5381
+    for i = 1, #s do h = (h * 33 + s:byte(i)) % _DJB2_MASK end
+    return h
+end
+
+-- Zero-padded 8-char lowercase hex of djb2(s).
+function M.djb2_hex(s)
+    return ("%08x"):format(M.djb2(s))
+end
+
 return M

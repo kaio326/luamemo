@@ -10,8 +10,13 @@ tools:
   - luamemo/memory_promote
   - luamemo/memory_reconnect
   - luamemo/memory_status
+  - luamemo/memory_sense
   - luamemo/memory_diary_write
   - luamemo/memory_diary_read
+  - luamemo/index_search
+  - luamemo/index_outline
+  - luamemo/index_explore
+  - luamemo/index_status
 model: "Claude Sonnet 4.6 (copilot)"
 argument-hint: "Project name or context to load"
 ---
@@ -83,9 +88,27 @@ Call `memory_status` immediately before doing anything else.
 
 - Write a memory after every architectural decision, bug fix, or agreed fact.
 - Use `kind="decision"` or `kind="fact"`, `importance` 0.7–0.9 for durable facts.
-- Use `scope="repo:<project>"` to namespace project memories.
+- Use `scope="repo:<project>"` to namespace project memories; `user:<name>` for
+  personal preferences that follow you across projects; `global` for universal facts.
 - Search before writing: `memory_search` with the current task may surface an
-  existing answer you already stored.
+  existing answer you already stored. To search a hierarchy at once, pass
+  `scopes=["repo:x","user:me","global"]` — higher-tier memories surface first.
+
+### Working with code (codebase map)
+
+If `index_status` shows a map exists for the project, use it before searching or
+reading files — it is the cheaper path to the same information:
+
+- **Finding code**: `index_search` returns `path:line` locations, not file dumps.
+  Prefer it over grep/read when locating a function, config, or concept.
+- **Before editing a file**: `index_outline <path>` lists what the file defines
+  so you know its shape without reading it whole.
+- **Before refactoring**: `index_explore <symbol>` shows callers and callees.
+- **After changing code**: suggest `memo index update` to refresh the map.
+
+The map locates and orients; it does not replace reading the current file on disk
+before you edit it (it can lag recent edits). If `index_status` reports no map,
+just work with normal file tools.
 
 ## At session end
 
@@ -93,3 +116,6 @@ Call `memory_status` immediately before doing anything else.
   (`kind="plan"`, `importance=0.8`).
 - If a `session:<uuid>` scope was used, call `memory_promote` to fold it into
   the long-term project scope before closing.
+- Call `memory_sense` with the recent turns (`[{role, text}]`) so memory learns
+  from the session — it reinforces the memories the user corrected, ruled on, or
+  confirmed. Idempotent; do it whenever corrected, not just at the end.

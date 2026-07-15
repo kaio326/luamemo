@@ -52,32 +52,8 @@ local function ensure_setup()
         -- but it sets up config defaults. Silently skip if unavailable.
         return
     end
-    local cfg = {}
-    -- Embedder: HTTP embedder takes priority (MEMO_EMBEDDER_URL set).
-    -- Falls back to a local embedder selected by MEMO_EMBEDDER, defaulting to "hash".
-    local embedder_url = os.getenv("MEMO_EMBEDDER_URL")
-    if embedder_url and embedder_url ~= "" then
-        cfg.embedder_url     = embedder_url
-        local ea = os.getenv("MEMO_EMBEDDER_ADAPTER")
-        cfg.embedder_adapter = (ea and ea ~= "") and ea or "generic"
-        local em = os.getenv("MEMO_EMBEDDER_MODEL")
-        if em and em ~= "" then cfg.embedder_model = em end
-    else
-        local el = os.getenv("MEMO_EMBEDDER")
-        cfg.embedder_local = (el and el ~= "") and el or "hash"
-    end
-    local embed_dim = tonumber(os.getenv("MEMO_EMBED_DIM"))
-    if embed_dim then cfg.embed_dim = embed_dim end
-    -- Propagate MEMO_DB_URL into config so db.lua can read it from lib_cfg.
-    local db_url = os.getenv("MEMO_DB_URL")
-    if db_url and db_url ~= "" then cfg.db_url = db_url end
-    -- Secrets config from env vars.
-    local secrets_file = os.getenv("MEMO_SECRETS_FILE")
-    if secrets_file and secrets_file ~= "" then cfg.secrets_file = secrets_file end
-    local master_key_env = os.getenv("MEMO_MASTER_KEY_ENV")
-    if master_key_env then cfg.master_key_env = master_key_env end
-    local master_key = os.getenv("MEMO_MASTER_KEY")
-    if master_key and master_key ~= "" then cfg.master_key = master_key end
+    -- Shared MEMO_* → config construction (incl. secrets); see cli._common.
+    local cfg = require("luamemo.cli._common").config_from_env({ secrets = true })
     local ok2, err = pcall(luamemo.setup, cfg)
     if not ok2 then
         io.stderr:write("luamemo.setup warning: " .. tostring(err) .. "\n")
@@ -182,6 +158,7 @@ handlers["search"] = function(p)
     local rows, err = store.search({
         query        = p.q or p.query,
         scope        = p.scope,
+        scopes       = (type(p.scopes) == "table") and p.scopes or nil,
         limit        = tonumber(p.limit),
         min_score    = tonumber(p.min_score),
         kind         = p.kind,
@@ -299,6 +276,41 @@ handlers["digest"] = function(p)
     local result = d.run(scope, {
         dry_run   = to_bool(p.dry_run),
         threshold = tonumber(p.threshold),
+    })
+    out({ ok = true, result = result })
+end
+
+-- sense: signal capture (Phase 9). The agent relays a session's turns; the
+-- sensing pipeline detects corrections/commands/praise and records reinforcements
+-- (which feed the tier system AND the learned-from-usage triples). luamemo cannot
+-- read the chat itself, so the caller passes `turns` = [{role, text}, ...].
+handlers["sense"] = function(p)
+    local scope = p.scope
+    if not scope or scope == "" then return err_out("sense: scope required") end
+    if type(p.turns) ~= "table" then return err_out("sense: turns array required") end
+    local sensing = require("luamemo.sensing")
+    local result = sensing.process(scope, p.turns, {
+        generative     = (p.generative == true),
+        min_confidence = tonumber(p.min_confidence),
+        min_similarity = tonumber(p.min_similarity),
+        delta_scale    = tonumber(p.delta_scale),
+    })
+    out({ ok = true, result = result })
+end
+
+-- learn: per-scope promotion harness (Phase 11). Harvests feedback for the scope,
+-- trains the reranker, gates on a held-out split, and promotes the new weights
+-- only if they beat the incumbent — else rejects. No-op until enough signal.
+handlers["learn"] = function(p)
+    local scope = p.scope
+    if not scope or scope == "" then return err_out("learn: scope required") end
+    local promote = require("luamemo.promote")
+    local result = promote.run(scope, {
+        min_samples = tonumber(p.min_samples),
+        margin      = tonumber(p.margin),
+        gate_frac   = tonumber(p.gate_frac),
+        epochs      = tonumber(p.epochs),
+        dry_run     = (p.dry_run == true),
     })
     out({ ok = true, result = result })
 end
@@ -535,6 +547,74 @@ handlers["context"] = function(p)
 
     lines[#lines+1] = "=== END CONTEXT ==="
     -- Emit as JSON wrapper with a "text" field so cli/memo can extract it.
+    out({ ok = true, text = table.concat(lines, "\n") })
+end
+
+-- brief: a tiny, no-query session-start digest (~5 lines) meant to be injected
+-- automatically (e.g. by a SessionStart hook). Tells the agent what memory and
+-- what codebase map exist for the project, and which tools to reach for — so it
+-- knows luamemo is available without being asked. Fail-soft: on any error it
+-- still returns a minimal block rather than throwing.
+handlers["brief"] = function(p)
+    local scope = (type(p.scope) == "string" and p.scope ~= "") and p.scope or nil
+    local lines = { "=== LUAMEMO ===" }
+
+    local okq, dberr = pcall(function()
+        local db    = require("luamemo.db")
+        local store = require("luamemo.store")
+        local tbl   = store.table_name()
+
+        -- Memory summary for the scope.
+        if scope then
+            local esc = db.escape_literal(scope)
+            local cnt = db.query("SELECT COUNT(*) AS n FROM " .. tbl .. " WHERE scope = " .. esc)
+            local n   = cnt and cnt[1] and tonumber(cnt[1].n) or 0
+            local rows = db.query("SELECT title FROM " .. tbl .. " WHERE scope = " .. esc
+                .. " AND tier >= 1 ORDER BY created_at DESC LIMIT 3")
+            local titles = {}
+            for _, r in ipairs(rows or {}) do
+                if r.title and r.title ~= "" then
+                    -- Show the full title up to a generous cap; only ellipsize
+                    -- when genuinely longer, so a mid-word cut doesn't read as
+                    -- "incomplete — go fetch the rest" (which makes the agent
+                    -- re-query and defeats the digest's purpose).
+                    local t = r.title
+                    if #t > 110 then t = t:sub(1, 110):gsub("%s+%S*$", "") .. "…" end
+                    titles[#titles + 1] = '"' .. t .. '"'
+                end
+            end
+            local latest = (#titles > 0) and (" · latest: " .. table.concat(titles, ", ")) or ""
+            lines[#lines + 1] = ("memory: %s — %d memories%s"):format(scope, n, latest)
+        else
+            lines[#lines + 1] = "memory: pass --scope repo:<name> to summarise a project"
+        end
+
+        -- Codebase map summary (derive codeindex scope from the memory scope).
+        local project = scope and scope:gsub("^%a+:", "") or "default"
+        if project == "" then project = "default" end
+        local map_scope = "codeindex:" .. project
+        local index  = require("luamemo.index")
+        local counts = index.status({ scope = map_scope })
+        local mapped = counts and ((counts.file or 0) + (counts.symbol or 0)) > 0
+        if mapped then
+            lines[#lines + 1] = ("map:    %s — %d files / %d symbols indexed"):format(
+                map_scope, counts.file or 0, counts.symbol or 0)
+            lines[#lines + 1] = "tools:  memory_search (decisions/facts) · "
+                .. "index_search (find code) · index_outline <file> before editing"
+        else
+            lines[#lines + 1] = ("map:    none for %s — build with: memo index ingest"):format(map_scope)
+            lines[#lines + 1] = "tools:  memory_search (decisions/facts)"
+        end
+    end)
+
+    if not okq then
+        lines[#lines + 1] = "status: memory backend unreachable (check MEMO_DB_URL)"
+        if os.getenv("MEMO_DEBUG") == "1" then
+            lines[#lines + 1] = "debug: " .. tostring(dberr)
+        end
+    end
+
+    lines[#lines + 1] = "=== END ==="
     out({ ok = true, text = table.concat(lines, "\n") })
 end
 

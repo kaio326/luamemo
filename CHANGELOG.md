@@ -1,5 +1,167 @@
 # Changelog
 
+## [0.4.0] — unreleased
+
+Major unreleased release covering two arcs: the codebase index / agent-delivery
+layer + hybrid-search rewrite (below), and the learned-from-usage / in-process
+embedder / self-maintenance work described here.
+
+### Learned-from-usage, in-process embedder, self-maintenance
+
+A large arc that makes retrieval **learn from real usage** (opt-in, with
+zero-regression guardrails), adds an **in-process semantic embedder**, and lets
+memory **maintain itself** without an external trigger.
+
+- **In-process semantic embedder (`gguf_ffi`).** Runs EmbeddingGemma directly via
+  a tiny LuaJIT-FFI shim over llama.cpp (`luamemo/embedders/native/gguf_shim.c`) —
+  bge-m3-class recall on CPU, no HTTP sidecar. `memo calibrate` recommends it when
+  the host can build it (LuaJIT + C toolchain), persists `MEMO_EMBEDDER=gguf_ffi`,
+  and launches `luajit`; `--no-gguf` opts out. Optional GPU offload via
+  `MEMO_GGUF_NGL` / `MEMO_GEN_NGL` (activates when llama.cpp is built with CUDA).
+  The `openai` adapter is reframed as `openai_compatible` (serves OpenAI or any
+  self-hosted vLLM / LM Studio / TEI endpoint); `openai` kept as an alias.
+- **Learned-from-usage retrieval.** Opt-in `feedback_enabled`: retrieval events and
+  reinforcements (`lm_reinforcements`) become training triples for a pure-Lua
+  **learned reranker** and **projection** (`luamemo.rerank_train` /
+  `projection_train`). Corrections/outcomes label the data — raw frequency never
+  does. Frozen base models; only small learned layers adapt.
+- **Retrieval-miss sensor** (migration 011, `miss` event type). A "miss" = retrieval
+  failed to surface a needed memory (the opposite of a content mistake): detected
+  automatically from near-duplicate writes and from corrections whose target was
+  never retrieved. A miss bumps the memory's importance (more findable next time)
+  and trains the ranker — it never diminishes the memory.
+- **Per-scope promotion harness** (migration 013; `luamemo.promote` +
+  `learner_store`). `memo learn <scope>` harvests feedback → trains → evaluates on a
+  **held-out gate** → promotes the new weights only if they beat the incumbent, else
+  rejects; weights are versioned per-scope in the DB with rollback + an audit log
+  (`lm_promotion_runs`). The reranker loads a scope's own promoted weights at search
+  time.
+- **Signal capture.** `memory_sense` MCP tool + `memo sense` CLI relay a session's
+  turns (luamemo can't read chat) into reinforcements — explicit-pattern heuristics
+  always, plus an optional in-process instruct model (`MEMO_GEN_MODEL`, gemma-3) for
+  implicit signals (experimental, precision-first). Idempotent.
+- **Self-maintaining digest** (migration 012, `lm_digest_state`). A debounced
+  auto-digest piggybacks on writes (`auto_digest_enabled`, enabled by `memo
+  calibrate`) so tier promotion / consolidation / decay run without an agent or
+  scheduler calling `memo digest`. Race-safe (atomic per-scope claim).
+- **Hierarchical multi-scope search.** `store.search{ scopes = {…} }` (and MCP
+  `memory_search.scopes`) searches a set of scopes as one union; higher-tier
+  memories (e.g. org directives) surface first via the existing weight.
+  `store.resolve_scopes{org,repo,user,global}` composes the effective set.
+- **Fix:** `memo`'s interpreter selection now prefers LuaJIT when
+  `MEMO_EMBEDDER=gguf_ffi`, so every embedder-backed CLI command works under the
+  in-process embedder (previously failed under PUC lua5.1's missing FFI).
+- Env bridge for the opt-in switches (`MEMO_FEEDBACK_ENABLED`, `MEMO_AUTO_DIGEST`,
+  `MEMO_AUTO_DIGEST_INTERVAL`, `MEMO_MISS_THRESHOLD`), shared by the api/CLI and MCP.
+
+### Codebase index, agent delivery & hybrid-search rewrite
+
+A whole-repository **codebase index** plus an **agent-delivery layer** (MCP tools
++ auto-injected session digest), and a **hybrid-search rewrite** that improves
+lexical recall for all searches.
+
+- **Codebase index (`luamemo.index` / `memo index`).** Indexes a repository into
+  queryable memory rows under `codeindex:<project>` scopes:
+  - `kind="file"` (one per tracked file), `kind="symbol"` (functions/classes/
+    methods), `kind="dependency"` (import/require edges), `kind="diff"` (git-diff
+    hunks). Symbols carry `path`, `line`, `symbol_type`, `exported`, `arity`, etc.
+  - **Whole-repo by default** — every text file (any language, plus extensionless
+    files) gets a `file` row; symbols are extracted where a parser exists.
+  - **Multi-language symbols**: pure-Lua pattern parsers for Lua, Python and
+    JavaScript/TypeScript, dispatched by extension. **universal-ctags** enrichment
+    covers any other language when the `ctags` binary is present, with graceful
+    fallback to file-only when it is absent.
+  - **Incremental** `update` via per-file checksums (unchanged files skipped;
+    deleted files removed). File-level delete-before-write makes ingest idempotent
+    and crash-safe.
+  - **Dependency graph** mirrored into the knowledge graph (`requires` /
+    `required_by`), powering one-hop blast-radius traversal: `index.explore`.
+  - **Diff ingestion**: `memo index diff --commit SHA | --file FILE | --stdin`
+    parses unified diffs into searchable `diff` rows with symbol attribution.
+  - CLI: `memo index ingest|update|search|explore|status|invalidate|diff` with
+    `--extensions csv|*`, `--no-symbols`, `--embed-file-rows`, `--exclude`.
+
+- **MCP server: 21 tools (was 17).** Four new codebase-map tools return compact,
+  token-lean text (path:line — name (type) — doc), not full JSON:
+  `index_search`, `index_outline` (list a file's symbols before editing),
+  `index_explore` (callers/callees), `index_status`. The server now **self-locates
+  its bundled modules from its own script path** — no `LUA_PATH` needed, and a
+  stale system install can't shadow the bundled code.
+
+- **Session digest (`memo brief`) + SessionStart hook.** A tiny, fail-soft,
+  timeout-capped summary (memory count + latest titles + codebase-map size + tool
+  hints) meant to be auto-injected at session start so an agent knows what
+  persistent context exists without being asked. The plugin `hooks/hooks.json`
+  emits it as `hookSpecificOutput.additionalContext` (verified injecting into a
+  live Claude Code session).
+
+- **Hybrid-search rewrite (affects all `store.search`).** The pgvector candidate
+  pool is now the **union of the vector-nearest rows and the top FTS matches**
+  (previously vector-nearest only, then re-ranked). Lexical/FTS-only hits are now
+  found regardless of vector distance — including rows stored without an embedding.
+  `COALESCE`-guards keep NULL-embedding rows from corrupting rank order.
+
+- **Embed-cost control.** `store.write_many` accepts a per-row `no_embed` flag →
+  the row is inserted with a `NULL` embedding (no embed call), surfaced via the
+  FTS leg. The codebase index stores `file` rows FTS-only by default; their body
+  is enriched with split path words + a `defines: <symbol names>` digest so
+  path/multi-word lexical queries match. Opt back in with `--embed-file-rows`.
+
+- **Store additions**: `store.search({ metadata_filter = {…} })` (JSONB WHERE
+  predicates) and `store.delete_where({ scope, kind, metadata_filter })` (bulk
+  delete without an embed call). Skill + agent docs updated with the codebase-map
+  workflow.
+
+- **Recall benchmarks — re-run, no regression.** Per the pre-commit checklist
+  (`store.lua` changed), the LongMemEval / LoCoMo / ConvoMem hash/bruteforce
+  benchmarks were re-run (`*_hash_v040.json`; version sections added to
+  `eval/results/{longmemeval,locomo,convomem}.md`):
+
+  | benchmark (hash, bruteforce) | R@1 | R@10 | MRR | vs v0.3.2 |
+  |------------------------------|----:|-----:|----:|-----------|
+  | LongMemEval (n=500) | 54.0% | 83.4% | 0.630 | identical |
+  | LoCoMo              | 45.2% | 82.5% | 0.565 | identical |
+  | ConvoMem            | 82.5% | 96.5% | 0.890 | R@1 −0.1pp (≈1 q of 2,478; noise) |
+
+  The candidate-union rewrite is on the **pgvector** path; the brute-force path
+  (which these runs use, for continuity with the historical baseline) is
+  unchanged — so the table above is the regression guard.
+
+- **pgvector path validated (new).** Two follow-up sweeps confirm the pgvector
+  backend is sound and the hybrid rewrite is safe:
+
+  1. *Hybrid-union A/B (hash, pgvector).* Union candidate pool vs the old
+     vector-nearest-only pool: **≤0.1pp on all three benchmarks** (LME/LoCoMo/
+     ConvoMem identical to within 1 question). On prose NL-QA the vector-nearest
+     pool already contains the top-FTS rows, so the union is a no-op there; its
+     value is the FTS-only / lexically-distant case (the code index, `no_embed`
+     rows) which these prose sets don't exercise.
+
+  2. *pgvector-vs-bruteforce at real embedders* (bge-m3 1024-dim via TEI, and
+     ollama `nomic-embed-text` 768-dim), each backend pair sharing identical
+     embedder config so only storage/search differs:
+
+     | benchmark | embedder | pgvector R@1 / MRR | bruteforce R@1 / MRR | Δ R@1 |
+     |-----------|----------|-------------------:|---------------------:|------:|
+     | LoCoMo    | bge-m3   | 58.3% / 0.698 | 58.4% / 0.698 | −0.1pp |
+     | LoCoMo    | nomic    | 52.9% / 0.639 | 52.8% / 0.638 | +0.1pp |
+     | ConvoMem  | bge-m3   | 91.7% / 0.940 | 92.1% / 0.942 | −0.4pp |
+     | ConvoMem  | nomic    | 90.2% / 0.931 | 90.2% / 0.931 | −0.0pp |
+     | LME       | bge-m3   | 100% / 1.000  | 100% / 1.000  |  0.0pp |
+     | LME       | nomic    | 99.8% / 0.998 | 99.8% / 0.998 |  0.0pp |
+
+     **HNSW approximate search matches exact cosine to ≤0.4pp R@1 / 0.002 MRR**
+     across 768- and 1024-dim — the pgvector backend costs essentially no recall.
+     Full results in `eval/results/{longmemeval,locomo,convomem}.md`.
+
+  - *Eval-infra fix (`eval/sidecars/docker-compose.yml`).* The TEI bge-m3 sidecar
+    hung the full request timeout (no error) on any single input exceeding
+    `MAX_BATCH_TOKENS`; ~30% of LME oracle sessions exceed the old 4096 default.
+    Raised to 7168 (the 6 GB RTX 2060 VRAM ceiling; 8192 OOMs), added
+    `AUTO_TRUNCATE` (hang → fast 424), and capped eval bodies via
+    `EMBED_MAX_CHARS` (24000 bge-m3 / 8000 nomic). bge-m3's longest ~2% of
+    sessions are tail-truncated as a result.
+
 ## [0.3.6] — 2026-06-05
 
 - **VS Code Agent Plugin (Preview).** The luamemo repo is now a valid VS Code

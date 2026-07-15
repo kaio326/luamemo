@@ -19,6 +19,25 @@
 --   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
 --     | MEMO_DB_URL=postgresql://postgres:@127.0.0.1:5432/luamemo lua mcp/server.lua
 
+-- ---------------------------------------------------------------------------
+-- Self-locate the bundled luamemo modules. Derive the repo/plugin root from
+-- this script's own path (".../mcp/server.lua" → root) and prepend it to
+-- package.path so `require("luamemo.*")` resolves to the code shipped next to
+-- this server — no reliance on a LUA_PATH env var, and a stale system LuaRocks
+-- install can't shadow the bundled modules. Falls back to the ambient path if
+-- the root can't be derived (e.g. arg[0] unavailable).
+-- ---------------------------------------------------------------------------
+do
+    local self_path = arg and arg[0]
+    if self_path then
+        local root = self_path:gsub("\\", "/"):match("^(.-)/?mcp/[^/]+$")
+        if root then
+            if root == "" then root = "." end
+            package.path = root .. "/?.lua;" .. root .. "/?/init.lua;" .. package.path
+        end
+    end
+end
+
 local json  = require("luamemo.json")
 local util  = require("luamemo.util")
 
@@ -81,27 +100,12 @@ local function ensure_setup()
     if not ok then
         fatal("luamemo library not found — install via: luarocks install luamemo\n" .. tostring(luamemo))
     end
-    local cfg = {}
-    -- Embedder: HTTP embedder takes priority (MEMO_EMBEDDER_URL set).
-    -- Falls back to a local embedder selected by MEMO_EMBEDDER, defaulting to "hash".
-    local embedder_url = os.getenv("MEMO_EMBEDDER_URL")
-    if embedder_url and embedder_url ~= "" then
-        cfg.embedder_url     = embedder_url
-        local ea = os.getenv("MEMO_EMBEDDER_ADAPTER")
-        cfg.embedder_adapter = (ea and ea ~= "") and ea or "generic"
-        local em = os.getenv("MEMO_EMBEDDER_MODEL")
-        if em and em ~= "" then cfg.embedder_model = em end
-    else
-        local el = os.getenv("MEMO_EMBEDDER")
-        cfg.embedder_local = (el and el ~= "") and el or "hash"
-    end
-    local embed_dim = tonumber(os.getenv("MEMO_EMBED_DIM"))
-    if embed_dim then cfg.embed_dim = embed_dim end
-    if MEMO_DB_URL and MEMO_DB_URL ~= "" then cfg.db_url = MEMO_DB_URL end
-    local master_key = os.getenv("MEMO_MASTER_KEY")
-    if master_key and master_key ~= "" then cfg.master_key = master_key end
-    local secrets_file = os.getenv("MEMO_SECRETS_FILE")
-    if secrets_file and secrets_file ~= "" then cfg.secrets_file = secrets_file end
+    -- Build the config from the MEMO_* environment via the shared helper, so the
+    -- embedder / DB / secrets / learning-flag parsing lives in ONE place (the
+    -- api/CLI path uses the same). No auth=true: the MCP server makes direct,
+    -- already-trusted store calls, so auth_fn stays the deny-by-default (the tools
+    -- never consult it) and the embed probe behaviour is unchanged.
+    local cfg = require("luamemo.cli._common").config_from_env({ secrets = true })
     local pok, perr = pcall(luamemo.setup, cfg)
     if not pok then
         io.stderr:write("[luamemo-mcp] setup warning: " .. tostring(perr) .. "\n")
@@ -184,7 +188,14 @@ Tools.memory_search = {
         type = "object",
         properties = {
             query = { type = "string", description = "Natural-language query." },
-            scope = { type = "string", description = "Restrict to a scope." },
+            scope = { type = "string", description = "Restrict to a single scope." },
+            scopes = {
+                type = "array",
+                description = "Search a SET of scopes as a hierarchy (e.g. org ∪ repo ∪ user). "
+                    .. "Returns the union; higher-tier memories (e.g. org directives) surface first. "
+                    .. "Overrides `scope` when provided.",
+                items = { type = "string" },
+            },
             kind  = { type = "string", description = "Restrict to a kind." },
             limit = { type = "integer", description = "Max results (default 10).", minimum = 1, maximum = 100 },
             ignore_decay = {
@@ -217,6 +228,7 @@ Tools.memory_search = {
         local rows, err = store.search({
             query        = args.query,
             scope        = scope,
+            scopes       = (type(args.scopes) == "table" and #args.scopes > 0) and args.scopes or nil,
             kind         = args.kind,
             limit        = tonumber(args.limit),
             ignore_decay = to_bool(args.ignore_decay),
@@ -453,6 +465,59 @@ Tools.memory_digest = {
         local result = digest.run(scope, {
             dry_run   = to_bool(args.dry_run),
             threshold = tonumber(args.threshold),
+        })
+        return { ok = true, result = result }
+    end,
+}
+
+Tools.memory_sense = {
+    description = "Capture feedback signals from the recent conversation and record them as "
+        .. "reinforcements on the memories they concern — this is how memory LEARNS from use. "
+        .. "luamemo cannot read the chat itself, so the agent RELAYS the recent turns as "
+        .. "{role, text} objects (oldest first). Heuristics detect explicit corrections "
+        .. "(\"no, we use X not Y\"), standing commands (\"always/never …\"), and praise; each is "
+        .. "attributed to the nearest memory in scope and logged once (idempotent — re-relaying "
+        .. "the same turns records nothing new). Set generative=true to ALSO run the in-process "
+        .. "instruct model for implicit/paraphrased signals (opt-in; needs MEMO_GEN_MODEL + LuaJIT; "
+        .. "precision-first, so it stays quiet when unsure). Call this at a natural session boundary "
+        .. "or after the user corrects you. Returns {recorded, skipped, signals}.",
+    inputSchema = {
+        type = "object",
+        properties = {
+            turns = {
+                type = "array",
+                description = "Recent conversation turns, oldest first. Only USER turns are scanned "
+                    .. "for signals; assistant turns give context to the generative extractor.",
+                items = {
+                    type = "object",
+                    properties = {
+                        role = { type = "string", description = "'user' or 'assistant'." },
+                        text = { type = "string", description = "The turn's text." },
+                    },
+                },
+            },
+            scope = {
+                type = "string",
+                description = "Scope whose memories may be reinforced. Defaults to the server's scope.",
+            },
+            generative = {
+                type = "boolean",
+                description = "Also run the in-process generative extractor (opt-in; default false).",
+            },
+            min_similarity = {
+                type = "number", minimum = 0, maximum = 1,
+                description = "Memory-resolution floor (default 0.15). Higher = stricter attribution.",
+            },
+        },
+        required = { "turns" },
+    },
+    handler = function(args)
+        ensure_setup()
+        local sensing = require("luamemo.sensing")
+        local scope = args.scope or MEMO_SCOPE
+        local result = sensing.process(scope, args.turns or {}, {
+            generative     = to_bool(args.generative),
+            min_similarity = tonumber(args.min_similarity),
         })
         return { ok = true, result = result }
     end,
@@ -782,6 +847,137 @@ Tools.memory_diary_read = {
             }
         end
         return { agent = args.agent_name, entries = entries, total = #entries, scope = scope }
+    end,
+}
+
+-- ===========================================================================
+-- Codebase map tools (index_*) — token-lean access to the code index.
+-- Return compact text (`{ ok, text }`) instead of full rows so an agent spends
+-- ~30 tokens locating code rather than reading files or parsing JSON.
+-- ===========================================================================
+
+-- Resolve the codeindex scope for an index_* call. Explicit `scope` wins;
+-- else `codeindex:<project>` where project comes from the `project` arg or is
+-- derived from MEMO_SCOPE (strip a leading "repo:"), defaulting to "default".
+local function index_scope(args)
+    if args.scope and args.scope ~= "" then return args.scope end
+    local project = args.project
+    if not project or project == "" then
+        if MEMO_SCOPE and MEMO_SCOPE ~= "" then
+            project = MEMO_SCOPE:gsub("^repo:", "")
+        else
+            project = "default"
+        end
+    end
+    return "codeindex:" .. project
+end
+
+Tools.index_search = {
+    description = "Search the codebase MAP (symbols, files, dependencies) — call this "
+        .. "BEFORE grepping or reading files to find WHERE code lives. Returns compact "
+        .. "'path:line  name (type) — doc' lines, not file contents. Use it to locate the "
+        .. "right file/function, then read only that region. Requires a built index "
+        .. "(run `memo index ingest`).",
+    inputSchema = {
+        type       = "object",
+        properties = {
+            query   = { type = "string",  description = "Natural-language or identifier query, e.g. 'where is dedup handled'." },
+            project = { type = "string",  description = "Project name → scope codeindex:<project>. Defaults from MEMO_SCOPE." },
+            scope   = { type = "string",  description = "Explicit codeindex:<project> scope (overrides project)." },
+            kind    = { type = "string",  description = "Restrict to 'symbol', 'file', 'dependency', or 'diff'." },
+            limit   = { type = "integer", description = "Max results (default 15, max 50).", minimum = 1, maximum = 50 },
+        },
+        required = { "query" },
+    },
+    handler = function(args)
+        ensure_setup()
+        local index = require("luamemo.index")
+        local rows, err = index.search(args.query, {
+            scope = index_scope(args),
+            kind  = args.kind,
+            limit = math.max(1, math.min(math.floor(tonumber(args.limit) or 15), 50)),
+        })
+        if not rows then return nil, err end
+        return { ok = true, text = index.format.results(rows) }
+    end,
+}
+
+Tools.index_outline = {
+    description = "List everything defined in ONE file (symbol names, line numbers, one-line "
+        .. "docs) — call before editing a file instead of reading it whole. Returns a compact "
+        .. "outline; the file on disk remains the source of truth to read before writing.",
+    inputSchema = {
+        type       = "object",
+        properties = {
+            path    = { type = "string", description = "Repo-relative file path, e.g. 'luamemo/store.lua'." },
+            project = { type = "string", description = "Project name → scope codeindex:<project>. Defaults from MEMO_SCOPE." },
+            scope   = { type = "string", description = "Explicit codeindex:<project> scope (overrides project)." },
+        },
+        required = { "path" },
+    },
+    handler = function(args)
+        ensure_setup()
+        local index = require("luamemo.index")
+        local res, err = index.outline(args.path, { scope = index_scope(args) })
+        if not res then return nil, err end
+        return { ok = true, text = index.format.outline(res.file, res.symbols) }
+    end,
+}
+
+Tools.index_explore = {
+    description = "Impact/blast-radius query over the dependency graph: given a query, return "
+        .. "matched symbols PLUS the modules that depend on them (callers) and that they depend "
+        .. "on (callees). Use before refactoring to see what a change touches. One hop.",
+    inputSchema = {
+        type       = "object",
+        properties = {
+            query   = { type = "string",  description = "Symbol or concept to explore, e.g. 'store.write'." },
+            project = { type = "string",  description = "Project name → scope codeindex:<project>. Defaults from MEMO_SCOPE." },
+            scope   = { type = "string",  description = "Explicit codeindex:<project> scope (overrides project)." },
+            limit   = { type = "integer", description = "Max matched symbols before expansion (default 10, max 30).", minimum = 1, maximum = 30 },
+        },
+        required = { "query" },
+    },
+    handler = function(args)
+        ensure_setup()
+        local index = require("luamemo.index")
+        local res, err = index.explore(args.query, {
+            scope = index_scope(args),
+            limit = math.max(1, math.min(math.floor(tonumber(args.limit) or 10), 30)),
+        })
+        if not res then return nil, err end
+        return { ok = true, text = index.format.explore(res) }
+    end,
+}
+
+Tools.index_status = {
+    description = "Report whether a codebase map exists for this project and its size "
+        .. "(file / symbol / dependency / diff row counts). Call at session start to learn "
+        .. "if index_search/index_outline are available.",
+    inputSchema = {
+        type       = "object",
+        properties = {
+            project = { type = "string", description = "Project name → scope codeindex:<project>. Defaults from MEMO_SCOPE." },
+            scope   = { type = "string", description = "Explicit codeindex:<project> scope (overrides project)." },
+        },
+    },
+    handler = function(args)
+        ensure_setup()
+        local index = require("luamemo.index")
+        local scope = index_scope(args)
+        local counts, err = index.status({ scope = scope })
+        if not counts then return nil, err end
+        local total = (counts.file or 0) + (counts.symbol or 0)
+            + (counts.dependency or 0) + (counts.diff or 0)
+        local text
+        if total == 0 then
+            text = "No codebase map for " .. scope .. ". Build one with: memo index ingest"
+        else
+            text = ("codebase map %s — files=%d symbols=%d dependencies=%d diffs=%d"):format(
+                scope, counts.file or 0, counts.symbol or 0,
+                counts.dependency or 0, counts.diff or 0)
+        end
+        return { ok = true, text = text, counts = counts, scope = scope }
     end,
 }
 

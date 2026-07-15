@@ -1,13 +1,10 @@
 {
-  "_note": "LUA_PATH puts plugin-root first so luamemo.* resolves from the cloned repo. The trailing ;; appends the system LuaRocks path, which is required for pgmoon, luasocket, and cjson (not bundled). Plugin-root entries win for luamemo.* because they appear first.",
+  "_note": "The MCP server self-locates its bundled luamemo modules from its own script path (see the bootstrap at the top of mcp/server.lua), so no LUA_PATH is needed and a stale system LuaRocks install cannot shadow them. pgmoon/luasocket/cjson still resolve via the default (system LuaRocks) package path. ${CLAUDE_PLUGIN_ROOT} points at the installed plugin directory. For a bare dev clone opened as a project WITHOUT installing the plugin (so ${CLAUDE_PLUGIN_ROOT} is unset), register the server with an absolute path instead: claude mcp add luamemo -s local --env MEMO_DB_URL=... -- lua5.1 <repo>/mcp/server.lua",
   "mcpServers": {
     "luamemo": {
       "command": "lua5.1",
       "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/server.lua"],
-      "envFile": "${env:HOME}/.luamemorc",
-      "env": {
-        "LUA_PATH": "${CLAUDE_PLUGIN_ROOT}/?.lua;${CLAUDE_PLUGIN_ROOT}/?/init.lua;;"
-      }
+      "envFile": "${env:HOME}/.luamemorc"
     }
   }
 }

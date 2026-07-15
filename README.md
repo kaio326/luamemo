@@ -38,13 +38,32 @@ pgvector is optional — the default backend runs on any Postgres 15+.
   zero network, zero Python, zero model files, zero new dependencies.
   Latency is microseconds.
 - **Embedder-agnostic upgrade path**: when you outgrow lexical similarity,
-  swap to **Ollama**, **OpenAI**, or any HTTP service that returns a JSON
-  vector — without touching the schema, API, or clients. See
+  swap to **Ollama**, **OpenAI-compatible** endpoints, or any HTTP service that
+  returns a JSON vector — without touching the schema, API, or clients. See
   [EMBEDDERS.md](EMBEDDERS.md) for the 5-minute switch and the dim-mismatch trap,
   [eval/results/recall_bench.md](eval/results/recall_bench.md) for a
   measured hash-vs-Ollama recall comparison on a synthetic corpus, and
   [eval/results/longmemeval.md](eval/results/longmemeval.md) for the
   full 500-question LongMemEval `_s` retrieval-recall run.
+- **In-process semantic embedder (no sidecar)**: an optional `gguf_ffi` embedder
+  runs **EmbeddingGemma** directly in the process via a tiny LuaJIT-FFI shim over
+  llama.cpp — bge-m3-class recall, on CPU, no HTTP service. `memo calibrate`
+  recommends it automatically when the host can build it (LuaJIT + a C toolchain);
+  `--no-gguf` opts out. It is a swappable default, not a hard dependency — the
+  pure-Lua `hash` embedder remains the zero-setup fallback.
+- **Learns from usage (opt-in)**: with `feedback_enabled`, luamemo captures
+  corrections/commands/praise from your sessions and *retrieval misses* (a memory
+  that should have surfaced but didn't), then a per-scope **promotion harness**
+  (`memo learn <scope>`) trains a learned reranker and promotes it **only if it
+  beats the incumbent on a held-out gate** — so retrieval improves over time with
+  zero-regression guardrails. The base models stay frozen; only small learned
+  layers adapt. See [Learned-from-usage](#learned-from-usage) below.
+- **Self-maintaining**: `memo calibrate` enables a debounced auto-digest that
+  piggybacks on writes, so tier promotion / consolidation / decay run without any
+  agent or scheduler having to call `memo digest`.
+- **Hierarchical scopes**: search a *set* of scopes at once (`scopes = {org, repo,
+  user}`) and higher-tier memories (e.g. org directives) surface first across the
+  union — the foundation for multi-project and org-shared memory.
 - **Auth-agnostic**: you supply an `auth_fn(self) -> bool`. The library never
   assumes a session model, role table, or CSRF mechanism.
 - **Scoped**: every memory has a `scope` (`global`, `repo:<name>`,
@@ -60,18 +79,39 @@ pgvector is optional — the default backend runs on any Postgres 15+.
 - **Built-in reranker**: opt-in second pass over the hybrid top-N
   using `noop` (lexical), `ollama`, or `openai` adapters. Lifted R@1
   by **+12 pts** on LongMemEval `_s` (n=50) at ~4 % overhead with the
-  free `noop` adapter. See [RETRIEVAL_TUNING.md §4](RETRIEVAL_TUNING.md).
+  free `noop` adapter. A pure-Lua **learned** reranker can also be trained
+  per-scope from usage and gated-promoted (see Learned-from-usage). See
+  [RETRIEVAL_TUNING.md §4](RETRIEVAL_TUNING.md).
 - **Tiny surface**: one `setup()` call, one `routes.register()` call, six
   HTTP endpoints, six Lua functions.
-- **CLI included**: `memo write`, `memo search`, `memo recent` from any shell.
+- **CLI included**: `memo write`, `memo search`, `memo recent`, plus
+  `memo sense` / `memo learn` for the learn-from-usage loop, from any shell.
 - **MCP-native**: a pure-Lua [Model Context Protocol](https://modelcontextprotocol.io/)
-  stdio server lets Claude Desktop, Cursor, Continue.dev, and Copilot Agent Mode
-  read/write memories directly. See [`mcp/README.md`](mcp/README.md).
+  stdio server (22 tools) lets Claude Desktop, Cursor, Continue.dev, and Copilot
+  Agent Mode read/write memories, **query the codebase index**, and feed the
+  learn-from-usage loop (`memory_sense`) directly. See
+  [`mcp/README.md`](mcp/README.md).
+- **Codebase index**: `memo index` maps a whole repository into queryable memory
+  rows (files, symbols, dependencies, diffs) under `codeindex:<project>` scopes, so
+  an agent can find *where* code lives (`path:line`) and *what* a file defines
+  without grepping or reading files. Pure-Lua parsers for Lua/Python/JS-TS, plus
+  universal-ctags for any other language when present. See
+  [Codebase Index](#codebase-index) below.
 - **Importance + time decay**: each memory carries an `importance` weight
   (0..10) and an optional `decay_rate` (0..1 per day). Search ranks by
   `(hybrid_score × importance × e^(-decay_rate · days))` so fresh,
   high-value notes outrank stale low-value ones automatically. See
   [examples/decay_importance.md](examples/decay_importance.md).
+
+---
+
+## Security and alignment design
+
+LuaMemo includes a secrets subsystem designed for AI agents. API keys and tokens are stored AES‑encrypted on the server, with the master key held only in memory. Agents never see raw secret values: there is no read API, and secrets are only injected server‑side into HTTP requests via execute_with_secret. This makes it much harder for prompt injection, jailbreaks, or compromised agents to exfiltrate credentials.
+
+The HTTP execution path also defends against common agent‑mediated attacks such as SSRF and path traversal (scheme and private‑IP blocking, DNS‑rebinding checks, and strict file path validation). This is intended as a practical pattern for least‑privilege tool use and safer integration of LLM agents into real systems.
+
+Check out *Secrets management* section for more info.
 
 ---
 
@@ -174,6 +214,16 @@ See “Backends & cost” below for the trade-off.
 ---
 ## Upgrading
 
+### → 0.4.0 (run `memo migrate`)
+
+Run **`memo migrate`** to add the new tables (all idempotent, additive — no
+existing data touched): `lm_retrieval_feedback`, the `miss` reinforcement type,
+`lm_digest_state`, `lm_learner_weights`, `lm_promotion_runs`. Everything new is
+**opt-in and off by default** — existing behaviour is unchanged until you enable
+`feedback_enabled` / `auto_digest_enabled` (or re-run `memo calibrate`, which
+turns on self-maintenance and recommends the in-process embedder). If you adopt
+the `gguf_ffi` embedder, the `memo` CLI now runs under LuaJIT automatically.
+
 ### 0.2.6 → 0.2.7
 
 Drop-in upgrade — no schema changes, no migrations, no config changes.
@@ -247,11 +297,24 @@ embedder_local = "hash"   -- pure Lua, in-process
 ```
 See [examples/local_hash_embedder.md](examples/local_hash_embedder.md).
 
+**In-process semantic (no sidecar, recommended when the host can build it):**
+```lua
+embedder_local = "gguf_ffi"   -- EmbeddingGemma via LuaJIT-FFI over llama.cpp
+```
+Runs a real semantic embedder (bge-m3-class recall) directly in-process on CPU —
+no HTTP service. Requires **LuaJIT** + a one-time build of the tiny C shim
+(`luamemo/embedders/native/build.sh`, needs a C toolchain + cmake + llama.cpp) and
+the model file (`MEMO_GGUF_MODEL`). `memo calibrate` detects capability and wires
+this up for you (persisting `MEMO_EMBEDDER=gguf_ffi` and launching `luajit`);
+pass `--no-gguf` to stay on a lighter option. An optional GPU offload
+(`MEMO_GGUF_NGL` / `MEMO_GEN_NGL`) activates when llama.cpp is built with CUDA.
+
 **Or one of the HTTP options:**
 
 - **Ollama** (local, semantic): `ollama pull nomic-embed-text` — see
   [examples/ollama_embedder.md](examples/ollama_embedder.md).
-- **OpenAI**: `text-embedding-3-small` with your API key.
+- **OpenAI-compatible** (`openai_compatible` adapter): OpenAI itself, or any
+  self-hosted vLLM / LM Studio / TEI endpoint that speaks the same protocol.
 - **Bundled Python sidecar** (`examples/python_embedder/`):
   ```bash
   cd examples/python_embedder && docker build -t memo-embedder .
@@ -778,7 +841,116 @@ memo search "embedder choice"
 memo recent --scope repo:my-app --limit 5
 memo get 42
 memo delete 42
+
+# maintenance + learning (see Learned-from-usage)
+memo digest  --scope repo:my-app           # tier promotion / consolidation / decay
+memo learn   repo:my-app --dry-run         # train + gate the learned reranker (no promote)
+echo '[{"role":"user","text":"No, we use pgmoon, not luadbi."}]' \
+  | memo sense --scope repo:my-app         # record a correction as a reinforcement
 ```
+
+`memo calibrate` sets up the database, recommends an embedder, and enables
+self-maintenance (auto-digest) for you.
+
+---
+
+## Learned-from-usage
+
+Opt-in (`feedback_enabled = true`, or `MEMO_FEEDBACK_ENABLED=1`). When on, luamemo
+turns real usage into a signal that makes retrieval better over time — while the
+base embedder stays **frozen** (only small learned layers adapt, and only when
+they demonstrably help).
+
+**1. Capture (how memory learns what matters).** Signals become `lm_reinforcements`:
+- **Corrections / commands / praise** — relayed from a session via `memo sense` or
+  the `memory_sense` MCP tool (luamemo can't read your chat, so the agent relays
+  the recent turns). Explicit-pattern heuristics run always; an optional in-process
+  instruct model (`MEMO_GEN_MODEL`) can also extract implicit signals (experimental).
+- **Retrieval misses** — fully automatic, no LLM: a near-duplicate write means an
+  existing memory *should* have surfaced but didn't, so it's marked a "miss" (the
+  opposite of a content mistake) and made more findable. A correction whose target
+  was never retrieved is likewise reclassified from mistake → miss.
+
+**2. Consolidate (self-maintaining).** A debounced auto-digest piggybacks on writes
+(enabled by `memo calibrate`) so tier promotion, consolidation, and decay run
+without anything having to remember to call `memo digest`.
+
+**3. Promote (safely, per scope).** `memo learn <scope>` harvests the scope's
+feedback into training triples, trains a learned reranker, and evaluates it on a
+**held-out gate** — promoting the new weights **only if they beat the incumbent**,
+else rejecting. Weights are versioned per-scope in the DB (`lm_learner_weights`)
+and every attempt is audited (`lm_promotion_runs`); `rollback` restores the prior
+version. This is a no-op until enough signal exists — by design.
+
+> The learned layers ride the **same** reinforcement log the tier/consolidation
+> system uses, so "this memory keeps getting corrected/needed" strengthens both
+> its tier and the ranker. Nothing fine-tunes the embedding model itself.
+
+---
+
+## Codebase Index
+
+`memo index` maps a whole repository into queryable memory rows so an agent can
+find **where** code lives and **what** a file defines — without grepping or
+reading files. The index lives in its own `codeindex:<project>` scopes, separate
+from your regular memories, and never enters an agent's context until queried.
+
+**Build / refresh the map:**
+
+```bash
+# Index the current repo (whole-repo: every text file → a file row; symbols
+# extracted where a parser exists). Scope defaults to codeindex:<dirname>.
+memo index ingest --scope codeindex:my-app
+
+# Incremental refresh — only changed / new / deleted files are touched.
+memo index update --scope codeindex:my-app
+
+# Narrow the walk, or store file rows only (skip symbol extraction):
+memo index ingest --extensions lua,py --scope codeindex:my-app
+memo index ingest --no-symbols --scope codeindex:my-app
+```
+
+**Query it:**
+
+```bash
+memo index status  --scope codeindex:my-app          # row counts by kind
+memo index search  "where is dedup handled" --scope codeindex:my-app
+memo index explore "store.write"  --scope codeindex:my-app   # callers + callees
+memo index invalidate luamemo/store.lua --scope codeindex:my-app
+# Ingest a commit's diff as searchable, symbol-attributed rows:
+memo index diff --commit HEAD --scope codeindex:my-app
+```
+
+**Row kinds** (all in `codeindex:<project>`): `file` (one per tracked file,
+stored FTS-only to bound embed cost), `symbol` (functions/classes/methods with
+`path`, `line`, `symbol_type`, `exported`), `dependency` (import/require edges,
+also mirrored into the knowledge graph for `index explore`), and `diff` (git-diff
+hunks).
+
+**Languages.** Pure-Lua pattern parsers cover **Lua, Python, and
+JavaScript/TypeScript** out of the box. For any other language, if the
+[`universal-ctags`](https://github.com/universal-ctags/ctags) binary is on PATH it
+is used automatically to extract symbols; when it is absent those files are still
+indexed at the file level. luamemo itself runs on **just Lua** — ctags is optional
+enrichment, never required.
+
+### Agent integration (MCP + session digest)
+
+The bundled MCP server exposes four codebase-map tools that return compact
+`path:line — name (type) — doc` text (not full file contents):
+
+| Tool | Use |
+|------|-----|
+| `index_search`  | Find where code lives — call **before** grepping/reading files |
+| `index_outline` | List everything a file defines — call **before** editing it |
+| `index_explore` | Blast radius — callers and callees of a symbol |
+| `index_status`  | Is a map available for this project, and how big |
+
+`memo brief` prints a tiny session-start digest (memory count + map size + tool
+hints). Wired to a **SessionStart hook** (see `hooks/hooks.json`), it is injected
+automatically at the start of a session so the agent knows a map exists without
+being asked — then pulls specifics on demand. The map locates and orients; the
+file on disk remains the source of truth to read before editing.
 
 ---
 

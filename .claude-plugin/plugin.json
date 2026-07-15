@@ -4,5 +4,6 @@
   "author": { "name": "kaio326", "url": "https://github.com/kaio326/luamemo" },
   "skills": "../skills/",
   "agents": "../agents/",
-  "mcpServers": "../.mcp.json"
+  "mcpServers": "../.mcp.json",
+  "hooks": "../hooks/hooks.json"
 }

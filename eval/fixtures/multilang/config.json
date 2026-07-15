@@ -1,0 +1,5 @@
+{
+  "name": "multilang-fixture",
+  "version": "1.0.0",
+  "description": "A non-code text file that should be file-indexed but not symbol-parsed."
+}

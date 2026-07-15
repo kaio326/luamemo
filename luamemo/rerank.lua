@@ -83,6 +83,9 @@ function M.rerank(query, hits, opts)
                             or (cfg and cfg.rerank_timeout_ms) or 30000,
         rerank_top_n      = tonumber(opts.rerank_top_n)
                             or (cfg and cfg.rerank_top_n) or 20,
+        -- Scope for per-scope learned weights (Phase 11); nil = global/unscoped.
+        rerank_scope      = opts.rerank_scope,
+        rerank_weights    = opts.rerank_weights,
     }
 
     -- Trim the candidate pool the LLM sees to keep token cost predictable.
