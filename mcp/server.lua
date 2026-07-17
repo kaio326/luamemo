@@ -52,7 +52,13 @@ local DEBUG       = os.getenv("MEMO_DEBUG") == "1"
 
 local PROTOCOL_VERSION = "2024-11-05"
 local SERVER_NAME      = "luamemo"
-local SERVER_VERSION   = "0.3.1"
+-- Single source of truth: luamemo.VERSION (luamemo/init.lua) — was a
+-- hardcoded literal here that silently went stale every release; require()
+-- is safe at load time (no setup() / DB dependency for a plain constant).
+local SERVER_VERSION   = (function()
+    local ok, lm = pcall(require, "luamemo")
+    return (ok and lm.VERSION) or "unknown"
+end)()
 
 -- ===========================================================================
 -- Logging (stderr only — stdout is reserved for JSON-RPC frames)

@@ -315,6 +315,22 @@ handlers["learn"] = function(p)
     out({ ok = true, result = result })
 end
 
+-- reembed: re-embed every memory in a scope with the CURRENTLY configured
+-- embedder. Needed after switching embedders — two different models' vector
+-- spaces are never comparable (even at the same embed_dim), so existing rows
+-- silently lose vector-search relevance until re-embedded.
+handlers["reembed"] = function(p)
+    local store = require("luamemo.store")
+    local scope = p.scope
+    if not scope or scope == "" then return err_out("reembed: scope required") end
+    local result, err = store.reembed_scope(scope, {
+        batch   = tonumber(p.batch),
+        dry_run = (p.dry_run == true),
+    })
+    if not result then return err_out(err) end
+    out({ ok = true, result = result })
+end
+
 -- kg-query
 handlers["kg-query"] = function(p)
     local kg = require("luamemo.kg")

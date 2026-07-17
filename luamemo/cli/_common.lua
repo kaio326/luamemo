@@ -36,6 +36,13 @@ function M.config_from_env(opts)
     local embed_dim = tonumber(os.getenv("MEMO_EMBED_DIM"))
     if embed_dim then cfg.embed_dim = embed_dim end
 
+    -- Truncation safety knob (embed.lua uses cfg.embed_max_chars to bound
+    -- request size / stay inside a local model's context window). calibrate
+    -- recommends and persists this to .luamemorc — it must actually reach
+    -- the CLI's write/search path, not just the ping/doctor display code.
+    local embed_max_chars = tonumber(os.getenv("MEMO_EMBED_MAX_CHARS"))
+    if embed_max_chars then cfg.embed_max_chars = embed_max_chars end
+
     local db_url = env("MEMO_DB_URL")
     if db_url then cfg.db_url = db_url end
 

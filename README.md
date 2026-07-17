@@ -847,6 +847,11 @@ memo digest  --scope repo:my-app           # tier promotion / consolidation / de
 memo learn   repo:my-app --dry-run         # train + gate the learned reranker (no promote)
 echo '[{"role":"user","text":"No, we use pgmoon, not luadbi."}]' \
   | memo sense --scope repo:my-app         # record a correction as a reinforcement
+
+# switched embedders? old and new vectors are never comparable, even at the
+# same embed_dim — re-embed the scope so vector search stays accurate:
+memo reembed --scope repo:my-app --dry-run # preview: how many rows would be touched
+memo reembed --scope repo:my-app           # re-embed with the currently configured embedder
 ```
 
 `memo calibrate` sets up the database, recommends an embedder, and enables

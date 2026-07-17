@@ -79,33 +79,60 @@ end
 
 local function check_embedder()
     local url = os.getenv("MEMO_EMBEDDER_URL")
-    if not url or url == "" then
-        result("SKIP", "Embedder", "(MEMO_EMBEDDER_URL not set)")
-        return true  -- not a failure — hash embedder needs no network
+    if url and url ~= "" then
+        -- Load the same config vars as the rest of the CLI so that ping
+        -- results are a reliable proxy for write/calibrate behaviour.
+        local adapter      = os.getenv("MEMO_EMBEDDER_ADAPTER") or "generic"
+        local model        = os.getenv("MEMO_EMBEDDER_MODEL")
+        local cfg_embed_dim = tonumber(os.getenv("MEMO_EMBED_DIM"))
+        local max_chars    = tonumber(os.getenv("MEMO_EMBED_MAX_CHARS"))
+
+        local embed = require("luamemo.embed")
+        embed.configure({
+            embedder_url      = url,
+            embedder_adapter  = adapter,
+            embedder_model    = model,
+            embed_dim         = cfg_embed_dim,  -- may be nil; embed.lua guards for nil
+            embed_max_chars   = max_chars,
+        })
+
+        local dim, err = embed.probe()
+        if dim then
+            result("PASS", "Embedder", url .. " \226\134\146 dim=" .. dim)
+            return true
+        else
+            result("FAIL", "Embedder", tostring(err))
+            return false
+        end
     end
 
-    -- Load the same config vars as the rest of the CLI so that ping results
-    -- are a reliable proxy for write/calibrate behaviour.
-    local adapter      = os.getenv("MEMO_EMBEDDER_ADAPTER") or "generic"
-    local model        = os.getenv("MEMO_EMBEDDER_MODEL")
-    local cfg_embed_dim = tonumber(os.getenv("MEMO_EMBED_DIM"))
-    local max_chars    = tonumber(os.getenv("MEMO_EMBED_MAX_CHARS"))
+    -- No HTTP embedder configured: MEMO_EMBEDDER selects a LOCAL (in-process)
+    -- embedder — "hash" (the zero-dependency default) or an in-process model
+    -- such as "gguf_ffi". Actually exercise it via the module's own
+    -- selftest() rather than unconditionally SKIPping: hash needs no network
+    -- and always passes trivially, but gguf_ffi (and any future local
+    -- embedder) CAN fail — a wrong MEMO_GGUF_MODEL path, an unbuilt/missing
+    -- native shim, a wrong architecture, OOM, etc. `memo ping` is the one
+    -- command whose job is to catch exactly that before a real write fails.
+    local name = os.getenv("MEMO_EMBEDDER")
+    if not name or name == "" then name = "hash" end
 
-    local embed = require("luamemo.embed")
-    embed.configure({
-        embedder_url      = url,
-        embedder_adapter  = adapter,
-        embedder_model    = model,
-        embed_dim         = cfg_embed_dim,  -- may be nil; embed.lua guards for nil
-        embed_max_chars   = max_chars,
-    })
+    local ok_mod, mod = pcall(require, "luamemo.embedders." .. name)
+    if not ok_mod then
+        result("FAIL", "Embedder", "local embedder '" .. name .. "' not found: " .. tostring(mod))
+        return false
+    end
+    if type(mod.selftest) ~= "function" then
+        result("SKIP", "Embedder", "(local embedder '" .. name .. "' has no selftest)")
+        return true
+    end
 
-    local dim, err = embed.probe()
-    if dim then
-        result("PASS", "Embedder", url .. " \226\134\146 dim=" .. dim)
+    local ok, err = mod.selftest()
+    if ok then
+        result("PASS", "Embedder", name .. " (local, in-process)")
         return true
     else
-        result("FAIL", "Embedder", tostring(err))
+        result("FAIL", "Embedder", name .. ": " .. tostring(err))
         return false
     end
 end

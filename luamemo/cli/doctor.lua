@@ -4,10 +4,11 @@
 -- M.corpus_health_check() the boot WARN uses, then prints a structured
 -- OK/WARN/FAIL report with concrete recommendations.
 --
--- Requires the host app to have called setup() already (so config is
--- populated). Invoked via `memo doctor --setup PATH` to bootstrap
--- config, or directly when imported by an app that has already wired
--- the library.
+-- Bootstraps from the MEMO_* environment the same way every other CLI
+-- subcommand does (write/search/etc. via cli.api's ensure_setup), so it
+-- works out of the box from .luamemorc/env vars alone. `--setup PATH`
+-- remains available to dofile() a custom setup() call instead (e.g. when
+-- your app configures luamemo with logic beyond plain env vars).
 --
 -- Exit codes: 0 = OK / WARN, 1 = FAIL (truncation > 10% or DB error).
 
@@ -53,9 +54,16 @@ function M.run(argv)
     -- "setup() was called" from "module loaded with defaults".  The reliable
     -- signal is lm.store.backend(): it returns nil until store.configure()
     -- completes successfully inside setup().
+    if not lm.store.backend() and not flags.setup then
+        -- No --setup file given: bootstrap from the environment (MEMO_DB_URL /
+        -- MEMO_EMBEDDER / .luamemorc), exactly like every other subcommand.
+        local cfg = require("luamemo.cli._common").config_from_env({ secrets = true })
+        pcall(lm.setup, cfg)
+    end
     if not lm.store.backend() then
         io.stderr:write("memo doctor: luamemo.setup() has not been called (or failed).\n" ..
-            "  Pass --setup PATH/TO/setup.lua, or invoke from a host app where setup() has run.\n")
+            "  Set MEMO_DB_URL / MEMO_EMBEDDER (or .luamemorc), pass --setup PATH/TO/setup.lua\n" ..
+            "  for a custom setup() call, or invoke from a host app where setup() has run.\n")
         os.exit(1)
     end
 

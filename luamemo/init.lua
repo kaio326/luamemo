@@ -12,6 +12,13 @@ local index       = require("luamemo.index")
 
 local M = {}
 
+-- Single source of truth for the package version — must be bumped alongside
+-- the rockspec (luamemo-<version>-<revision>.rockspec) on every release.
+-- Anything that needs to report luamemo's version (the MCP server's
+-- serverInfo, diagnostics, etc.) should read this instead of hardcoding its
+-- own copy, which silently goes stale the moment it does.
+M.VERSION = "0.4.1"
+
 -- Runtime state. ok is false until setup() completes a successful embedder
 -- probe. ensure_ready() retries the probe on demand so a slow-starting
 -- embedder sidecar can recover without a full container restart.

@@ -1459,6 +1459,65 @@ function M.list_by_scope(scope, opts)
 end
 
 -- ---------------------------------------------------------------------------
+-- reembed_scope
+--
+-- Re-embeds every memory in a scope with the CURRENTLY configured embedder.
+-- Needed after switching embedders (calibrate re-picking a different one on
+-- a new host, or manually changing MEMO_EMBEDDER*): two different models'
+-- vector spaces are never comparable, even at the same embed_dim, so
+-- existing rows silently lose vector-search relevance until re-embedded.
+-- (FTS still works, which is exactly why this is easy to miss — hybrid
+-- search doesn't fully collapse, it just quietly gets worse.)
+--
+-- Cursor-paginated by id (ASC) so it scales past any single-batch limit.
+-- Re-embeds via M.update(id, {title, body}) — the same write path a real
+-- edit uses, so decay/tier/consolidation bookkeeping stays consistent; only
+-- title/body are passed, so nothing else on the row is touched.
+--
+-- opts.batch    rows per page (default 100, max 1000)
+-- opts.dry_run  true → just count matching rows, no writes
+-- opts.on_progress  optional fn(updated, last_id) called after each page
+-- Returns { updated, errors, last_id } (errors: list of {id, err}), or for
+-- dry_run: { would_update, dry_run = true }.
+-- ---------------------------------------------------------------------------
+function M.reembed_scope(scope, opts)
+    if not scope or scope == "" then
+        return nil, "reembed_scope: scope required"
+    end
+    opts = opts or {}
+
+    if opts.dry_run then
+        local r = db.query("SELECT count(*) AS n FROM " .. tbl()
+            .. " WHERE scope = " .. db.escape_literal(scope))
+        return { would_update = r and tonumber(r[1].n) or 0, dry_run = true }
+    end
+
+    local batch = math.max(1, math.min(tonumber(opts.batch) or 100, 1000))
+    local updated, errors = 0, {}
+    local last_id = 0
+    while true do
+        local rows = db.query(([[
+            SELECT id, title, body FROM %s
+             WHERE scope = %s AND id > %d
+             ORDER BY id ASC LIMIT %d
+        ]]):format(tbl(), db.escape_literal(scope), last_id, batch))
+        if not rows or #rows == 0 then break end
+        for _, r in ipairs(rows) do
+            local _, uerr = M.update(r.id, { title = r.title, body = r.body })
+            if uerr then
+                errors[#errors + 1] = { id = r.id, err = uerr }
+            else
+                updated = updated + 1
+            end
+            last_id = r.id
+        end
+        if opts.on_progress then opts.on_progress(updated, last_id) end
+        if #rows < batch then break end
+    end
+    return { updated = updated, errors = errors, last_id = last_id }
+end
+
+-- ---------------------------------------------------------------------------
 -- search (hybrid: vector cosine + FTS rank, weighted by importance/decay)
 --
 -- Branches on backend:

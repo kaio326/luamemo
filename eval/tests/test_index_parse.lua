@@ -113,10 +113,12 @@ else
         fail("parser: " .. crashes .. " crashes")
     end
 
-    -- Spot-check: parse store.lua and look for known symbols.
+    -- Spot-check: parse store.lua and look for known symbols. Match the exact
+    -- relative path — a loose suffix match ("store%.lua$") also catches
+    -- luamemo/learner_store.lua, and whichever the walker returns first wins.
     local store_path
     for _, f in ipairs(files) do
-        if f.rel:match("store%.lua$") and not f.rel:match("/cli/") then
+        if f.rel == "luamemo/store.lua" then
             store_path = f.path; break
         end
     end

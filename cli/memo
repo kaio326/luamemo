@@ -49,6 +49,10 @@
 #   memo learn      <scope> [--dry-run] [--min-samples N] [--margin F]
 #                   (per-scope promotion harness: harvest → train → gated-promote reranker)
 #
+#   memo reembed    --scope SCOPE [--batch N] [--dry-run]
+#                   (re-embed every memory in a scope with the current embedder —
+#                    needed after switching embedders; old vectors aren't comparable)
+#
 #   memo promote    --from FROM_SCOPE --to TO_SCOPE [--delete-source] [--dry-run]
 #                   [--limit N]
 #
@@ -949,6 +953,27 @@ cmd_learn() {
     done
     printf '%s' "$json" | api_call learn | jq .
 }
+
+# memo reembed --scope SCOPE [--batch N] [--dry-run]
+# Re-embeds every memory in a scope with the CURRENTLY configured embedder.
+# Needed after switching embedders (calibrate re-picking a different one on a
+# new host, or manually changing MEMO_EMBEDDER*) — two different models'
+# vector spaces are never comparable even at the same embed_dim, so existing
+# rows silently lose vector-search relevance until re-embedded (FTS still
+# works, which is exactly why this is easy to miss).
+cmd_reembed() {
+    require_jq
+    local json='{}'
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scope)   json=$(printf '%s' "$json" | jq --arg v "$2" '. + {scope: $v}'); shift 2 ;;
+            --batch)   json=$(printf '%s' "$json" | jq --argjson v "$2" '. + {batch: $v}'); shift 2 ;;
+            --dry-run) json=$(printf '%s' "$json" | jq '. + {dry_run: true}'); shift ;;
+            *)         echo "memo reembed: unknown arg: $1" >&2; exit 1 ;;
+        esac
+    done
+    printf '%s' "$json" | api_call reembed | jq .
+}
 # Used by --docker-compose FILE flag in cmd_calibrate.
 # Parses a docker-compose.yml for Postgres credentials and host port,
 # then exports MEMO_DB_URL.
@@ -1238,6 +1263,55 @@ EOF
     # --keep-embedder skips this block entirely so users can re-run calibrate
     # without touching their working embedder config.
     if [[ "$keep_embedder" != true ]] && [[ -n "${MEMO_DB_URL:-}" ]]; then
+        # Embedder-switch warning: two different embedders' vectors are NEVER
+        # comparable, even at the same embed_dim — existing rows silently lose
+        # vector-search relevance until re-embedded (FTS still works, which is
+        # exactly why this is easy to miss). Two ways this happens even under
+        # write-if-absent semantics below: (a) the embedder actually changed
+        # from what .luamemorc already had, or (b) this is a FRESH .luamemorc
+        # (no local prior value to compare) pointed at a database that already
+        # has rows for this scope — e.g. a fresh clone / a different host
+        # connecting to a shared DB. Best-effort: skipped silently if psql
+        # isn't available.
+        local _old_eloc="" _old_emdl=""
+        if [[ -f "$PWD/.luamemorc" ]]; then
+            _old_eloc=$(grep -E '^MEMO_EMBEDDER=' "$PWD/.luamemorc" 2>/dev/null | tail -1 | cut -d= -f2-) || true
+            _old_emdl=$(grep -E '^MEMO_EMBEDDER_MODEL=' "$PWD/.luamemorc" 2>/dev/null | tail -1 | cut -d= -f2-) || true
+        fi
+        local _embedder_changed=false
+        if [[ -n "$_old_eloc" && -n "$_probe_eloc" && "$_old_eloc" != "$_probe_eloc" ]]; then
+            _embedder_changed=true
+        elif [[ -n "$_old_emdl" && -n "$_probe_emdl" && "$_old_emdl" != "$_probe_emdl" ]]; then
+            _embedder_changed=true
+        fi
+
+        if command -v psql >/dev/null 2>&1; then
+            local _target_scope="${scope:-repo:$(basename "$(cd "$root" 2>/dev/null && pwd)")}"
+            local _existing_rows
+            _existing_rows=$(PGPASSWORD="${PGPASSWORD:-}" psql "$MEMO_DB_URL" -tA \
+                -v target_scope="$_target_scope" 2>/dev/null <<'SQL' || echo ""
+SELECT count(*) FROM lm_memories WHERE scope = :'target_scope';
+SQL
+)
+            if [[ "$_existing_rows" =~ ^[0-9]+$ ]] && [[ "$_existing_rows" -gt 0 ]]; then
+                if [[ "$_embedder_changed" == true ]]; then
+                    echo ""
+                    echo "  WARNING: embedder is changing (${_old_eloc:-$_old_emdl} -> ${_probe_eloc:-$_probe_emdl})."
+                    echo "  ${_existing_rows} existing memories in scope '${_target_scope}' were embedded with"
+                    echo "  the PREVIOUS model — a different model's vectors are never comparable, even at the"
+                    echo "  same dimension, so vector search relevance will silently degrade on those rows"
+                    echo "  until they are re-embedded. Run:  memo reembed --scope ${_target_scope}"
+                elif [[ -z "$_old_eloc" ]]; then
+                    echo ""
+                    echo "  NOTE: scope '${_target_scope}' already has ${_existing_rows} memories, but no local"
+                    echo "  embedder config was found (e.g. a fresh clone connecting to a shared database)."
+                    echo "  If those rows were embedded with a DIFFERENT model than the one being configured"
+                    echo "  now, vector search relevance will be degraded until they are re-embedded. Run:"
+                    echo "    memo reembed --scope ${_target_scope}"
+                fi
+            fi
+        fi
+
         # Local embedder selector (hash / gguf_ffi / …). For gguf_ffi the user
         # also sets MEMO_GGUF_MODEL after downloading the model (see the guide
         # printed by `memo calibrate`).
@@ -1317,8 +1391,13 @@ EOF
     if [[ -z "${MEMO_DB_URL:-}" ]]; then
         echo ""
         echo "  No database config found."
-        echo -n "  Enter MEMO_DB_URL (e.g. postgresql://postgres:@127.0.0.1:5432/luamemo): "
-        read -r MEMO_DB_URL
+        if [[ -t 0 ]]; then
+            echo -n "  Enter MEMO_DB_URL (e.g. postgresql://postgres:@127.0.0.1:5432/luamemo): "
+            read -r MEMO_DB_URL
+        else
+            echo "  (non-interactive: skipping prompt — set MEMO_DB_URL before running calibrate)"
+            MEMO_DB_URL=""
+        fi
         if [[ -z "$MEMO_DB_URL" ]]; then
             echo ""
             echo "  No database configured — memories will NOT be saved."
@@ -1380,8 +1459,7 @@ EOF
 
             local do_migrate="n"
             if command -v psql >/dev/null 2>&1; then
-                echo -n "  Apply schema now? [y/N] "
-                read -r do_migrate
+                _confirm_yn "Apply schema now?" && do_migrate="y"
             else
                 echo "  psql not found — cannot apply schema automatically."
             fi
@@ -1583,6 +1661,23 @@ _calibrate_plugin_phase() {
     fi
 }
 
+# _confirm_yn <prompt> — prints "<prompt> [y/N] ", reads an answer, returns
+# 0 (true) for y/Y, 1 (false) otherwise. Under `set -e`, a bare `read` with
+# no data available on stdin (a script, CI, or an agent's shell tool — no
+# TTY) fails and silently kills the whole calibrate run with no error message
+# and no clue why; guard with a TTY check and treat non-interactive as "no",
+# printing a note so the skip is visible instead of a silent, unexplained
+# truncation of the run.
+_confirm_yn() {
+    echo -n "  $1 [y/N] "
+    if [[ ! -t 0 ]]; then
+        echo "(non-interactive: skipping)"
+        return 1
+    fi
+    local ans; read -r ans
+    [[ "$ans" =~ ^[Yy]$ ]]
+}
+
 # ---------------------------------------------------------------------------
 # IDE detection + MCP config writer (called from cmd_calibrate phase 5)
 # ---------------------------------------------------------------------------
@@ -1767,9 +1862,7 @@ _calibrate_mcp_phase() {
             if [[ -n "$already" ]]; then
                 echo "  .vscode/mcp.json: ${mcp_key} entry already present — skipping."
             else
-                echo -n "  Write ${mcp_key} MCP entry to .vscode/mcp.json? [y/N] "
-                local ans; read -r ans
-                if [[ "$ans" =~ ^[Yy]$ ]]; then
+                if _confirm_yn "Write ${mcp_key} MCP entry to .vscode/mcp.json?"; then
                     local updated
                     updated=$(jq --arg key "$mcp_key" --argjson entry "$vscode_entry" '.servers[$key] = $entry' "$vscode_mcp")
                     printf '%s\n' "$updated" > "$vscode_mcp"
@@ -1777,9 +1870,7 @@ _calibrate_mcp_phase() {
                 fi
             fi
         else
-            echo -n "  Create .vscode/mcp.json with ${mcp_key} entry? [y/N] "
-            local ans; read -r ans
-            if [[ "$ans" =~ ^[Yy]$ ]]; then
+            if _confirm_yn "Create .vscode/mcp.json with ${mcp_key} entry?"; then
                 mkdir -p "$vscode_dir"
                 jq -n --arg key "$mcp_key" --argjson entry "$vscode_entry" '{"servers":{($key):$entry}}' > "$vscode_mcp"
                 echo "  Created: $vscode_mcp"
@@ -1797,9 +1888,7 @@ _calibrate_mcp_phase() {
             if [[ -n "$already" ]]; then
                 echo "  ~/.cursor/mcp.json: ${mcp_key} entry already present — skipping."
             else
-                echo -n "  Write ${mcp_key} MCP entry to ~/.cursor/mcp.json? [y/N] "
-                local ans; read -r ans
-                if [[ "$ans" =~ ^[Yy]$ ]]; then
+                if _confirm_yn "Write ${mcp_key} MCP entry to ~/.cursor/mcp.json?"; then
                     local updated
                     updated=$(jq --arg key "$mcp_key" --argjson entry "$claude_entry" '.mcpServers[$key] = $entry' "$cursor_mcp")
                     printf '%s\n' "$updated" > "$cursor_mcp"
@@ -1807,9 +1896,7 @@ _calibrate_mcp_phase() {
                 fi
             fi
         else
-            echo -n "  Create ~/.cursor/mcp.json with ${mcp_key} entry? [y/N] "
-            local ans; read -r ans
-            if [[ "$ans" =~ ^[Yy]$ ]]; then
+            if _confirm_yn "Create ~/.cursor/mcp.json with ${mcp_key} entry?"; then
                 jq -n --arg key "$mcp_key" --argjson entry "$claude_entry" '{"mcpServers":{($key):$entry}}' > "$cursor_mcp"
                 echo "  Created: $cursor_mcp"
             fi
@@ -1830,9 +1917,7 @@ _calibrate_mcp_phase() {
         if [[ -n "$already" ]]; then
             echo "  claude_desktop_config.json: ${mcp_key} entry already present — skipping."
         else
-            echo -n "  Write ${mcp_key} MCP entry to Claude Desktop config? [y/N] "
-            local ans; read -r ans
-            if [[ "$ans" =~ ^[Yy]$ ]]; then
+            if _confirm_yn "Write ${mcp_key} MCP entry to Claude Desktop config?"; then
                 local updated
                 updated=$(jq --arg key "$mcp_key" --argjson entry "$claude_entry" '.mcpServers[$key] = $entry' "$claude_cfg")
                 printf '%s\n' "$updated" > "$claude_cfg"
@@ -2007,6 +2092,7 @@ case "$sub" in
     digest) cmd_digest "$@" ;;
     sense)  cmd_sense  "$@" ;;
     learn)  cmd_learn  "$@" ;;
+    reembed) cmd_reembed "$@" ;;
     index)     cmd_local_lua index "$@" ;;
     calibrate) cmd_calibrate "$@" ;;
     setup)     cmd_setup     "$@" ;;

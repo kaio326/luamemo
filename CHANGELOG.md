@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.4.1] — hotfix (7 issues from 0.4.0-1 beta testing)
+
+A focused patch fixing everything found during real-world upgrade testing of
+0.4.0-1 (upgrading an existing project, switching to the in-process `gguf_ffi`
+embedder). All seven issues confirmed and fixed with an isolated repro for each.
+
+- **Fix: `memo calibrate` died silently (exit 1, no error) whenever stdin
+  wasn't a terminal** — e.g. run from a script, CI, or an AI agent's shell
+  tool. Root cause: several `read` prompts in the MCP-config and
+  schema-apply phases had no TTY guard; under `set -e`, a `read` that hits
+  EOF kills the script instantly with no message. All prompts now detect a
+  non-interactive shell and skip with a visible note instead of dying.
+- **Fix: the published rock omitted `gguf_shim.c` / `build.sh`**, so the
+  in-process embedder could not be built from a stock `luarocks install` —
+  the flagship 0.4.0 feature was unusable out of the box. Both files now
+  ship via `copy_directories`; `build.sh` also no longer assumes its own
+  directory is the Lua module path (it isn't, under LuaRocks' packaging
+  layout) — it now asks the Lua interpreter's own module resolution where
+  `ffi_shim.lua` actually lives and builds the shim there, verified
+  end-to-end against a real local `luarocks install`.
+- **Fix: `memo ping --embedder` never checked local embedders** (`hash`,
+  `gguf_ffi`, …) — it only probed `MEMO_EMBEDDER_URL` and unconditionally
+  reported `[SKIP]` otherwise, even when a local embedder was badly
+  misconfigured (wrong model path, unbuilt native shim, wrong architecture).
+  Now calls the embedder module's own `selftest()`.
+- **Fix: `MEMO_EMBED_MAX_CHARS` was silently ignored by every CLI write /
+  search call** — `cli/_common.lua`'s environment bootstrap never read it
+  into `cfg.embed_max_chars`, so the truncation safety knob `memo calibrate`
+  recommends and persists had no effect where it mattered (`memo doctor`
+  reported it as `unset` even when configured).
+- **Fix: `memo doctor` was the only subcommand that required `--setup PATH`**
+  — it now bootstraps from the environment (`MEMO_DB_URL`/`MEMO_EMBEDDER`/
+  `.luamemorc`) exactly like `write`/`search`/etc. already do; `--setup` is
+  still available for a custom `setup()` call.
+- **Fix: the MCP server reported a stale hardcoded version** (`"0.3.1"`,
+  predating several releases) in both `initialize`'s `serverInfo.version`
+  and the `memory_status` tool. Added `luamemo.VERSION` as the single source
+  of truth; both now report it correctly (the `memory_status` field was
+  actually always `"unknown"` before this, since the field it read never
+  existed — a second bug the version-string report incidentally surfaced).
+- **New: `memo reembed --scope SCOPE [--batch N] [--dry-run]`** — re-embeds
+  every memory in a scope with the currently configured embedder.
+  Switching embedders (including `memo calibrate` re-picking a different
+  "best fit" on a new host) leaves existing rows with a different, never-
+  comparable vector space **even at the same `embed_dim`**, silently
+  degrading vector-search relevance with no error (FTS still partially
+  covers for it, which is exactly why this is easy to miss). Verified
+  end-to-end: a query's top-hit `vec_score` went from ~0.10 (noise floor)
+  to 0.79 (correctly ranked) after `reembed`.
+- **New: `memo calibrate` now warns when the embedder is about to change**
+  and the target scope already has existing memories — both when switching
+  away from a locally-known prior embedder, and (softer wording) when a
+  fresh `.luamemorc` connects to a database that already has rows from
+  elsewhere. Points at `memo reembed`.
+
+### Also fixed while verifying the above
+- `eval/tests/test_index_parse.lua`: the store.lua spot-check matched any
+  file ending in `store.lua`, which also caught the new (0.4.0)
+  `luamemo/learner_store.lua` — a false-negative regression risk, not a
+  product bug. Matched on the exact path instead.
+
 ## [0.4.0] — unreleased
 
 Major unreleased release covering two arcs: the codebase index / agent-delivery
