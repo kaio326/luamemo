@@ -1,273 +1,191 @@
 # luamemo MCP server
 
-A pure-Lua [Model Context Protocol](https://modelcontextprotocol.io/) stdio
-server that gives AI clients (Claude Desktop, Cursor, Continue.dev,
-Copilot Agent Mode, …) direct access to the luamemo memory store.
+`memo mcp` runs luamemo's [Model Context Protocol](https://modelcontextprotocol.io/)
+server (`mcp/server.lua`) over stdio. An MCP client — Claude Code, VS Code (Copilot
+agent mode), Cursor, Claude Desktop, Continue.dev, … — starts it and calls its tools
+to search, write and maintain memories, read the codebase map and use stored
+secrets. It works on the project's database (a SQLite file) in-process: there is no
+server to run beside it and no network connection to a database.
 
-It operates in two modes — choose the one that fits your setup:
+## The entry
 
-| Mode | How it connects | When to use |
-|------|----------------|-------------|
-| **Direct DB** (`MEMO_DB_URL`) | Connects to PostgreSQL directly — no running HTTP server required | Standalone use: AI agent only, or plain Lua app without Lapis |
-| **HTTP API** (`MEMO_URL`) | Calls your running Lapis/HTTP app's `/api/memory` routes | When you want the agent to go through your app's `auth_fn` and middleware |
-
-For most users the direct-DB mode is the right choice — it requires only
-PostgreSQL and the `luamemo` library.
-
-Once installed, your AI assistant can call eleven tools:
-
-| Tool | Purpose |
-|---|---|
-| `memory_write`   | Store a memory (decision, fact, plan, snippet, …). Optional `importance` (0..10) and `decay_rate` (0..1/day) control search ranking. |
-| `memory_search`  | Hybrid vector + full-text search, weighted by importance × time-decay. `ignore_decay=true` disables weighting (debug). |
-| `memory_recent`  | List most recent memories in a scope. |
-| `memory_get`     | Fetch a single memory by ID. |
-| `memory_update`  | Update title / body / tags / metadata / importance / decay_rate. |
-| `memory_delete`  | Permanently delete a memory. |
-| `memory_promote` | Roll a hot session scope into a long-term scope (session-continuity). |
-| `secret_list`    | List stored secrets — names and metadata only, **no values**. |
-| `secret_store`   | Encrypt and store an API key or token. **Use from terminal only** — never call this from the chat window. |
-| `secret_delete`  | Permanently delete a stored secret. |
-| `secret_execute` | Make an HTTP request with `{secret}` substituted server-side; only the response body is returned to the agent. |
-
-These survive chat-session crashes, IDE restarts, device switches, and the
-VS Code "Invalid string length" overflow on very long sessions.
-
----
-
-## Requirements
-
-- **Lua 5.1+** or **LuaJIT** (whichever is on your `$PATH` as `lua`)
-- **PostgreSQL 15+** with the luamemo schema applied (direct-DB mode)
-  — or a running `luamemo` HTTP API (HTTP mode)
-
-> `lua-cjson` is **not required**. `luamemo.json` tries it first (it is
-> always present in OpenResty) and falls back to the bundled pure-Lua
-> `dkjson` 2.5 automatically.
-
-> ### `curl` dependency (HTTP mode only)
-> When using `MEMO_URL` (HTTP mode), the MCP server shells out to `curl`
-> for its HTTP calls. `curl` is preinstalled on macOS, Linux, and modern
-> Windows. In direct-DB mode (`MEMO_DB_URL`) no `curl` is needed — all
-> calls go through `luamemo.db` / pgmoon directly.
-
----
-
-## Install
-
-```bash
-git clone https://github.com/kaio326/luamemo.git ~/luamemo
-chmod +x ~/luamemo/mcp/server.lua
-```
-
-Verify:
-
-```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  | MEMO_URL=http://localhost:8080/api/memory lua ~/luamemo/mcp/server.lua
-```
-
-You should get a one-line JSON response containing `serverInfo` and
-`capabilities`.
-
----
-
-## Configure your client
-
-All examples below show the **direct-DB mode** (`MEMO_DB_URL`), which is the
-simplest setup — no running HTTP server required. To use HTTP mode instead,
-replace `MEMO_DB_URL` with `MEMO_URL` (and optionally `MEMO_TOKEN` for auth).
-See [Transport modes](#transport-modes) for the trade-offs.
-
-### Claude Desktop
-
-Edit `claude_desktop_config.json`:
-
-- macOS:  `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Linux:  `~/.config/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+Every client gets the same entry, and nothing secret is in it:
 
 ```json
-{
-  "mcpServers": {
-    "luamemo": {
-      "command": "lua",
-      "args": ["/absolute/path/to/luamemo/mcp/server.lua"],
-      "env": {
-        "MEMO_DB_URL": "postgresql://user:pass@localhost:5432/mydb",
-        "MEMO_SCOPE":  "global"
-      }
-    }
-  }
-}
+{ "mcpServers": { "luamemo": { "command": "/usr/local/bin/memo", "args": ["mcp"] } } }
 ```
 
-Restart Claude Desktop. The eleven memory and secret tools will appear in the tool list.
+`memo mcp --print-config` prints it with `memo`'s absolute path (an app started from
+the desktop may not have your `PATH`), in the shapes clients use, and the
+`claude mcp add` line. `memo calibrate` writes it for the clients it finds (asking
+first) and replaces the entry it wrote before `memo mcp` — `luajit …/mcp/server.lua`
+with `MEMO_*` settings in `env`; an entry you wrote yourself is kept.
 
-### Cursor
-
-Cursor reads MCP servers from `~/.cursor/mcp.json` (same schema as Claude
-Desktop). Use the identical config.
-
-### Continue.dev
-
-In `~/.continue/config.yaml`:
-
-```yaml
-experimental:
-  modelContextProtocolServers:
-    - transport:
-        type: stdio
-        command: lua
-        args: ["/absolute/path/to/luamemo/mcp/server.lua"]
-        env:
-          MEMO_DB_URL: postgresql://user:pass@localhost:5432/mydb
-          MEMO_SCOPE:  global
-```
-
-### Copilot Agent Mode (VS Code)
-
-Add to `.vscode/mcp.json` in your workspace:
-
-```json
-{
-  "servers": {
-    "luamemo": {
-      "type": "stdio",
-      "command": "lua",
-      "args": ["/absolute/path/to/luamemo/mcp/server.lua"],
-      "env": {
-        "MEMO_DB_URL": "postgresql://user:pass@localhost:5432/mydb",
-        "MEMO_SCOPE":  "repo:my-project"
-      }
-    }
-  }
-}
-```
-
----
-
-## Environment variables
-
-### Direct-DB mode
-
-| Variable | Required | Purpose |
+| Client | Where | Notes |
 |---|---|---|
-| `MEMO_DB_URL` | yes | PostgreSQL connection URL — `postgresql://user:pass@host:5432/db` |
-| `MEMO_SCOPE`  | no  | Default scope when a tool call omits `scope` |
-| `MEMO_MASTER_KEY`    | no | 64-hex-char AES-256 master key for encrypted secrets |
-| `MEMO_SECRETS_FILE`  | no | Writable path for the encrypted secrets JSON file — both `MEMO_MASTER_KEY` and `MEMO_SECRETS_FILE` must be set to enable secrets |
-| `MEMO_DEBUG`  | no  | Set to `1` to log raw JSON-RPC frames to stderr |
+| Claude Code | the luamemo plugin (`.claude-plugin/`, starts `memo mcp` and adds the session-start hook), or `claude mcp add luamemo -s user -- /path/to/memo mcp` | started in the project's folder — one registration serves every project |
+| VS Code | `.vscode/mcp.json`: `"servers"`, with `"type": "stdio"` | `"args": ["mcp", "--project", "${workspaceFolder}"]`; add `"chat.mcp.autoStart": true` to VS Code's settings |
+| Cursor | `~/.cursor/mcp.json`: `"mcpServers"` | `"args": ["mcp", "--project", "${workspaceFolder}"]` |
+| Claude Desktop | `claude_desktop_config.json` — macOS `~/Library/Application Support/Claude/`, Linux `~/.config/Claude/` | no project of its own: one entry per project, `"args": ["mcp", "--project", "/path/to/project"]` |
+| Continue.dev | `~/.continue/config.yaml` | `experimental.modelContextProtocolServers: [{ transport: { type: stdio, command: /path/to/memo, args: [mcp] } }]` |
 
-### HTTP mode
+Restart (reconnect) the client after adding it; the tools appear in its tool list.
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `MEMO_URL`   | yes | Base URL of the luamemo HTTP API — e.g. `https://app.example.com/api/memory` |
-| `MEMO_TOKEN` | no  | Bearer token sent as `Authorization: Bearer <token>` |
-| `MEMO_SCOPE` | no  | Default scope when a tool call omits `scope` |
-| `MEMO_DEBUG` | no  | Set to `1` to log raw JSON-RPC frames to stderr |
+## Which project, which settings
 
-`MEMO_SCOPE` is the simplest way to point one MCP server instance at one
-project — set it to `repo:my-project` and every write/search defaults to
-that bucket without the model having to remember.
+`memo mcp` reads the settings like every `memo` command
+([SETTINGS.md](../SETTINGS.md)): the project's `.luamemorc` over `~/.luamemorc` over
+the environment. **The project** is `--project PATH`, else `MEMO_PROJECT`, else the
+nearest folder upward from where the client starts the server that holds a
+`.luamemorc` (`memo calibrate` writes it) — so a client that starts it in the open
+project needs no `--project`. A `.luamemorc` memo didn't write (committed to git,
+downloaded with the project, edited by hand) is used only after `memo config trust`.
 
----
+Settings are read when the server starts — after `memo config set`, restart the
+server in your client. The tools read every setting (`memory_status` with
+`details: true`) but change none. A setting you keep only in your shell's
+environment doesn't reach a server a GUI app starts: `memo calibrate` offers to
+save the ones the server needs in `.luamemorc`.
 
-## Transport modes
+No settings at all: the server still starts, and every tool answers with what to
+do (run `memo calibrate`, pass `--project`, or trust the project's file).
 
-### Direct DB (`MEMO_DB_URL`) — recommended for most users
+Started directly — `luajit mcp/server.lua`, as entries before `memo mcp` did — the
+server reads the same files, but there a variable the client's `env` passes wins.
 
-The MCP server calls `luamemo.db` / pgmoon directly. No running HTTP
-server required. This is the right choice when:
+## Protocol
 
-- You only need AI agent access to memory (not your app code)
-- You are using a standalone Lua script, CLI tool, or eval harness
-- You want the simplest possible setup
+The server speaks MCP **2026-07-28** — stateless: each request carries its version
+and the client's capabilities in `_meta`; `server/discover` names the versions,
+capabilities and usage rules; results say `resultType` and carry caching hints —
+and the earlier, `initialize`-based revisions **2025-11-25, 2025-06-18, 2025-03-26
+and 2024-11-05**, each client at the version it asks for (a version it doesn't know
+gets 2025-11-25 from `initialize`, or error -32022 with the supported list). JSON-RPC
+batches (2025-03-26) are answered as one array.
 
-`memory.setup()` and `routes.register()` are **not needed** in this mode.
-The MCP server calls `luamemo.setup()` internally using `MEMO_DB_URL`.
+**Usage rules.** `initialize` and `server/discover` return
+[instructions.md](instructions.md) as `instructions`: call `memory_brief` at the
+start unless the session-start hook already put the brief in context, search before
+answering, write as you go, keep secrets out of the chat, leave the people's
+decisions to them. The skill (`skills/session-memory/SKILL.md`) and the agent
+(`agents/luamemo.agent.md`) carry the same rules, word for word (a test checks).
 
-### HTTP API (`MEMO_URL`) — use when auth matters
+**Old clients.** The server records what each client says about itself — name,
+version, protocol, the names of its capabilities — in `~/.config/luamemo/clients.json`
+(nothing secret). A client older than 2025-03-26 can't receive the usage rules:
+`memo doctor` and `memo calibrate` name it, and the first `memory_brief` of a
+session tells the agent, so it can tell you. (Roots are not used — deprecated since
+2026-07-28; the project comes from the folder or `--project`.)
 
-The MCP server calls your running Lapis (or any HTTP) app's
-`/api/memory` routes via `curl`. Use this when:
+Check it by hand:
 
-- You want the AI agent to go through the same `auth_fn`, rate-limiter,
-  or CSRF hook that protects your app's other routes
-- Your Lapis app code also calls `store.write()` in-process and you want
-  a single, authoritative request path
-- You run multiple agents sharing one app and need per-agent token auth
-
-In this mode you **do** need `memory.setup()` and `routes.register()` in
-your Lapis app, and the app must be running when the MCP server is active.
-
-### Using both together (Lapis apps)
-
-For a Lapis app, the common combination is:
-
-- `memory.setup()` + `routes.register(app)` — for in-process use by your
-  app code (e.g. auto-capturing messages via `luamemo.hooks`) and for
-  non-MCP HTTP clients
-- MCP server with `MEMO_URL` pointing at your Lapis routes — when you
-  want the AI agent's writes to pass through `auth_fn`
-- MCP server with `MEMO_DB_URL` — when you want the AI agent to have
-  direct DB access independent of your app's auth layer
-
-All three can coexist — they write to the same PostgreSQL tables.
-
----
-
-## Per-project scopes
-
-Run multiple MCP server instances pointing at the same `luamemo`
-backend, each scoped to a different project:
-
-```jsonc
-{
-  "mcpServers": {
-    "memory-projectA": {
-      "command": "lua",
-      "args": ["/path/to/server.lua"],
-      "env": { "MEMO_URL": "...", "MEMO_SCOPE": "repo:projectA" }
-    },
-    "memory-acme": {
-      "command": "lua",
-      "args": ["/path/to/server.lua"],
-      "env": { "MEMO_URL": "...", "MEMO_SCOPE": "repo:acme" }
-    }
-  }
-}
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  | memo mcp
 ```
 
-The model sees them as two independent tool sets.
+One line of JSON comes back with `protocolVersion`, `serverInfo`, `capabilities`
+and `instructions`.
 
----
+## Tools
+
+27 tools. When a call names no scope, the project's `MEMO_SCOPE` applies (else
+`MEMO_DEFAULT_SCOPE`).
+
+**Token cost.** A client puts every tool's description in each session's context (an
+API-billed agent pays for it on every request unless it is cached), so they are short —
+the usage rules come once, as the server's instructions. The whole list is about
+15 KB of JSON; `MEMO_MCP_TOOLS=core` offers only the 16 everyday tools (brief, search,
+write, recent, get, update, delete, promote, sense, status, the `index_*` tools,
+`secret_list`, `secret_execute`; about 10 KB) and leaves the rest on `memo`. Answers are
+compact too: search, recent and get rows carry the text and where it lives, not the
+scoring internals (`verbose: true` returns whole rows), a write answers with the new
+memory's id, scope, kind, title and tier, not the text the agent just sent, and the
+`index_*` tools answer in plain text.
+
+### Memories
+
+| Tool | Parameters | Notes |
+|---|---|---|
+| `memory_brief` | `scope` | The session brief, as text: the scope and its latest memories, the codebase map, what waits for the user (org pairing, proposals) — what the session-start hook injects. Call it at the start when the brief isn't in context |
+| `memory_search` | `query`; `scope` or `scopes` (a list, searched together); `kind`, `limit`, `since`, `until` (ISO 8601 or Unix seconds), `tier_min` (default 1 — hides ephemeral tier 0), `tier_max`, `metadata_filter` (`{"key": value}`), `min_score`, `rerank` (true / false), `hybrid_weights` (`{"vector": …, "fts": …}`), `project` (narrows an `org:` scope to one project), `ignore_decay`, `verbose` | Hybrid vector + full-text search, weighted by importance, age and tier. Compact rows (id, title, body, kind, scope, tier, created_at, score; tags / metadata when set). The result also carries `facts`: the knowledge-graph facts the query is about — current value, since when, the previous value ([KG.md](../KG.md)) |
+| `memory_write` | `title`, `body`, `scope`, `kind`, `tags`, `metadata`, `importance` (0–10, default 1), `decay_rate` (per day), `tier` (0–3), `dedup_strategy` (`update` merges a near-duplicate, `skip`, `append`), `created_at`, `verbose` — or `items`: up to 100 memories, each answered on its own | Answers with the memory's id, scope, kind, title and tier (`verbose`: the whole row) |
+| `memory_recent` | `scope`, `kind`, `limit`, `offset`, `tier_min` (default 1 — hides ephemeral tier 0), `verbose` | The newest first, compact rows as search's |
+| `memory_get` | `id`, `verbose` | A compact row as search's (`verbose`: the whole row) |
+| `memory_update` | `id` + the fields to change, `verbose` | Re-embedded when title or body change; answers with the memory's id, scope, kind, title and tier (`verbose`: the whole row) |
+| `memory_delete` | `id` — or `scope` (+ `kind`, `metadata_filter`) to delete by filter | By filter, the first call previews (how many, a few titles) and returns a `confirm` token; the same call with the token deletes. The token is bound to the filter, the count and the database and lasts 5 minutes. A dev's org replica and approved org knowledge never match |
+
+### Sessions and maintenance
+
+| Tool | Parameters | Notes |
+|---|---|---|
+| `memory_promote` | `from_scope`, `to_scope`, `delete_source`, `dry_run`, `limit`, `min_rows` | Fold a session scope into one summary in a long-term scope ([SESSION_CONTINUITY.md](../SESSION_CONTINUITY.md)) |
+| `memory_digest` | `scope`, `threshold`, `dry_run` | Consolidate ephemeral memories, promote proven ones |
+| `memory_consolidate` | `scope`, `similarity_threshold`, `decay_threshold`, `max_rows`, `dry_run` | Expire decayed memories, group near-duplicates (merged by the summarizer) |
+| `memory_summarize` | `scope`, `weight_threshold`, `retention_days`, `batch_size`, `max_batches`, `dry_run` | Fold old, low-weight memories into summaries (`MEMO_SUMMARIZER_ADAPTER`; `noop` joins them without a model) |
+| `memory_status` | `verbose`, `details` | Rows per scope; `details`: every setting, its value and where it came from |
+| `memory_reconnect` | — | Re-open the database file (after a restore) |
+| `memory_diary_write` / `memory_diary_read` | `agent_name`, `entry`, `topic` / `agent_name`, `last_n` | A named agent's own diary in `diary:<agent_name>` |
+
+### Learning and tuning
+
+| Tool | Parameters | Notes |
+|---|---|---|
+| `memory_sense` | `turns` (`[{role, text}]`, oldest first), `scope`, `generative`, `min_similarity` | Corrections, standing rules and praise from the conversation the agent relays, recorded on the memories they concern. Idempotent |
+| `memory_learn` | `action` (`run`, `status`, `rollback`), `scope`, `dry_run`, `min_samples`, `margin` | The scope's learned reranker: trained on that feedback, promoted only if it beats the current one on held-out data |
+| `memory_tune_weights` | `scope`, `samples` (50), `metric` (`r_at_1`, `r_at_3`, `r_at_5`, `r_at_10`, `mrr`) | Which vector / full-text blend finds the scope's memories best — a report with the `memo config set` command a person runs to apply it |
+| `memory_embed` | `text`, `compare_to`, `include_vector` | The embedder's model and vector size; the cosine of two texts |
+
+### Code, secrets
+
+(The knowledge graph has no tool of its own: its facts come with `memory_search`,
+and people record and query them with `memo kg`.)
+
+| Tool | Parameters | Notes |
+|---|---|---|
+| `index_search` | `query`, `kind`, `limit`, `scope`, `project` | Where code lives: `path:line — name (type) — doc` lines |
+| `index_outline` | `path`, `scope`, `project` | Everything one file defines |
+| `index_explore` | `query`, `limit`, `scope`, `project` | A symbol's callers and callees |
+| `index_status` | `scope`, `project` | Whether a code map exists, and its size |
+| `secret_list` | — | Names and metadata only |
+| `secret_execute` | `name`, `url`, `method`, `headers`, `body`, `multipart`, `timeout_ms`, `max_bytes` | An HTTP request with `{secret}` filled in server-side; only the response body comes back, the value masked in it, at most `max_bytes` (default 64 KB; `truncated` says it was cut). Uploads: regular files inside the project only, never hidden or credential files |
+| `secret_delete` | `name`, `confirm` | Two calls: the first shows which secret and returns a `confirm` token (5 minutes); the second, with it, deletes |
+| `secret_store` | `name`, `value`, `description` | Adds a new secret — never replaces one (the user's `memo secret-store NAME`). Don't call it from chat — the value would reach the model. People run `memo secret-store NAME` in a terminal (it prompts without echo) |
+
+### Prompt
+
+`session_start` (arguments `scope`, `project`): the instructions for a session —
+reload context with `memory_search` and `memory_recent`, write decisions as you
+go, summarize at the end, keep secrets out of the chat — plus the scope's
+current knowledge-graph facts.
 
 ## Troubleshooting
 
-**"db_url not configured"** (direct-DB mode) — `MEMO_DB_URL` is missing or
-not being passed to the process. Check the `env` block in your client config.
-Claude Desktop has a `Developer → MCP` panel with per-server logs.
+Run with `MEMO_DEBUG=1` to log every JSON-RPC message to stderr (your client's
+MCP log shows it — VS Code: **MCP: List Servers → Show Output**; Claude Desktop:
+**Developer → MCP**).
 
-**"connection refused" / pgmoon error** (direct-DB mode) — PostgreSQL isn't
-reachable at the URL in `MEMO_DB_URL`. Verify the host, port, and credentials
-with `psql "$MEMO_DB_URL" -c 'SELECT 1'`.
+- **"luamemo has no database for this project yet"** — no `.luamemorc` from the
+  folder the client started the server in upward (or it names no `MEMO_DB`). Run
+  `memo calibrate` in the project, or add `--project /path/to/project` to the
+  entry's `args`; then restart the server in the client.
+- **"… is ignoring …/.luamemorc — it is committed to the repository" / "memo didn't
+  write it"** — review the file, then `memo config trust` in the project.
+- **The tools don't appear** — the client can't start `memo`: GUI apps often don't
+  see your shell's `PATH` (macOS especially); use the full path
+  (`memo mcp --print-config` prints it).
+- **"memo mcp: mcp/server.lua not found"** — the rock is incomplete or moved:
+  reinstall it (`luarocks install luamemo`).
+- **A library message** (`libsqlite3` / `libsodium` not found or too old, or
+  "luamemo runs on LuaJIT") — install the package it names, or point
+  `MEMO_LIB_SQLITE3` / `MEMO_LIB_SODIUM` at a copy. `memo ping` shows what it loads.
+- **A setting refused** (e.g. "MEMO_EMBEDDER must be one of …") — `memo config
+  check` names every problem; an invalid embedder, dimension, role or org-share
+  value stops luamemo rather than fall back.
+- **Writes fail, search works** — usually the embedder: `memo ping` checks it.
+- **The agent never calls `memory_brief`** — an old client may not pass the usage
+  rules on: `memo doctor` says so; until it's updated, the skill, the agent or the
+  hook carry them.
 
-**"empty response from server"** (HTTP mode) — Your `luamemo` HTTP API isn't
-reachable. Test with `curl $MEMO_URL/recent` directly.
-
-**"invalid JSON response"** (HTTP mode) — The API returned HTML or plain text
-(likely 401/403/500). Run with `MEMO_DEBUG=1` and inspect stderr for the raw
-request URL, then hit it with `curl` directly.
-
-**Tools don't appear in Claude Desktop** — Confirm `lua` is on the PATH
-seen by Claude (it inherits the *login shell* PATH on macOS, not your
-terminal's). Use an absolute path like `/usr/local/bin/lua` if needed.
-
----
-
-## See also
-
-- Project root: [`../README.md`](../README.md)
-- MCP spec: <https://spec.modelcontextprotocol.io/>
+See also: the main [README](../README.md) and the
+[MCP specification](https://modelcontextprotocol.io/specification).

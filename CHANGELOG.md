@@ -1,5 +1,766 @@
 # Changelog
 
+## [0.5.0] — unreleased
+
+luamemo is now an MCP server with a local database: private memory for AI
+agents, set up and governed with the `memo` CLI. No database server, no
+password, no Docker.
+
+### ⚠ New foundation: SQLite through LuaJIT, libsodium (set each project up again)
+
+- **No database server.** Each project's memory is one SQLite file in
+  `~/.local/share/luamemo` (`$XDG_DATA_HOME/luamemo`; directory 0700, files 0600),
+  reached through LuaJIT's FFI; several processes (the MCP server, `memo`, the
+  hooks) use it at once (WAL). `MEMO_DB` names it — a name in the data directory or
+  a path; `memo calibrate` gives each project its own (`<dir>-<checksum>`, `--db`
+  to choose). Nothing secret is left in `.luamemorc` or an MCP client config.
+- **LuaJIT is the only interpreter** (Lua 5.1 – 5.5 support is gone; Windows
+  through WSL). Two system libraries: libsqlite3 ≥ 3.35 (FTS5, JSON) and
+  libsodium ≥ 1.0.18 — found by their versioned names, or where
+  `MEMO_LIB_SQLITE3` / `MEMO_LIB_SODIUM` point; a missing one is named with the
+  package to install. `memo ping` shows which copies it loaded.
+- **Search is exact at every size**: every vector in scope is scored (float32
+  BLOBs), and the candidates are the vector top-N plus the full-text top-N.
+  Full text is FTS5 ranked with Postgres' cover-density `ts_rank_cd`,
+  reimplemented as an FTS5 function (BM25 measured 0.7 points worse). Recall is
+  unchanged: on the same vectors, every benchmark within +0.4 / −0.1 points of
+  the Postgres store (README → Benchmarks). Search is faster: 1,000 memories
+  3.9 ms (was 136), 5,000 18.3 ms (was 167), 100,000 233 ms.
+- **One embedding space per database**: the first vector fixes the dimension; a
+  vector of another size is refused, naming `memo reembed`. `memo reembed --all`
+  re-embeds every scope (an org replica re-syncs) and the database moves to the
+  new size when it's done.
+- **An embedder that rejects an input as too long no longer loses the memory**:
+  the text is halved and retried, the memory flagged `was_truncated` with its
+  full text kept; one still refused is stored without a vector (found by its
+  words) and the write says so. The in-process GGUF embedder fed llama.cpp an
+  unfilled token buffer for an over-long input ("failed to initialize batch") —
+  fixed in the shim, which also reports truncation.
+- **The vault moved into the database** (`lm_secrets`): XChaCha20-Poly1305 with
+  each value bound to its name, writes in a transaction (two processes storing at
+  once lost a write before). Its key is `~/.config/luamemo/vault.key` — the first
+  `memo secret-store` creates it — or `MEMO_MASTER_KEY_PATH` / `MEMO_MASTER_KEY_ENV`.
+  `MEMO_SECRETS_FILE` is gone.
+- **Crypto is libsodium** (the pure-Lua X25519 / Ed25519 / AES are gone).
+  Identities carry over: existing device keys, fingerprints and pairings stay
+  valid.
+- **New:** `memo backup [PATH]` (a consistent copy while in use, 0600; says the
+  vault key and keyring aren't in it), `memo export` / `memo import` (JSON Lines:
+  memories and facts; vectors reused when the embedder matches, else embedded
+  again; a second import of an export adds nothing; one memory per line from any
+  tool), `memo calibrate --db`.
+- **Removed:** PostgreSQL, pgvector, the brute-force and LSH backends and their
+  settings, `memo migrate`, the schema files and migrations, `MEMO_DB_URL`, the
+  `pgmoon` dependency, `memo doctor --setup`, calibrate's `--hosted`,
+  `--no-migrate`, `--docker-compose`. luamemo warns about an old setting name and
+  says what replaced it. `hooks/cursor/pre_compact.sh` is gone too: it targeted a
+  hook interface Cursor doesn't offer and couldn't be tested — Cursor gets
+  luamemo through MCP; a Cursor hook is a future goal.
+- **No automatic migration from 0.4** (pre-1.0): run `memo calibrate` in each
+  project; README → *Upgrading from 0.4* has a `psql` → `memo import` recipe for
+  the old memories and facts.
+
+### The Lua API is internal — every capability is on `memo` and MCP
+
+`require("luamemo")` is no longer documented or promised to other programs; the
+CLI, the MCP server, `memo serve` and the maintenance are built on it. Everything
+it could do is reachable from `memo` **and** an MCP tool (a parity test keeps it
+so); people change settings, agents only read them. The operations both offer —
+search, recent, update, embed, maintenance, learning — read their arguments in one
+place (`luamemo/ops.lua`), as text from `memo`'s flags or typed values from MCP, so
+the two surfaces can't drift apart.
+
+- **Settings:** one registry of every setting (87) — `MEMO_<NAME>` in the
+  project's `.luamemorc`, `~/.luamemorc` (now read by `memo` too) or the
+  environment. `memo config list | get | set | unset | check | trust` checks a
+  value before writing it; `memo config list --markdown` generates
+  [SETTINGS.md](SETTINGS.md) (a test keeps the two equal). The MCP server reads the
+  `.luamemorc` files itself (the client's environment wins); `memory_status
+  {details}` lists every setting and where it came from. A mistyped embedder,
+  dimension, role or org-share value stops luamemo instead of falling back; an
+  unknown `MEMO_` name is named with the closest setting. 39 options that only the
+  Lua API reached are settings now — authenticated embedders, the cross-encoder
+  reranker, the LLM summarizer, dedup, search boosts, defaults.
+- **Settings files are data; a project's must be memo's own or trusted.** `memo`
+  used to `source` the project's `.luamemorc` as shell, so a cloned repository could
+  run code on any `memo` call (the session-start hook's included); and the MCP server
+  reading project files would have let a committed one redirect the embedder.
+  Values are now parsed, never run, and a project's `.luamemorc` memo didn't write —
+  committed to git, or in a downloaded folder (a zip, a tarball), or edited by hand —
+  is ignored until `memo config trust` (checksum per machine; a changed file needs
+  trusting again; memo's own writes keep it trusted). A downloaded project's file
+  could otherwise point the embedder at its own server, with the vault's keys in the
+  headers (`{secret:NAME}`). An ignored file is named in `memory_brief` and
+  `memory_status`, so the agent tells the user — its memories would otherwise go,
+  unsaid, into the user's own database.
+- **A project's settings never name code to run.** `MEMO_LUA` (the interpreter memo
+  runs), `MEMO_LIB_SQLITE3`, `MEMO_LIB_SODIUM` and `MEMO_GGUF_SHIM` (libraries
+  luamemo loads) come only from the environment and `~/.luamemorc`: from a project's
+  file, a downloaded folder's `MEMO_LUA='./tools/x.sh'` ran its own script on
+  `memo brief` — that is, when the folder was opened with the plugin installed.
+- **Credentials in headers come from the vault:** `{secret:NAME}` in
+  `MEMO_EMBEDDER_HEADERS` / `MEMO_RERANK_HEADERS` / `MEMO_SUMMARIZER_HEADERS` is
+  filled in when the request is made and masked in errors; `memo config set`
+  refuses a plain-text credential, and calibrate prints the recipe when an
+  embedder answers 401 / 403.
+- **MCP: 27 tools** (was 22): `memory_summarize`, `memory_learn` (run / status /
+  rollback), `memory_embed`, `memory_tune_weights`, `memory_brief`.
+- **Facts come with every search.** `memory_search` and `memo search` return the
+  knowledge-graph facts the query is about (current value, since when, the
+  previous value) next to the memories — no separate fact tool. Measured on a
+  project memory full of outdated notes: with facts recorded, Gemma 4 e4b went
+  from 60 % to 94 % correct and llama3.1:8b from 44 % to 77 %; a separate fact
+  tool changed little (small models rarely called it, and guessed the names
+  wrong when they did). Agents still can't write facts (they recorded stale
+  ones); people and their scripts do, with `memo kg`.
+- **More per-call options on MCP:** `memory_delete` deletes by filter after a
+  preview and a 5-minute confirmation token; `memory_write` takes `items` (up to
+  100), `created_at` and `tier`; `memory_search` takes `metadata_filter`, `rerank`,
+  `hybrid_weights`, `min_score` (now a real cut-off) and `tier_max`;
+  `memory_recent` takes `kind` and `offset`.
+- **CLI:** `memo kg assert | query | invalidate | timeline`, `memo embed`,
+  `memo tune-weights` (the best search blend for a scope — `eval/tune_weights.lua`
+  is gone, and it embedded with `hash` whatever the database used), `memo delete
+  --scope … [--kind] [--meta] [--yes]`, `memo learn --status | --rollback`,
+  `memo write --created-at | --tier`, `memo search --scopes a,b | --metadata-filter |
+  --min-score | --rerank | --hybrid-weights`; `--metadata` is parsed as JSON.
+- **Summarization without OpenResty:** with `MEMO_SUMMARIZER_INTERVAL_SECONDS`
+  set, writes summarize old, light memories at most that often (as auto-digest
+  does).
+
+### Connecting MCP clients: `memo mcp`
+
+- **`memo mcp [--project PATH]`** runs the MCP server with the project's settings,
+  found as for every `memo` command — so a client's entry is the same everywhere
+  and holds nothing secret: `{"command": "/path/to/memo", "args": ["mcp"]}`.
+  `memo mcp --print-config` prints it (the `mcpServers` and VS Code `servers`
+  shapes, and the `claude mcp add` line). It finds `mcp/server.lua` next to itself
+  in a checkout, or in the LuaRocks tree it was installed in.
+- **The project is found from any subfolder:** the nearest directory upward that
+  holds a `.luamemorc` (never the home directory's own `~/.luamemorc`, the user
+  file); `memo calibrate --root DIR` / `memo mcp --project DIR` name one and win
+  over `MEMO_PROJECT`.
+- **No settings → the server still starts**, and every tool answers with what to
+  do (run `memo calibrate`, pass `--project`, or trust a committed `.luamemorc`).
+- **`~/.memorc` is no longer read:** `memo calibrate` moves its settings into
+  `~/.luamemorc` (a setting already there is kept) and removes it; until then every
+  command says so.
+- **`memo calibrate` writes the generic entry** for VS Code (`.vscode/mcp.json`,
+  `--project ${workspaceFolder}`), Cursor and Claude Desktop (one entry per project,
+  its folder pinned), replaces the entries it wrote before (`luajit …/mcp/server.lua`
+  with `MEMO_*` settings in `env`) and keeps one you wrote yourself; it always
+  prints the entry for other clients. It no longer copies settings into client
+  configs: a setting the server needs that only your shell sets (e.g. `MEMO_CA_FILE`,
+  `MEMO_ORG_IDENTITY`) is offered for `.luamemorc` instead. The Claude Code plugin
+  starts `memo mcp`, and its session-start hook no longer runs `~/.luamemorc` as
+  shell (memo reads it).
+- **MCP 2026-07-28** (stateless: `_meta` on every request, `server/discover`,
+  `resultType`, caching hints, error -32022 for an unknown version) alongside the
+  `initialize`-based 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05 — each client
+  at its own version (was: 2024-11-05 for everyone); JSON-RPC batches are answered;
+  a line that isn't JSON gets a parse error instead of silence.
+- **Usage rules in the connection:** the server sends `mcp/instructions.md` as MCP
+  `instructions` — start with the brief, search before answering, write as you go,
+  keep secrets out of the chat, leave approvals and settings to people — so a
+  client without luamemo's skill, agent or hooks still knows how to use it. The
+  skill and the agent carry the same rules, word for word.
+- **`memory_brief`** — the session brief (`memo brief`) as a tool, for clients
+  without hooks.
+- **Old clients are named:** the server records each client's name, version,
+  protocol and capability names (`~/.config/luamemo/clients.json`); `memo doctor`
+  and `memo calibrate` name a client too old for the usage rules (before
+  2025-03-26), and the first brief of a session tells the agent.
+
+### Fewer tokens per session
+
+- **The tool list is 39 % smaller** (24 KB → 15 KB of JSON, every tool kept): the
+  descriptions no longer repeat the usage rules the server sends once as instructions.
+  `MEMO_MCP_TOOLS=core` offers only the 16 everyday tools (10 KB); the others stay on
+  `memo`.
+- **Compact answers:** `memory_search` / `memory_recent` / `memory_get` rows leave out
+  the scoring internals (`vec_score`, `fts_score`, `weight`, `decay_rate`, …) and empty
+  fields — a 10-result search went from 4.5 KB to 2.5 KB; `verbose: true` returns whole
+  rows. `memory_write` and `memory_update` answer with the memory's id, scope, kind,
+  title and tier (and a `warning` when the store kept it otherwise) instead of echoing
+  the text they were sent — an update of the importance alone sent the whole body back
+  (2.3 KB → 95 bytes); `memory_status` no longer repeats the total in every scope's row.
+- **A long memory doesn't cost its whole length in every search:** in `memory_search` /
+  `memory_recent` rows a body is at most 2,000 bytes (`truncated`; `memory_get` has it
+  whole). And the capture hooks save at tier 0 — the digest's raw input — so their
+  conversation chunks stay out of searches: at tier 1 a search without a scope returned
+  them whole (three saves: 30 KB, about 7,700 tokens). Tier 0 now stays out everywhere an
+  agent reads: `memory_recent` hides it as search does (`tier_min`; a session scope's
+  newest 20 were all transcript chunks — 27 KB → 1 KB), `memory_promote` leaves it out of
+  the summary (a session's chunks made a 122 KB "summary" searches then returned; they
+  stay for the digest), a search no longer distils it into observations (they got past
+  its tier filter), and its lines no longer become "User has mentioned …" memories at
+  tier 1 (the assistant's lines among them).
+- **No answer says the same thing twice:** with the default summarizer an observation is
+  a memory's own text, appended after that memory in the same search; one repeating a
+  result is left out.
+- **Org searches without the bookkeeping:** compact rows leave out luamemo's own metadata
+  (`lm_org_id`, sync clocks, proposal links) and an org memory's `proposers` — people's
+  e-mail identities, sent to the model on every call; together half of an org search's
+  answer (4.1 → 2.2 KB for 10 results). `verbose` keeps them.
+- **Code-map answers are plain text:** `index_search` / `index_outline` /
+  `index_explore` / `index_status` sent their lines inside JSON
+  (`{"ok":true,"text":"…\n…"}`, `index_status` its counts twice), every line break and
+  `/` escaped; they now send the text itself (2–4 % smaller). JSON answers no longer
+  write `/` as `\/` (lua-cjson does), a character per path or URL separator.
+- **Less work per write and search:** a batch write's duplicate check scores the
+  stored vectors in place, as a single write does (it unpacked up to 1,000 of them
+  into Lua tables); the facts lookup that comes with every search skips code-map scopes
+  and asks SQLite only for the facts naming a query word (it scanned a scope's 1,000
+  newest in Lua); the observations every search consults are scored where they are stored,
+  not unpacked into a Lua table each per search (12.7 → 3 ms at 482 observations, the same
+  results) — and so are they when the first search after a write consolidates it (8.2 →
+  2.7 ms at 486 observations, 36.6 → 7.1 ms at 1,575; the same observations reinforced
+  or made). `memo write` / `search` / `recent` build their request with one `jq`
+  instead of one per option (jq 1.6 or newer).
+- **Half the embedder calls:** a new observation the default summarizer makes is a
+  memory's own text — it was embedded again (one more call per memory written, all
+  inside the first search after the writes: 101 calls after 100 writes); it now takes
+  that memory's vector. On a paid embedding API, that was the cost of every write twice.
+- **An org central answers a dev's push in constant time:** its lookups by proposal ref
+  (each status check, withdrawal and proposal) matched inside every proposal's
+  proposers list — 22 ms a ref at 20,000 proposals, 1.1 s for a push's 50 checks while
+  the central served one request at a time. An indexed mirror (migration `005`, kept by
+  triggers) answers them: 0.3 ms a ref, whatever the count.
+- **`memo index ingest` runs ctags once per 200 files** (Go, Rust, Java, … — the
+  languages without a built-in parser), not once per file: 200 Go files index in 0.3 s
+  instead of 1.3 s.
+- **Indexing a big project no longer slows down with its size:** `memo index ingest` /
+  `update` replace each file's rows by its path, and nothing indexed the path — every
+  file searched the whole code map (2,000 files: 47 s; now 6.7 s, ~3 ms a file however
+  large the map). `index_outline` read every symbol of the project to find one file's
+  (59 ms at 5,000 files; now 0.1 ms), as did `index_explore` per neighbouring module.
+  A new index (migration `004`, applied when a database is next opened) answers these;
+  metadata filters on text (`memory_search` / `memory_delete`) can use it too.
+
+### Install, CI and releases
+
+- **`luarocks install luamemo` works with the LuaRocks systems package.** The
+  rockspec required `luajit >= 2.1`, which a LuaRocks running on Lua 5.1 (Debian's
+  and Ubuntu's `apt install luarocks`) can never provide, so the rock didn't
+  install. It now depends on `lua ~> 5.1`; `memo` runs LuaJIT itself.
+- **The rock carries every module:** the rockspec is generated
+  (`eval/release/rockspec.lua`). 0.4.1's hand-kept list missed 16 modules; a test
+  keeps the two equal.
+- **A `--local` or custom LuaRocks tree works without `luarocks path`:** `memo`
+  finds its modules in the tree it's installed in.
+- **The in-process GGUF embedder without a compiler:** each release ships a
+  prebuilt runtime for Linux x86_64 and macOS arm64 (the shim plus llama.cpp b9976).
+  `memo calibrate` offers it and `memo gguf install` gets it. The download is
+  checked against the checksum the installed rock carries; `memo gguf status`
+  shows what is in use.
+- **CI on every push** (GitHub Actions): the suite on Ubuntu, with and without
+  lua-cjson, then a smoke test of the rock installed into a fresh tree. A
+  **Release** workflow runs the checks, CI and the GGUF runtimes, tags the release,
+  smoke-tests the packed rock, creates the GitHub Release and uploads to
+  luarocks.org on request. See [RELEASING.md](RELEASING.md).
+- **New tests:** live Ollama / TEI embedders (`test_embedders_live`, skipped when
+  nothing answers), the installed rock (`test_rock`), the rockspec, the prebuilt
+  GGUF runtime.
+
+### Security
+
+- **`memo secret-store` put the secret on a command line:** the value went to `jq` as an
+  argument, readable by any local user while it ran (`ps`, `/proc/<pid>/cmdline`). It goes
+  on stdin now.
+- **A project's own Lua files could run as luamemo's (0.4.x and earlier — update).**
+  LuaJIT searches the working directory first (`./?.lua`, `./?.so`), and `memo` put
+  `./?/init.lua` in front as well. So in a project holding a `luamemo/init.lua`, a
+  `cjson/safe.lua` and the like, that file ran instead of luamemo's code: from any
+  `memo` command, from an MCP server started in the project, and from the Claude Code
+  plugin's session-start hook as soon as the project was opened. `memo`, `memo mcp`
+  and the server now keep only absolute entries on the module paths; a test keeps it
+  so.
+- **`secret_execute` can't hand a secret, or a credential file, to the agent.** The
+  response is masked (the value as sent, URL-encoded and JSON-escaped — a server that
+  echoes the request used to return it) and bounded (MCP: 64 KB by default, up to
+  1 MB with `max_bytes`; `truncated` says so). Files the MCP tool uploads must be
+  regular files inside the project (symlinks resolved), never hidden or credential
+  files (`.env`, keys, `.luamemorc`, …), at most 50 MB together, and none when the
+  server runs outside a project. Before, any path relative to the server's working
+  directory was read. A multipart field name or content type can't carry a line break
+  into the part's headers.
+- **Credentials are scrubbed from every memory before it is stored.** The capture
+  hooks now really save the conversation (see Fixed), so a key pasted into the chat
+  would have been kept and come back in every search. Private-key blocks (also cut
+  off), JWTs, tokens with a known prefix (`sk-`, `ghp_`, `AKIA`, `xoxb-`, …), Bearer /
+  Basic credentials, URL credentials and `password=…`-style values that mix letters and
+  digits become `[redacted]` — in the title, the body, tags and metadata, however the
+  memory is written (MCP, `memo`, hooks, import, updates). Commit SHAs, UUIDs and code
+  are left alone. The hooks hand the
+  conversation to `memo write --body -` on stdin, not on its command line, where `ps`
+  shows it to other users. The org-proposal filter shares the scrubber's list of key
+  formats, so the central now also refuses proposals holding GitLab tokens or Basic
+  credentials.
+- **An agent can't replace or silently delete a stored secret.** Over MCP,
+  `secret_store` adds new secrets only (replacing one is `memo secret-store`), and
+  `secret_delete` takes two calls — a preview with a confirm token, then the delete.
+- **HTTPS is TLS 1.2 or newer** (1.1 was still allowed; RFC 8996 deprecates it).
+- **`memo import` can't plant facts in a dev's org replica:** an imported fact for the
+  read-only `org:` scope was inserted (`memo kg add` refuses it), and searches reported it
+  as the org's current truth. Such a line is now refused, by line number.
+- **`memo calibrate`'s project scan quotes the project's path:** it went into `find`
+  as it is — a directory named `x$(…)y` (a downloaded archive's) ran that command, and
+  one with a space in its path scanned nothing.
+- **Smaller hardening:** credentials in URLs (`user:password@`, `?key=…`, `&access_token=…`)
+  are masked wherever luamemo shows a URL, `memory_status` details included; the
+  capture hook keeps its cooldown file in `~/.cache/luamemo/hooks` (0700), not the
+  shared `/tmp`; an MCP client's name and version are stored and printed without
+  control characters; every private file luamemo writes (settings files, the trust
+  list, the org registry, the client record) is created 0600 from the start — none
+  is world-readable for the instant between writing and `chmod` any more — under a
+  random temporary name; a symlinked `~/.luamemorc` (a dotfiles manager's) is written
+  where it points, while a project's settings file that is a symlink is left alone (a
+  downloaded folder could point it at any file of the user's, and writing through the
+  link would rewrite that file); the CI and release workflows pin GitHub's actions by
+  commit.
+
+### Fixed (found during the rebuild)
+
+- **Opening a database no longer changes the mode of its directory.** luamemo made
+  whatever directory held the database 0700: `MEMO_DB=/tmp/x.db` locked down `/tmp`,
+  a relative path the current directory, a path under `/dev/null` `/dev/null` itself
+  (other programs then failed to open it). Only a directory luamemo creates is 0700
+  now; the default data directory still is.
+- **Without lua-cjson, the learned reranker and the projection trainer failed to
+  load**, as did several benchmark scripts: they loaded `cjson` directly, but
+  lua-cjson is optional. They now use `luamemo.json` (lua-cjson when installed,
+  else the bundled dkjson); a test keeps it that way. Found by the first CI run on
+  a clean machine.
+- **The bundled JSON fallback now encodes like lua-cjson.** It treated a numeric
+  field `n` as an array length (metadata `{n = 7}` was written as seven nulls) and
+  wrote an empty table as `[]` (MCP capabilities went out as `"tools": []`).
+- **`memo write` without `--scope` ignored the project's `MEMO_SCOPE`.** The memory
+  landed in `global`, where the agent's searches, scoped to the project, never
+  found it.
+- **MCP results encoded an empty list as `{}`** (search, recent, secrets, diary);
+  they now return `[]`.
+- **The Claude Code capture hooks never saved a conversation.** They read
+  `CLAUDE_TRANSCRIPT_PATH` / `CLAUDE_SESSION_ID`, which Claude Code doesn't set
+  (it passes the hook input as JSON on stdin), and a transcript shape it doesn't
+  write — given the variable, they saved "ASSISTANT: " lines with every word lost.
+  They now read stdin and Claude Code's transcript (text only — no tool calls,
+  tool results, meta or subagent lines); they also needed `MEMO_DB_URL` and
+  printed `memo write`'s output.
+- **`memo` run outside its checkout loaded no luamemo — or an older installed
+  copy.** It now puts the modules next to it first (as the MCP server does), so
+  a plugin's clone works from any project.
+- **The plugin's session-start hook failed on a fresh clone**: git checks
+  `cli/memo` out without its executable bit; the hook now runs it with `bash`.
+- `memo summarize --weight-threshold` was ignored; digest ignored
+  `MEMO_CONSOLIDATE_THRESHOLD` (always 0.80); `MEMO_RERANK_EPSILON` never reached
+  the learned reranker.
+- A metadata filter with a value it couldn't compare was silently dropped — a
+  bulk delete would have matched the whole scope. Booleans are compared now;
+  anything else is refused.
+- `memo kg … --at` refused Unix seconds; `memo search` / `recent` / `kg query`
+  printed `"results": {}` instead of `[]` when nothing matched.
+- A search's `facts` never included a fact older than the scope's 1,000 newest.
+- **Search got slower with every memory in the scope:** its text step let SQLite walk
+  every row of the scope and run the full-text match per row (a plan chosen for the bound
+  `LIMIT ?`) — 0.5–2 s a search at 5,000 memories, whatever matched. It now starts from
+  the full-text index: about 15–25 ms. And a batch write's duplicate check sorted the
+  whole scope to find its newest candidates: a new index (scope, updated_at) — migration
+  `003`, applied when a database is next opened — reads them directly (28 → 7 ms at 5,000
+  memories). And the first search after a bulk write ran the whole pending consolidation
+  inline (clustering every new memory: 9 s after 5,000 rows); a search now consolidates
+  at most 100 of them, the rest over the next searches (or `memo digest`).
+- **Every MCP tool checks its arguments against its own schema** before it runs: a
+  wrong-typed argument (an object as a scope, a number as the diary's agent name, null for
+  a required field) was a Lua error in the handler — 45 bare "Internal error"s across 9
+  tools in 720 wrong-typed calls; each is now a tool error naming the argument. A number
+  for a string, `"5"` for a number and `"true"` for a boolean are taken as meant; JSON
+  text for an object or a list is parsed by the tool, as before. A list or an object
+  holds at most 200 entries unless its schema says otherwise: 10,000 scopes or
+  metadata-filter keys overran LuaJIT's argument limit or SQLite's expression depth.
+- **A wrong-typed field in a write gave a bare "Internal error":** an object or a null as
+  the title or body crashed deep in the store, a string as metadata surfaced a raw SQLite
+  message. Each is now refused with what is wrong (`body must be text`, `metadata must be
+  an object`, `tags must be a list of words`); a number is taken as text.
+- **A malformed answer from an LLM reranker failed the whole search:** an index like `2.5`
+  passed the range check and crashed it, and an error an adapter raised escaped too. Such
+  an index is refused, and search falls back to its own ranking whenever the reranker
+  fails (as documented — reranking is best-effort).
+- **Text cut to a length could end inside a character** (`decisão` → `decis` + a stray
+  byte): titles calibrate makes from commit subjects, index rows, sensing notes, the brief,
+  `index_search` docstrings, and text sent to embedders, rerankers and summarizers — which
+  may refuse what isn't valid UTF-8. Every cut ends on a character now (`util.cut_utf8`),
+  and whatever the MCP server sends is valid UTF-8 (a stray byte from an earlier version
+  goes out as U+FFFD).
+- `memo calibrate` read a hand-edited, double-quoted value (`MEMO_DB="…"`) with its
+  quotes: it had a reader of its own that knew single quotes only.
+- A batch write (`memory_write` with `items`, dedup `update`) lost text: of two
+  near-duplicates in the batch, the second was reported merged into the first but its
+  body never stored; with a first one that had no body, the batch failed.
+- `memo write` / `update` / `search` / `recent` looped forever when the last option
+  had no value (`memo write --title`); they now exit 2 with a message.
+- A dev whose embedder changed size could never finish the switch (the replica
+  re-sync and `memo reembed` waited on each other).
+- `memo reembed` left a scope's observations (what consolidation distils from its
+  memories) in the old embedder's space: after a switch of size no search found them
+  again. They are re-embedded with the scope's memories now (`observations` in the result).
+- **A deleted memory went on reaching agents:** consolidation distils observations from
+  memories, and with the default summarizer an observation is a memory's own text — after
+  `memory_delete` (a confidential note, say) searches still returned it, and after
+  `memory_update` the old text came back beside the new. An observation now goes with the
+  memory it came from (a delete, a delete by filter, new text), and so do the
+  "Preference: …" memories written from its text; an updated memory is consolidated
+  again. `memory_get` of a missing id says "not found" (it said "Error: nil").
+- **Acting on an observation reached another memory:** a search's observation rows carried
+  their own table's id as `id`, which `memory_get` / `memory_update` / `memory_delete` read
+  as a memory id — an agent deleting "that result" deleted an unrelated memory, in any
+  scope. They carry `observation_id` now. And a search filtered on `kind`, metadata, time
+  or tier no longer has observations appended whatever the filter (they have none of
+  those); `min_score` holds for them too.
+- **A decision could vanish into a hook's transcript chunk:** a write nearly the same as a
+  tier-0 row (the raw conversation the hooks save) merged into it and stayed tier 0 —
+  hidden from search, then deleted by the digest; the other way round, a chunk merged into
+  a memory overwrote its text. Near-duplicates merge only within tier 0 or within tier ≥ 1.
+- **The MCP server could be stopped by one message** when lua-cjson isn't installed (it is
+  optional): the bundled JSON parser recursed per nesting level and a deeply nested line
+  overflowed the stack, out of the server's loop. It is a parse error now, and nothing a
+  message raises ends the server.
+- **`memo index ingest` built a map nobody read:** it wrote `codeindex:default`, while the
+  brief and the `index_*` tools looked in `codeindex:<project>` — following the brief's
+  "build with: memo index ingest" changed nothing, and the agent went back to grepping and
+  reading files. One rule now: the project of `MEMO_SCOPE` (`repo:x` → `codeindex:x`).
+- `memory_write` with `items`: a duplicate inside the batch was reported as failed
+  ("merged into batch item 1", `ok: false`), so an agent sent it again; it is answered
+  with the row it joined (`merged_into`).
+- **One far-off time made a scope unreadable:** a backdated `created_at` past what the
+  clock functions show (a nanosecond count read as seconds) was stored, and every
+  `memory_search` / `memory_recent` of that scope then failed; a millisecond count gave a
+  5-digit year an export couldn't read back. Times outside the years 1000–9999 are
+  refused (writes, imports, facts), and a stored one no longer breaks a read.
+- `memory_update` with `scope: ""` moved the memory into the empty scope, where only its
+  id found it; an empty scope or kind is now no change. `memo write-many` ignored a
+  line's `tier` and `created_at` (`memo write` and `memory_write` took them): the three
+  read a memory's fields in one place now.
+- **An edit whose text the embedder rejected as too long was lost** (`memory_update`,
+  `memo update`, a dedup merge, synced directives, accepted proposals): it failed with
+  `update: db error: nil`, while a write of the same text is kept without a vector. An
+  update keeps it the same way now (`was_truncated`, a warning). `memo reembed` failed on
+  such a memory too and left its old vector — after a change of vector size the switch
+  could never finish.
+- `memo export --out` onto an existing world-readable file kept its mode (now
+  0600); `memo learn --rollback` now records its own audit row.
+- `recall_bench --mode ci` was flaky under LuaJIT (scope iteration order) — it
+  writes in a fixed order now.
+
+### Federation (org mode)
+
+- **One binary, three roles** (config only, never auto-detected): *solo*
+  (default, unchanged — one database per project), *dev* (`memo calibrate
+  --org-url URL --org-fingerprint FP`) and *org central* (`memo calibrate --role
+  org --org-name NAME`). Devs talk to the central through `memo serve`, never its
+  database. See README → Federation.
+- **Local network / VPN only — no hosted anything.** `memo serve` binds only to
+  loopback / private / Tailscale addresses and drops public peers; a dev refuses a
+  central that resolves to a public IP (new `luamemo.netguard`: IPv4 + IPv6,
+  CGNAT 100.64/10, ULA, link-local, every resolved address). `memo serve` is an
+  event loop: a client that sends or reads slowly can't hold it up for others;
+  open connections are capped (overall and per address, the longest-idle one
+  closed to make room) and request bodies in flight share a memory budget.
+- **No passwords or tokens: keys + a pairing code (SSH model).** The central's
+  Ed25519 identity has a public fingerprint the admin hands out; each dev machine
+  creates its own key (per-user keyring `~/.config/luamemo`, 0700 / 0600,
+  encrypted, never leaves the machine). Pairing pins the central's key; both sides
+  show the same short code derived from both public keys; the admin approves that
+  code (`memo org devs pending | approve CODE | remove REF`; a code matching two
+  pending requests is refused, not approved for both). Pairing is limited per
+  address (IPv6: per /64) — a few pending requests and a few requests a minute,
+  checked before any signature work — so one machine can't crowd the queue; a
+  request claiming someone's identity from another address can't remove theirs;
+  the queue is storage-bounded (the oldest pending request makes room), requests
+  expire after 24 h, and `memo org devs clear-pending` drops them all. An
+  approval that races with the device re-sending its request is kept.
+  Nothing secret is typed, printed or transported.
+- **Built-in encrypted channel (protocol 3, libsodium).** One-round handshake
+  (Ed25519-signed transcripts, ephemeral X25519, HKDF-SHA256 → forward secrecy),
+  then XChaCha20-Poly1305 envelopes under one key per direction, every message
+  numbered (a nonce never repeats under a key; replay / reorder refused),
+  DB-backed sessions (survive restarts). Unknown / pending / removed keys are
+  refused before expensive crypto; each hello also carries a MAC under a key only
+  that device and the central can derive (static X25519 agreement of their
+  identity keys, Ed25519 → X25519), checked with one HMAC before any signature
+  work — knowing a device's public key lets nobody force signature work or lock
+  the device out; a replayed handshake is refused. The central's signed welcome
+  names the approved identity. Peers of another protocol version refuse each
+  other, saying which side to upgrade.
+- **Secrets store: internal secrets + per-user stores.** Store instances
+  (`secrets.open`), internal entries under the reserved `luamemo.` prefix that
+  only luamemo's code can read — `secret_execute` refuses them before any request
+  and listings mark them.
+- **One org database per machine; project tags; switching.** The first project of
+  an org records its database (and embedder) as the org's database on this
+  machine; later projects join it (their `.luamemorc` gets its `MEMO_DB` and
+  embedder keys), each keeping its `repo:` scope; a project with its own memories is
+  offered `memo org adopt` (copies memories, reinforcements, retrieval events,
+  graph facts, observations and learned weights — idempotent, re-embedded when
+  the embedders differ, the source never modified). A database belongs to one
+  org. A different central fingerprint = a different org: calibrate leaves the old
+  one first (last push; replica, weights and sync state go with the last project
+  using them); `memo calibrate --role solo` leaves too. `metadata.project` tags
+  (`memo org directives --project`), and `memory_search project=…` narrows `org:`
+  scopes to one project + org-wide rows (all search legs). Existing MCP entries
+  get their database / embedder / org settings synced by calibrate.
+- **Knowledge proposals (dev → admin → org).** Devs never push memories
+  wholesale. A deterministic filter proposes a `repo:` fact / decision only when
+  it's proven by use, secret-free, free of first-person preference / style
+  language, grounded in the project's code index and not already in the org
+  (`memo org proposals [candidates --explain | withdraw | private]`); triples mode
+  only, `MEMO_ORG_PROPOSE=0` / `MEMO_ORG_PROPOSE_SCOPES` to limit. The central
+  re-checks, merges the same knowledge from several devs (support), suppresses
+  rejected content until it changes, and the admin decides (`memo org review
+  [show | approve | approve --top N | reject | remove]`). Approved knowledge lands
+  at tier 1, tagged with its project, decaying (`MEMO_ORG_KNOWLEDGE_DECAY`, 0.01/day);
+  a changed source is re-proposed as an update of the same org memory.
+- **No silent loss.** Use of approved knowledge (praise / direct command / miss,
+  top of a pushed search, the proposer's use of its original) raises its
+  importance and restarts its decay clock; decay, summarization, bulk deletes and
+  digest purges never remove it, and corrections never drop it below tier 1. Only
+  the admin removes it.
+- **Session brief:** a dev's brief says when the device isn't paired yet or the
+  last sync failed; the central's brief says what waits for the admin (pairing
+  requests, proposals — the admin decides).
+- **Protected core tier.** `memo org directives <path>` ingests Markdown standards
+  as org directives (tier 3, never decaying; one per `#`/`##` section; idempotent
+  re-sync with in-place updates and pruning — never after a skipped or unreadable
+  file). Nothing else can write that tier on the central, and every `org:` scope is
+  a read-only replica on a dev. Enforced on every mutation path (write / bulk /
+  update / delete / dedup-merge / digest / consolidation / summarizer) through
+  unforgeable in-process capabilities.
+- **Dev replica + sync.** Paged, resumable, time-boxed pulls with a versioned
+  manifest (rows that left the org are removed, missed versions re-fetched);
+  the central's vectors are reused when both sides run the same embedder, else
+  rows are re-embedded locally. Triggers: session start (`memo brief` also
+  announces the replica), a stale org-scope search (`MEMO_ORG_SYNC_TTL`, 900 s),
+  `memo org pull|push|sync|status`. Offline-safe: a failed pull keeps the replica.
+- **Feedback push.** Reinforcements on org memories, plus (default
+  `MEMO_ORG_SHARE=triples`) their retrieval triples, attributed to the identity
+  bound to the paired key (never to what a push claims) and idempotent on the
+  central. `signals` mode never sends query text, event notes or proposals, not
+  even after switching back.
+- **Central learning.** `memo org aggregate` digests the org scope and runs the
+  promotion harness over all devs' feedback with a **directives gate** (a
+  candidate reranker may not push any directive out of the top results the
+  incumbent keeps it in); devs pull promoted weights on their next sync.
+  `promote.run` gained pluggable `gates`.
+- **Serving.** `memo serve` (pure-Lua luasocket HTTP; bounded reads, strict
+  Content-Length, binary bodies, request log without query strings) is the one
+  federation endpoint — `GET /key`, `POST /pair`, `POST /hello`, `POST /call`
+  (encrypted RPC: info / snapshot / feedback / proposals). Protocol 3.
+- **Fix (affects solo too): `store.update` corrupted a "?" inside metadata or
+  tags** (`{"q": "why?"}` had its "?" replaced by a parameter). Every value is
+  bound as a parameter now.
+- **Fix (affects solo too): almost every memory was "core" (tier 3).** Tiers were
+  derived from importance with 0–1 thresholds (0.3 / 0.6 / 0.85) although
+  importance runs 0–10 with a default of 1.0, so a normal write landed in tier 3:
+  digest's promotion (1 → 2 → 3) had nothing left to do, and the federation
+  proposal filter's "tier 2 = proven by use" held for nearly everything. Writes
+  now derive `< 0.3` → 0 · `< 5` → 1 · `< 9` → 2 · `≥ 9` → 3; a write with the
+  directive capability is always tier 3; digest keeps its own 0–1 relevance scale
+  for escalation / reversal (a miss never demotes, a reversal never raises).
+  Imported memories land in the tier their importance gives them; learned
+  reranker weights should be retrained (`memo learn`) since the tier feature now
+  varies.
+- **Fix (affects solo too): documented `memo` flags were silently ignored.**
+  `memo write` / `update` / `search` / `recent` passed multi-word flags on with
+  their hyphens (`--decay-rate` never reached `decay_rate`), `memo search`
+  dropped `--since`, `--until`, `--tier-min`, `--tier-max` and `--ignore-decay`,
+  and `memo update` dropped `--scope`. All are honoured now.
+- **Docs: the MCP server's "HTTP mode" is gone from the docs** — it was removed
+  from the server in 0.2.5 (`MEMO_URL` / `MEMO_TOKEN` do nothing); the CLI and
+  the MCP server always use the database directly. The MCP README lists every
+  tool.
+- **Hardening (affects solo too): `secret_execute`'s SSRF guard** now blocks
+  Tailscale / CGNAT (100.64/10) and IPv6 private ranges and checks every resolved
+  address, not just the first. It also closes these bypasses: a `user@` part
+  (`http://8.8.8.8:80@127.0.0.1/` was checked as 8.8.8.8 but went to loopback —
+  such URLs are now refused), leading-zero IPv4 (`0177.0.0.1` is 127.0.0.1 to the
+  resolver), IPv6 forms embedding a private IPv4 (`::127.0.0.1`, NAT64, 6to4),
+  site-local `fec0::/10`, DNS rebinding for `http://` (the request connects to
+  the address that was checked), and **redirects** (a public server answering
+  302 → `http://127.0.0.1/…` had the request, `Authorization` header included,
+  followed to the internal host and its answer returned — now no redirect is
+  followed and a 3xx is reported). A failed request's error no longer quotes the
+  URL with the secret substituted in.
+- **Security fix (affects solo too): HTTPS was never verified.** luasec's
+  `ssl.https` checks nothing by default (and never the host name), so anyone able
+  to intercept traffic could read an `https://` `secret_execute` request or an
+  embedder / reranker / summarizer API key. Every https server is now verified —
+  certificate chain against the system CAs (`SSL_CERT_FILE` / `SSL_CERT_DIR`, else
+  the OS bundle) plus the new **`MEMO_CA_FILE`** (a self-hosted server's CA or
+  self-signed certificate, trusted in addition), and the certificate against the
+  URL's host. No CA found → https refuses with a message naming what to set. No
+  switch turns verification off. `luamemo.http` no longer follows redirects for
+  any caller.
+- **Hardening (affects solo too): `.luamemorc` and the CLI.** A value with a
+  newline is refused; inside a git work tree `memo calibrate` adds `.luamemorc` to
+  `.gitignore` (or says how to untrack it); a `.luamemorc` memo writes to is made
+  0600 (appending to a hand-made 0644 file kept it world-readable). Command-line
+  arguments reach the Lua side hex-encoded in the environment instead of spliced
+  into Lua source, so a crafted argument is always data. (Settings files are now
+  parsed as data — see *The Lua API is internal* above.)
+- **Fix (affects solo too): training / gating / tuning searches logged
+  themselves as retrieval feedback.** `memo learn` re-ran every harvested query
+  through `store.search`, which appended it to `lm_retrieval_feedback` — the
+  table grew on every run and learning fed on its own probes. Internal searches
+  now pass `skip_feedback`.
+- `cli/memo` runs Lua subcommands with `exec`, so a SIGTERM to `memo serve`
+  reaches the server.
+
+### Removed — Lapis / OpenResty and the Lua capture helpers
+
+luamemo is used through the `memo` CLI and the MCP server; nothing in either
+(nor in the agent hooks or `memo serve`) used these, so they are gone:
+
+- the Lapis HTTP routes (`luamemo.routes`, `memory.routes.register`) and the
+  `auth_fn` / `before_request` settings that guarded them;
+- every OpenResty path: the `resty.http` transport (HTTP now always goes through
+  luasocket + luasec, always verified), the `ngx.timer` summarizer
+  (`start_background_jobs`), the `ngx.shared` vault lock and the `ngx.log` calls;
+- `luamemo.hooks` and `HOOKS.md` (Lua auto-capture helpers — `memo write` /
+  `memory_write` take the same kind, tags, metadata and dedup strategy);
+- the `dev/` Docker Lapis app and `examples/lapis_app.lua`.
+
+What the routes and helpers did is recorded in
+`eval/fixtures/golden_routes_hooks.json`; every one of those capabilities is
+reachable through `memo` and the MCP server.
+
+Side effects: a misconfigured vault (bad master key, failed `chmod 600`) is now
+reported on stderr instead of only to nginx's log, and `corpus_health_check =
+true` writes its warnings to stderr at startup.
+
+### Fixes & compatibility
+
+- **Fix: `eval/recall_bench.lua` could not build its corpus** — it ran the
+  long-gone `eval/_make_synthetic.lua`; it now runs `eval/helpers.lua` with its
+  own interpreter.
+- **The luamemo agent no longer pins a model.** `agents/luamemo.agent.md` named
+  `Claude Sonnet 4.6 (copilot)` in its `model:` line, so VS Code switched to
+  that model whenever the agent was picked. The line is gone: the agent now
+  runs on whatever model you have selected.
+- **New: `MEMO_PROJECT=DIR`** — the project whose `.luamemorc` `memo` reads and
+  writes (and that `memo org link|adopt|leave` act on). Unset or empty: the
+  current directory, as before.
+- **Fix: `memo calibrate` persisted a garbage `MEMO_EMBEDDER_ADAPTER`** (e.g.
+  `8000`) when the probe recommended an embedder with no adapter/url/model —
+  i.e. the default `gguf_ffi` recommendation. The probe fields were joined
+  with tabs and split with `IFS=$'\t'`; tab is IFS whitespace, so `read`
+  collapsed the run of empty fields and every later value shifted left
+  (`embed_max_chars` landed in the adapter slot). Fields are now joined and
+  split on `\037` (ASCII unit separator), which never collapses; verified
+  under awk, mawk and gawk with both a sparse (gguf) and a full (ollama)
+  probe snippet.
+- **Fix: codebase-index exclude patterns matched as character subsequences,
+  silently dropping real files from the map.** `walker._glob_match` parked
+  `**` on a `"\0"` sentinel, but a Lua 5.1 pattern ends at an embedded NUL,
+  so `gsub("\0", ".*")` matched the empty pattern and inserted `.*` between
+  every character — even the built-in `.git` default then excluded any path
+  containing g…i…t in order (e.g. `luamemo/sensing/init.lua` and
+  `sensing/heuristics.lua` were missing from every `memo index ingest`). The
+  sentinel is now `"\1"`. Regression test added to `test_index_parse.lua`
+  (fails on the old walker, passes on the fix); index + brief suites 233/0
+  under both lua5.1 and LuaJIT. Re-run `memo index ingest` to pick up the
+  files earlier ingests skipped.
+- **Security: the codebase map could store credentials.** File rows keep each
+  file's first line and the map is served to agents (`index_search`), but the
+  walker indexed `.env`, `.luamemorc` (0.4 wrote the database URL on its first
+  line), key files, etc. — reproduced on a fresh project: the DB password
+  and an API key landed in agent-retrievable rows. Now:
+  - credential files are **always** skipped, whatever the flags: `.env` /
+    `.env.*` (templates `.env.example|sample|template|dist` kept), `.envrc`,
+    `.luamemorc`, `.memorc`, `.pgpass`, `.netrc`, `.npmrc`, `.pypirc`,
+    `.htpasswd`, `.git-credentials`, `.dockercfg`, `*.pem|key|p12|pfx|jks|keystore`,
+    SSH private keys, `lm_master_key*`, and anything under `.ssh/`, `.aws/`,
+    `.gnupg/` (`walker.is_secret`);
+  - inside a git work tree, gitignored files are skipped (tracked files and
+    submodule contents kept; a root that is itself gitignored is walked
+    unfiltered); opt out with `memo index … --no-gitignore` /
+    `respect_gitignore = false`;
+  - `memo index ingest|update --exclude` now **adds** to the defaults
+    (`.git`, `vendor/`, `node_modules/`) instead of replacing them — before,
+    `--exclude dist/` silently re-included `.git/` internals.
+  An existing map is purged of such files by the next `memo index update`.
+  New `eval/tests/test_index_walker.lua` (67 checks, 35 of them fail on the
+  old walker).
+- **Fix: `memo calibrate` persisted `gguf_ffi` on any LuaJIT + C-toolchain host
+  even when the shim wasn't built / no model was downloaded** — every
+  write/search then failed until the user finished a manual setup. The gguf
+  embedder is now picked only when `probe.gguf_ready()` passes (shim built,
+  model found via `MEMO_GGUF_MODEL` or `~/models/`, and one real embedding
+  succeeds under `luajit`); calibrate then persists `MEMO_GGUF_MODEL` and the
+  model's native dim. A capable-but-not-set-up host gets a working embedder
+  (service ladder, else an interim `hash` at 768 dims, the GGUF model's size) plus
+  the setup guide as an optional upgrade, with the switch steps (`memo config set`,
+  `memo reembed --all`).
+- **Fix: calibrate's own codebase scan never used the embedder it had just
+  chosen.** Later phases kept the environment from before the probe, so on a
+  fresh install the scan embedded with the 384-dim `hash` default while the
+  chosen embedder was 768-dim (`expected 768 dimensions, not 384`, 0 memories
+  written), `gguf_ffi` ran under lua5.1 (no FFI), and the generated MCP env
+  lacked the model path / `MEMO_EMBED_DIM`. calibrate now re-reads
+  `.luamemorc` after persisting (and re-picks the interpreter).
+- **Fix: calibrate reported "0 errors" when writes failed** — `write-many`
+  printed only successes to stdout; failures now stream as `{ok=false,error}`.
+- **Fix: `memo calibrate --no-gguf` was rejected** ("unknown arg") by the shell
+  wrapper although the probe supports it and its own guide recommends it.
+- **Fix: calibrate's Ollama / TEI recommendations could not embed.** The
+  service ladder chose by hardware (GPU/Docker/RAM) without checking anything
+  was running (Ollama was recommended even when unreachable), persisted
+  container-only hostnames (`host.docker.internal:11434`, `lapis-tei-embed:80`)
+  into `.luamemorc` and the MCP env although the CLI and MCP server run on the
+  host, and omitted the endpoint path the adapters POST to (`/api/embeddings`,
+  `/embed`). Now a service is chosen only if it answers a real embedding through
+  the luamemo adapter (`probe.ollama_ready`, `probe.tei_ready` — running TEI
+  containers are found via `docker ps`, model from `/info`); the tested host
+  endpoint and live dim are persisted, and the in-container URL is printed as a
+  comment in the app snippet. When nothing answers, calibrate prints what to
+  start (`ollama pull …`, a `docker run` line for TEI bge-m3) and — with no gguf
+  interim available — exits with the options instead of persisting a dead URL.
+- **Fix: `luamemo.http` returned status `1` for every plain-Lua (luasocket)
+  request.** The table form of `socket.http.request` returns
+  `(1, code, headers, status)`; the success flag was read as the HTTP status,
+  so `util.check_http` never saw a 404/500 — embedders, rerankers and
+  summarizers parsed error bodies as data (e.g. a missing Ollama model surfaced
+  as "response missing 'embedding'" instead of the 404), and transport errors
+  lost their message. New `eval/tests/test_http.lua` (throwaway local server;
+  7 of 10 checks fail on the old code).
+- **New: `MEMO_LUA`** — the LuaJIT interpreter `memo` runs (a name or a path).
+- **Fix: the codebase-index walker crashed whenever luafilesystem was
+  installed** (any Lua version): it dropped the directory object `lfs.dir`
+  returns, which luafilesystem ≥ 1.8 requires ("directory metatable expected,
+  got nil"). New lfs-vs-`find` parity test so both walker backends stay covered.
+
+### Development (eval harness / test suite — no effect on the installed tool)
+
+- **Committed test runner: `luajit eval/tests/run.lua`** (see `eval/README.md`). It runs every
+  `eval/tests/test_*.lua` in a clean environment — a fresh SQLite database per file,
+  a temporary `HOME`, no inherited `MEMO_*` — prints one line per file and exits 1 on any
+  failure. It also fixes a test-isolation bug: tests that run `./cli/memo` from the
+  repository root picked up the checkout's own `.luamemorc`, so they wrote to the developer's
+  database instead of the one they passed; and the ConvoMem / LoCoMo smoke tests defaulted to
+  a shared benchmark database.
+- The ConvoMem / LoCoMo / MemBench smoke tests read their fixtures from the
+  gitignored `eval/data/`, so they failed on a fresh clone. Fixtures now live in
+  the tracked `eval/fixtures/` (`convomem_tiny.json`, `locomo_tiny.json`,
+  `membench_tiny/`); smoke outputs go to a temp file instead of `eval/results/`,
+  and the runners are launched with the test's own interpreter (LuaJIT runs now
+  exercise them under LuaJIT).
+- `test_membench.lua` was rewritten for the current loader (the old one called
+  the removed `iter_questions` / `iter_sessions`); `membench_tiny/` uses the real
+  per-category layout and the test runs the real `membench_run.lua` on it.
+- `membench.load` iterated topic keys with `pairs()`, so question ids — and which
+  questions a `--n` subset picks — differed between lua5.1 and LuaJIT; keys are
+  now sorted. New `membench_run.lua --scope-prefix P` (default `mb`) so tests
+  never wipe real `mb:<embedder>:*` benchmark scopes. Integral MemBench ids are
+  formatted as integers (Lua 5.3+ decoded them as `"1.0"`).
+
 ## [0.4.1] — hotfix (7 issues from 0.4.0-1 beta testing)
 
 A focused patch fixing everything found during real-world upgrade testing of

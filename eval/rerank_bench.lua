@@ -1,4 +1,4 @@
-#!/usr/bin/env lua5.1
+#!/usr/bin/env luajit
 -- Phase 4 — learned reranker evaluation via k-fold cross-validation on the
 -- project-personalization set. Honest methodology: the learned model NEVER sees
 -- the test fold's labels. The `reuse` feature for a test query is derived only
@@ -9,12 +9,11 @@
 --   rerank the SAME retrieved pool for the held-out queries and compare the
 --   gold's rank vs the baseline order.
 --
--- Usage:
---   PGHOST=127.0.0.1 PGDATABASE=luamemo_dev PGUSER=postgres PGPASSWORD=postgres \
---     lua5.1 eval/rerank_bench.lua [--folds 4] [--epochs 300]
+-- Usage (MEMO_DB: a scratch name or path; the run wipes its own scope):
+--   MEMO_DB=bench luajit eval/rerank_bench.lua [--folds 4] [--epochs 300]
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
-local cjson   = require("cjson.safe")
+local cjson   = require("luamemo.json")
 local memory  = require("luamemo")
 local db      = require("luamemo.db")
 local learned = require("luamemo.rerankers.learned")
@@ -36,12 +35,11 @@ end
 local corpus  = load_jsonl("eval/personalization/corpus.jsonl")
 local queries = load_jsonl("eval/personalization/queries.jsonl")
 
-memory.setup({ embedder_local="hash", embed_dim=384, backend="auto",
-    auth_fn=function() return true end, skip_embed_probe=true })
+memory.setup({ embedder_local="hash", embed_dim=384, skip_embed_probe=true })
 local SCOPE = "perso:rrbench"
 
 -- Ingest corpus; map item_id -> memory row id.
-db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(SCOPE))
+assert(db.run("DELETE FROM lm_memories WHERE scope = ?", SCOPE))
 local id_of = {}
 for _, m in ipairs(corpus) do
     local row = memory.write({ scope=SCOPE, kind=m.kind or "fact", title=m.title or m.id,
@@ -110,7 +108,7 @@ for f=1,K do
     end
 end
 
-db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(SCOPE))
+db.run("DELETE FROM lm_memories WHERE scope = ?", SCOPE)
 
 -- report
 local function line(tag,b,l) local B,L=fin(b),fin(l)

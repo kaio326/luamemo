@@ -7,8 +7,8 @@
 -- conversation at once. Same output shape as heuristics.detect, so the
 -- orchestrator treats both uniformly.
 --
--- Degrades to {} (no signals) whenever generation is unavailable (PUC lua5.1,
--- no model, no shim) — the pipeline then runs heuristics-only. Deterministic
+-- Degrades to {} (no signals) whenever generation is unavailable (no model, no
+-- shim) — the pipeline then runs heuristics-only. Deterministic
 -- (greedy decode), so the same transcript yields the same signals.
 --
 -- OPT-IN / experimental: enabled via opts.generative on sensing.process. The prompt

@@ -1,286 +1,204 @@
-# Knowledge-graph layer (`luamemo.kg`)
+# Knowledge graph — facts that change over time
 
-> Status: Phase 16.5 — shipped 2026-05-04. Adjunct to the vector memory
-> table. Not a replacement.
+Memories answer *"what is similar to this?"*. Some questions need *"what is true
+now?"* — the current value of something that changes: a team rule, a preference,
+the version a service runs. Search can't settle those: a two-year-old rule that
+was superseded may well be the most similar match.
 
-## Why a KG layer?
+luamemo keeps such values as **facts**: `(subject, predicate, object)` triples,
+each valid over a time window. A query returns the facts valid now (or at a time
+you name); asserting a new value can close the old one, so the history stays and
+the current answer is unambiguous. A lookup costs one indexed query — no
+embedding call, no rerank.
 
-Vector memory answers "what is *similar* to this query?". That's the
-wrong shape for two important question types:
-
-1. **Directive memory** — *"What is the current CSP rule for inline
-   styles?"*. The latest answer must override older ones; vector
-   search will happily return a 2-year-old superseded rule that
-   happens to be more cosine-similar.
-2. **Entity memory** — *"What is user 42's preferred theme?"*. The
-   value changes between sessions and we need the *currently valid*
-   value, not the *most-similar-looking* one.
-
-The KG layer stores `(subject, predicate, object)` triples with a
-**bitemporal validity window** (`valid_from`, `valid_until`). Queries
-default to *currently valid* rows, which is the right answer for both
-of the patterns above. Cost is one indexed SQL lookup — no embedding
-call, no rerank.
-
-This is intentionally *not* a full RDF / SPARQL graph. There are no
-inferences, no transitive closures, no ontology. It is a fact store
-with time semantics, deliberately scoped to the patterns vector
-search handles poorly.
+It is a fact store with time semantics, deliberately small: no inference, no
+ontology, no SPARQL. It sits beside the memories; it doesn't replace them.
 
 ---
 
-## Schema
+## Validity windows
 
-Migration: [`luamemo/migrations/003_kg.sql`](luamemo/migrations/003_kg.sql)
+Every fact is valid over `[valid_from, valid_until)`. An empty `valid_until`
+means the fact holds now.
 
-```sql
-CREATE TABLE lm_kg_facts (
-    id               BIGSERIAL PRIMARY KEY,
-    scope            TEXT        NOT NULL,
-    subject          TEXT        NOT NULL,
-    predicate        TEXT        NOT NULL,
-    object           TEXT        NOT NULL,
-    valid_from       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    valid_until      TIMESTAMPTZ,                          -- NULL = currently valid
-    source_memory_id BIGINT      REFERENCES lm_memories(id) ON DELETE SET NULL,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT lm_kg_facts_validity_window
-        CHECK (valid_until IS NULL OR valid_until >= valid_from)
-);
+| Query | Returns |
+|---|---|
+| *(default)* | the facts valid now |
+| `at = T` | the facts valid at time T |
+| `include_invalidated = true` | every fact, closed ones included (audit) |
 
--- Indexes
-CREATE INDEX lm_kg_facts_scope_idx   ON lm_kg_facts (scope);
-CREATE INDEX lm_kg_facts_sp_idx      ON lm_kg_facts (subject, predicate);
-CREATE INDEX lm_kg_facts_current_idx ON lm_kg_facts (subject, predicate)
-                                     WHERE valid_until IS NULL;     -- hot path
-```
+- **assert with `supersede`** — for a value that changes: closes the
+  currently valid fact of that subject + predicate at the new fact's
+  `valid_from`, then records the new one.
+- **invalidate** — closes the currently valid fact(s) without a successor
+  ("this rule no longer applies").
+- **timeline** — the whole history of one subject + predicate, oldest first.
 
-`scope` mirrors `luamemo.scope` semantics — every query is
-implicitly scope-filtered, so multi-tenant deployments cannot leak
-across tenants.
+Every fact belongs to a scope, like memories: a query never sees another scope's
+facts. A fact may point at the memory it came from (`source_memory_id`);
+deleting that memory keeps the fact and clears the reference.
 
-`source_memory_id` is the optional back-reference to the
-`luamemo` row that asserted this fact (e.g. the chat message or
-summary that contained it). `ON DELETE SET NULL` means deleting a
-memory does **not** delete the derived facts — useful for audit but
-worth knowing if you expect cascading cleanup.
+Times are ISO 8601 (`2025-07-01T00:00:00Z`) or Unix seconds.
 
 ---
 
-## Validity-window semantics
+## Writing facts — `memo kg` (people and their scripts)
 
-Every fact has a half-open interval `[valid_from, valid_until)`.
+```bash
+memo kg assert --subject csp --predicate inline_styles_allowed --object false \
+    --supersede --scope team:eng
+memo kg invalidate --subject csp --predicate inline_styles_allowed --scope team:eng
+```
 
-- **`valid_until IS NULL`** — the fact is currently valid.
-- **Closed interval** — the fact was valid during that window only.
+`assert` takes `--valid-from T` (default: now), `--source-memory ID` and
+`--supersede`; `invalidate` takes `--object O` (close only that value) and
+`--at T` (default: now). `--scope` defaults to `MEMO_SCOPE`. Output is JSON
+(`{"ok": true, "fact": {…}}`); the exit status is 1 on failure.
 
-Three query modes are supported:
-
-| `query` arg                        | Returns                                                          |
-| ---------------------------------- | ---------------------------------------------------------------- |
-| *(default)*                        | Rows where `valid_until IS NULL`. Hot path, uses partial index. |
-| `at = <timestamp>`                 | Rows where `valid_from <= at < valid_until` (or `valid_until IS NULL`). |
-| `include_invalidated = true`       | All rows, no validity filter. Useful for audit / debugging.     |
-
-**`assert_fact{... supersede = true}`** is the convenience flow for
-entity-state updates: it `UPDATE`s the currently-valid row's
-`valid_until` to the new fact's `valid_from`, then inserts the new
-row in one logical step.
-
-**`invalidate{...}`** is the standalone version: it just closes the
-currently-valid row(s) without inserting a replacement. Use this for
-"the rule no longer applies" scenarios where there is no successor.
+**Agents can't write facts.** There is deliberately no MCP tool for `assert` or
+`invalidate`. This was measured: an agent (llama3.1:8b, 12 scripted
+conversations in which facts are stated, changed and corrected, then 16
+questions in a fresh session) answered half the questions wrong when it could
+write facts, and left stale facts marked valid. Write facts from your own
+scripts or by hand, where the invalidation logic is explicit.
 
 ---
 
-## API
+## How agents see facts — inside `memory_search`
 
-All functions return `value, nil` on success or `nil, "error message"`
-on failure. Every function takes one table argument so call-sites stay
-self-documenting.
+There is no separate fact tool on MCP. Every `memory_search` (and `memo search`)
+also returns the facts its question is about: the currently valid facts of the
+searched scopes whose subject or predicate words appear in the query (words are
+compared lowercased, `payments_team` as "payments team", a plural "s" ignored),
+up to three, each with when it took effect and the value it replaced:
 
-### `kg.assert_fact{ scope, subject, predicate, object, ... }`
-
-Insert a new fact.
-
-```lua
-local row, err = memory.kg.assert_fact({
-    scope     = "user:42",
-    subject   = "user:42",
-    predicate = "theme",
-    object    = "dark",
-    -- optional:
-    valid_from       = "2025-01-01T00:00:00Z",  -- nil = now()
-    source_memory_id = 1234,                    -- nil = no back-ref
-    supersede        = true,                    -- close prior open row first
-})
+```json
+"facts": [
+  { "subject": "payments_team", "predicate": "tech_lead", "value": "Bruno",
+    "since": "2026-09-30 …", "scope": "repo:acme",
+    "previous": { "value": "Ana", "until": "2026-09-30 …" } }
+]
 ```
 
-### `kg.query{ scope, subject?, predicate?, object?, at?, include_invalidated?, limit? }`
+The tool's description tells the agent that facts, when present, are
+authoritative for what is true now — memories may still repeat an older value.
+A search of no particular scope looks at every scope's facts except the code
+maps' (`codeindex:`).
 
-Read facts. `subject` / `predicate` / `object` are all optional
-filters; `scope` is mandatory.
+**Why this shape — measured** (2026-10-10). One project memory of 555 entries:
+400 unrelated notes, and per topic the conversation's memories plus ten older
+notes repeating the old value — what a project's history looks like. 16
+questions about values that changed; facts recorded as `memo kg assert
+--supersede` would. Correct answers:
 
-```lua
--- "What is currently true?"
-local rows = memory.kg.query({
-    scope = "user:42", subject = "user:42", predicate = "theme",
-})
--- -> { { object = "light", valid_from = ..., valid_until = nil, ... } }
+| | Gemma 4 e4b | llama3.1:8b | Claude Sonnet |
+|---|---|---|---|
+| search only | 60 % | 44 % | 16/16 |
+| a separate `memory_facts` tool | 60 % | 60 % | 16/16 |
+| facts inside the search results | **94 %** | **77 %** | 16/16 |
 
--- "What was true on 2025-04-01?"
-local rows = memory.kg.query({
-    scope = "user:42", subject = "user:42", predicate = "theme",
-    at = "2025-04-01T00:00:00Z",
-})
+Small models almost never called a separate fact tool — and when they did, they
+guessed names (`payments team` for `payments_team`) and found nothing. Facts
+inside the search reach them without asking, and with no facts recorded the
+search behaves exactly as before. Claude widened its searches and compared dates,
+so it answered right every way at this size; facts save it that work as the
+history grows.
+
+## Reading facts from a terminal
+
+```bash
+memo kg query --subject csp --scope team:eng                 # valid now
+memo kg query --subject csp --at 2025-04-01T00:00:00Z --scope team:eng
+memo kg query --subject csp --include-invalidated --scope team:eng
+memo kg timeline --subject csp --predicate inline_styles_allowed --scope team:eng
+memo context "inline styles" --scope team:eng                # search + facts in one block
 ```
 
-`limit` defaults to 100, capped at 1000.
-
-### `kg.invalidate{ scope, subject, predicate, object?, at? }`
-
-Close all currently-valid rows matching the filter. Returns the count.
-
-```lua
-local n = memory.kg.invalidate({
-    scope = "team:eng", subject = "csp", predicate = "inline_styles_allowed",
-})
-```
-
-### `kg.timeline{ scope, subject, predicate }`
-
-Full chronological history for one (subject, predicate) pair.
-
-```lua
-local rows = memory.kg.timeline({
-    scope = "user:42", subject = "user:42", predicate = "theme",
-})
--- -> { dark[t1..t2], light[t2..nil] }
-```
-
----
-
-## HTTP routes
-
-All routes live under the same `prefix` you passed to
-`memory.routes.register(app, { prefix = "/api/memory" })`:
-
-| Method | Path             | Body / params                                                                                  |
-| ------ | ---------------- | ---------------------------------------------------------------------------------------------- |
-| POST   | `/kg/assert`     | `scope`, `subject`, `predicate`, `object`, `valid_from?`, `source_memory_id?`, `supersede?`    |
-| GET    | `/kg/query`      | `scope`, `subject?`, `predicate?`, `object?`, `at?`, `include_invalidated?`, `limit?`          |
-| POST   | `/kg/invalidate` | `scope`, `subject`, `predicate`, `object?`, `at?`                                              |
-| GET    | `/kg/timeline`   | `scope`, `subject`, `predicate`                                                                |
-
-All routes go through the same `auth_fn` / `before_request` gate as
-the rest of the memory routes.
-
-> **No MCP tool is provided** for the destructive write paths
-> (`assert`, `invalidate`). Same reasoning as the summarizer: an LLM
-> with the `kg/assert` tool would happily spam contradictory facts
-> the moment a user said "actually, never mind". Keep it human-driven
-> or driven by app code that has explicit invalidation logic.
+The MCP `session_start` prompt also lists a scope's current facts as ground
+truth for the agent.
 
 ---
 
 ## Recipes
 
-### Recipe 1 — Directive memory ("the CSP rule for inline styles")
-
-```lua
-local kg = require("luamemo").kg
-
--- Day 1: the rule allows inline styles.
-kg.assert_fact({
-    scope = "team:eng", subject = "csp",
-    predicate = "inline_styles_allowed", object = "true",
-    source_memory_id = some_chat_message_id,
-})
-
--- 6 months later: the rule changes. Supersede the prior assertion.
-kg.assert_fact({
-    scope = "team:eng", subject = "csp",
-    predicate = "inline_styles_allowed", object = "false",
-    source_memory_id = newer_chat_message_id,
-    supersede = true,
-})
-
--- An LLM agent assembling a system prompt asks: "what's the current rule?"
-local cur = kg.query({
-    scope = "team:eng", subject = "csp",
-    predicate = "inline_styles_allowed",
-})
--- -> [{ object = "false", valid_from = "2025-07-01...", valid_until = nil }]
--- The agent injects "inline styles are forbidden" into the prompt.
-
--- Auditor asks: "when did this change?"
-local history = kg.timeline({
-    scope = "team:eng", subject = "csp",
-    predicate = "inline_styles_allowed",
-})
--- -> [ true (2025-01-01..2025-07-01), false (2025-07-01..nil) ]
-```
-
-### Recipe 2 — Entity memory ("user 42's preferred theme")
-
-```lua
--- User toggles dark mode in settings.
-kg.assert_fact({
-    scope = "user:42", subject = "user:42",
-    predicate = "theme", object = "dark",
-    supersede = true,    -- close any prior theme assertion
-})
-
--- Later: user toggles back.
-kg.assert_fact({
-    scope = "user:42", subject = "user:42",
-    predicate = "theme", object = "light",
-    supersede = true,
-})
-
--- On every page load: fetch the current theme.
-local rows = kg.query({
-    scope = "user:42", subject = "user:42", predicate = "theme",
-})
-local theme = rows[1] and rows[1].object or "light"
-```
-
----
-
-## When to use vector memory vs. KG
-
-| Question shape                                      | Use                                            |
-| --------------------------------------------------- | ---------------------------------------------- |
-| "What did we discuss about X?"                      | Vector memory (`memory.search`)                |
-| "Find the email about the renovation invoice"       | Vector memory                                  |
-| "What is currently true about Y?"                   | KG (`kg.query`)                                |
-| "What was the rule about Z on date D?"              | KG (`kg.query{ at = ... }`)                    |
-| "Show me how user X's preference changed over time" | KG (`kg.timeline`)                             |
-| Open-ended summary / synthesis                      | Vector memory + summarizer                     |
-| Latest authoritative value, no synthesis            | KG                                             |
-
-When in doubt: if the *latest* answer must beat the *most similar*
-answer, use the KG.
-
----
-
-## Reproducing the smoke test
+### A rule that changes ("may we use inline styles?")
 
 ```bash
-cd luamemo
+# January: allowed.
+memo kg assert --subject csp --predicate inline_styles_allowed --object true \
+    --valid-from 2025-01-01T00:00:00Z --scope team:eng
 
-# Reset DB and apply migrations
-docker exec -i <postgres-container> psql -U postgres -c \
-  'DROP DATABASE IF EXISTS lm_bruteforce_test; CREATE DATABASE lm_bruteforce_test;'
-docker exec -i <postgres-container> psql -U postgres -d lm_bruteforce_test \
-  < luamemo/schema_bruteforce.sql
-docker exec -i <postgres-container> psql -U postgres -d lm_bruteforce_test \
-  < luamemo/migrations/003_kg.sql
+# July: forbidden — supersede closes the January fact at July 1st.
+memo kg assert --subject csp --predicate inline_styles_allowed --object false \
+    --valid-from 2025-07-01T00:00:00Z --supersede --scope team:eng
 
-# Run the 6-test suite
-PGHOST=127.0.0.1 PGPORT=5432 PGDATABASE=lm_bruteforce_test \
-  PGUSER=postgres PGPASSWORD=postgres \
-  lua5.1 eval/smoke_kg.lua
+memo kg query --subject csp --scope team:eng
+#   → object "false", valid from 2025-07-01, no valid_until
+memo kg query --subject csp --at 2025-04-01T00:00:00Z --scope team:eng
+#   → object "true",  valid 2025-01-01 … 2025-07-01
+memo kg timeline --subject csp --predicate inline_styles_allowed --scope team:eng
+#   → true (2025-01-01 … 2025-07-01), false (2025-07-01 … now)
 ```
 
-Expected output: `All Phase 16.5 KG smoke tests passed.`
+### A preference ("which theme does user 42 use?")
+
+```bash
+memo kg assert --subject user:42 --predicate theme --object dark  --supersede --scope user:42
+memo kg assert --subject user:42 --predicate theme --object light --supersede --scope user:42
+memo kg query  --subject user:42 --predicate theme --scope user:42   # → light
+```
+
+---
+
+## Memories or facts?
+
+| Question | Use |
+|---|---|
+| "What did we discuss about X?" | memories (`memory_search`) |
+| "Find the note about the renovation invoice" | memories |
+| "What is currently true about Y?" | facts (they come with `memory_search`) |
+| "What was the rule about Z on date D?" | facts (`memo kg query --at`) |
+| "How did X's preference change over time?" | facts (`memo kg timeline`; a search shows the previous value) |
+| Open-ended summary or synthesis | memories (+ the summarizer) |
+
+If the *latest* answer must beat the *most similar* one, it is a fact.
+
+---
+
+## Storage
+
+Facts live in the project's database (the same SQLite file as its memories), in
+`lm_kg_facts`; times are integer microseconds since the Unix epoch:
+
+```sql
+CREATE TABLE lm_kg_facts (
+    id               INTEGER PRIMARY KEY,
+    scope            TEXT NOT NULL,
+    subject          TEXT NOT NULL,
+    predicate        TEXT NOT NULL,
+    object           TEXT NOT NULL,
+    valid_from       INTEGER NOT NULL,
+    valid_until      INTEGER,                 -- NULL: valid now
+    source_memory_id INTEGER REFERENCES lm_memories (id) ON DELETE SET NULL,
+    created_at       INTEGER NOT NULL,
+    CHECK (valid_until IS NULL OR valid_until >= valid_from)
+);
+CREATE INDEX lm_kg_facts_scope_idx   ON lm_kg_facts (scope);
+CREATE INDEX lm_kg_facts_sp_idx      ON lm_kg_facts (subject, predicate);
+CREATE INDEX lm_kg_facts_current_idx ON lm_kg_facts (subject, predicate) WHERE valid_until IS NULL;
+```
+
+`memo export` / `memo import` carry a scope's facts along with its memories (a
+fact keeps its link to the memory it came from). The codebase index also records
+its dependency edges here (`memo index explore` walks them).
+
+---
+
+## Tests
+
+The knowledge graph is covered by `eval/tests/test_features.lua` (semantics),
+`test_surfaces.lua` (`memo kg`, and the facts `memory_search` returns) and `test_golden.lua`:
+
+```bash
+luajit eval/tests/run.lua --only features,surfaces,golden
+```

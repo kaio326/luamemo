@@ -6,9 +6,8 @@
 --   Section 3: miss detection is inert when feedback_enabled = false
 --   Section 4: sensing reclassifies mistake -> miss when the target was never retrieved
 --
--- Usage:
---   MEMO_DB_URL=postgresql://postgres:postgres@127.0.0.1:5432/luamemo_dev \
---     lua5.1 eval/tests/test_miss.lua
+-- Usage (the test runner sets a new MEMO_DB per file):
+--   MEMO_DB=/tmp/test_miss.db luajit eval/tests/test_miss.lua
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
@@ -25,25 +24,27 @@ local function check(label, ok, detail)
 end
 local function header(s) io.write(string.format("\n=== %s ===\n", s)) end
 
-memory.setup({
-    db_table = "lm_memories", embedder_local = "hash", embed_dim = 384,
-    backend = "auto", auth_fn = function() return true end, skip_embed_probe = true,
-})
+memory.setup({ embedder_local = "hash", embed_dim = 384, skip_embed_probe = true })
 
 local SCOPE = "misstest"
 local function wipe()
-    db.query("DELETE FROM lm_retrieval_feedback WHERE scope = " .. db.escape_literal(SCOPE))
-    db.query("DELETE FROM lm_reinforcements    WHERE scope = " .. db.escape_literal(SCOPE))
-    db.query("DELETE FROM lm_memories          WHERE scope = " .. db.escape_literal(SCOPE))
+    db.run("DELETE FROM lm_retrieval_feedback WHERE scope = ?", SCOPE)
+    db.run("DELETE FROM lm_reinforcements    WHERE scope = ?", SCOPE)
+    db.run("DELETE FROM lm_memories          WHERE scope = ?", SCOPE)
 end
 local function reinf(mem_id)
-    local q = "SELECT event_type, note FROM lm_reinforcements WHERE scope = " .. db.escape_literal(SCOPE)
-    if mem_id then q = q .. " AND memory_id = " .. math.floor(mem_id) end
-    return db.query(q .. " ORDER BY id") or {}
+    if mem_id then
+        return db.query("SELECT event_type, note FROM lm_reinforcements WHERE scope = ? AND memory_id = ? ORDER BY id",
+            SCOPE, math.floor(mem_id)) or {}
+    end
+    return db.query("SELECT event_type, note FROM lm_reinforcements WHERE scope = ? ORDER BY id", SCOPE) or {}
 end
 local function importance_of(id)
-    local r = db.query("SELECT importance FROM lm_memories WHERE id = " .. math.floor(id))
-    return r and r[1] and tonumber(r[1].importance) or nil
+    return tonumber((db.value("SELECT importance FROM lm_memories WHERE id = ?", math.floor(id))))
+end
+local function log_retrieval(query, ids)
+    assert(db.run("INSERT INTO lm_retrieval_feedback (scope, query, candidate_ids, created_at) VALUES (?, ?, ?, ?)",
+        SCOPE, query, db.json(ids), require("luamemo.util").now_us()))
 end
 
 -- =========================================================================
@@ -90,8 +91,7 @@ local correction = { { role = "user", text = "No, that's wrong — hybrid search
 -- 4a: retrieval log ACTIVE but the memory was NEVER a candidate -> reclassify to miss.
 wipe()
 local c = memory.write({ scope = SCOPE, title = "hybrid", body = "Hybrid search unions vector-nearest and top-FTS candidates.", importance = 0.5 })
-db.query("INSERT INTO lm_retrieval_feedback (scope, query, candidate_ids) VALUES ("
-    .. db.escape_literal(SCOPE) .. ", 'unrelated query', '{999999}')")   -- log active, c absent
+log_retrieval("unrelated query", { 999999 })   -- log active, c absent
 sensing.process(SCOPE, correction, {})
 local r4a = reinf(c.id)
 check("4a: correction on a never-retrieved memory is a miss", r4a[1] and r4a[1].event_type == "miss",
@@ -100,8 +100,7 @@ check("4a: correction on a never-retrieved memory is a miss", r4a[1] and r4a[1].
 -- 4b: memory WAS a candidate -> stays a content mistake.
 wipe()
 local d = memory.write({ scope = SCOPE, title = "hybrid", body = "Hybrid search unions vector-nearest and top-FTS candidates.", importance = 0.5 })
-db.query("INSERT INTO lm_retrieval_feedback (scope, query, candidate_ids) VALUES ("
-    .. db.escape_literal(SCOPE) .. ", 'hybrid search', '{" .. math.floor(d.id) .. "}')")
+log_retrieval("hybrid search", { math.floor(d.id) })
 sensing.process(SCOPE, correction, {})
 local r4b = reinf(d.id)
 check("4b: correction on a retrieved memory stays a mistake", r4b[1] and r4b[1].event_type == "mistake",

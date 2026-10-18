@@ -5,9 +5,8 @@
 --   Section 3: harvest joins reinforcements → (query, positive, negatives) triples
 --   Section 4: frequency without a reinforcement yields NO training positive
 --
--- Usage:
---   MEMO_DB_URL=postgresql://postgres:postgres@127.0.0.1:5432/luamemo_dev \
---     lua5.1 eval/tests/test_feedback.lua
+-- Usage (the test runner sets a new MEMO_DB per file):
+--   MEMO_DB=/tmp/test_feedback.db luajit eval/tests/test_feedback.lua
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
@@ -22,20 +21,16 @@ local function check(label, ok, detail)
 end
 local function header(s) io.write(string.format("\n=== %s ===\n", s)) end
 
-memory.setup({
-    db_table = "lm_memories", embedder_local = "hash", embed_dim = 384,
-    backend = "auto", auth_fn = function() return true end, skip_embed_probe = true,
-})
+memory.setup({ embedder_local = "hash", embed_dim = 384, skip_embed_probe = true })
 
 local SCOPE = "fbtest"
 local function wipe()
-    db.query("DELETE FROM lm_retrieval_feedback WHERE scope = " .. db.escape_literal(SCOPE))
-    db.query("DELETE FROM lm_reinforcements WHERE scope = " .. db.escape_literal(SCOPE))
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(SCOPE))
+    db.run("DELETE FROM lm_retrieval_feedback WHERE scope = ?", SCOPE)
+    db.run("DELETE FROM lm_reinforcements WHERE scope = ?", SCOPE)
+    db.run("DELETE FROM lm_memories WHERE scope = ?", SCOPE)
 end
 local function count_events()
-    local r = db.query("SELECT count(*) AS n FROM lm_retrieval_feedback WHERE scope = " .. db.escape_literal(SCOPE))
-    return r and tonumber(r[1].n) or -1
+    return tonumber((db.value("SELECT count(*) FROM lm_retrieval_feedback WHERE scope = ?", SCOPE))) or -1
 end
 wipe()
 
@@ -63,7 +58,12 @@ check("log_retrieval fail-silent on empty ids", feedback.log_retrieval(SCOPE, "q
 check("log_retrieval fail-silent on nil query", feedback.log_retrieval(SCOPE, nil, {1}) == false)
 check("log_retrieval writes a valid event", feedback.log_retrieval(SCOPE, "manual q", { ids["commit rule"], ids["db client"] }) == true)
 check("one event present after manual log", count_events() == 1, tostring(count_events()))
-db.query("DELETE FROM lm_retrieval_feedback WHERE scope = " .. db.escape_literal(SCOPE))
+check("the event's candidates are indexed (lm_retrieval_candidates)",
+    tonumber((db.value("SELECT count(*) FROM lm_retrieval_candidates c JOIN lm_retrieval_feedback f "
+        .. "ON f.id = c.feedback_id WHERE f.scope = ?", SCOPE))) == 2)
+db.run("DELETE FROM lm_retrieval_feedback WHERE scope = ?", SCOPE)
+check("deleting an event deletes its candidate rows",
+    tonumber((db.value("SELECT count(*) FROM lm_retrieval_candidates"))) == 0)
 
 -- =========================================================================
 header("Section 2 — store.search hook logs candidate sets when enabled")
@@ -73,11 +73,9 @@ local rows = memory.store.search({ query = "am I allowed to push commits myself?
     limit = 5, skip_temporal = true, skip_observations = true }) or {}
 check("search returned candidates", #rows > 0, tostring(#rows))
 check("search logged exactly one retrieval event", count_events() == 1, tostring(count_events()))
-local ev = db.query("SELECT query, candidate_ids FROM lm_retrieval_feedback WHERE scope = " .. db.escape_literal(SCOPE))
+local ev = db.query("SELECT query, candidate_ids FROM lm_retrieval_feedback WHERE scope = ?", SCOPE)
 check("event query recorded", ev and ev[1] and tostring(ev[1].query):find("push commits", 1, true) ~= nil)
--- candidate_ids comes back as a Lua array (pgmoon parses BIGINT[]); count its
--- length directly. (Do NOT tostring() a table — its pointer address is
--- VM-dependent, which silently varies between lua5.1 and LuaJIT.)
+-- candidate_ids comes back decoded as a Lua array; count its length directly.
 local logged = 0
 if ev and ev[1] then
     local cid = ev[1].candidate_ids

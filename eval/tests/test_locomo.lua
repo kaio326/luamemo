@@ -9,21 +9,27 @@
 --   4. qa_gold_sessions maps evidence dia_ids -> session id set.
 --   5. End-to-end run via the locomo_run.lua bench writes results JSON.
 --
--- Prereqs:
---   docker exec -i <postgres-container> psql -U postgres -c \
---     'DROP DATABASE IF EXISTS lm_bruteforce_test; CREATE DATABASE lm_bruteforce_test;'
---   docker exec -i <postgres-container> psql -U postgres -d lm_bruteforce_test \
---     < luamemo/schema_bruteforce.sql
---
--- Run:
---   PGHOST=127.0.0.1 PGPORT=5432 lua5.1 eval/tests/test_locomo.lua
+-- Run (the end-to-end step uses the database MEMO_DB names; the test runner sets a
+-- new one per file):
+--   MEMO_DB=/tmp/test_locomo.db luajit eval/tests/test_locomo.lua
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;eval/datasets/?.lua;" .. package.path
 
 local locomo = require("locomo")
-local cjson  = require("cjson.safe")
+local cjson  = require("luamemo.json")
 
-local FIXTURE = "eval/data/fixtures/locomo_tiny.json"
+-- Tracked fixture (eval/data/ is gitignored — a fresh clone would not have it).
+local FIXTURE = "eval/fixtures/locomo_tiny.json"
+
+-- The runner is launched with the same interpreter as this test, so a LuaJIT
+-- run exercises locomo_run.lua under LuaJIT too. The interpreter is the
+-- lowest negative arg index (options like -e sit between).
+local LUA_BIN = "luajit"
+if arg then
+    local i = -1
+    while arg[i - 1] do i = i - 1 end
+    LUA_BIN = arg[i] or LUA_BIN
+end
 
 local function header(s) print("\n=== " .. s .. " ===") end
 
@@ -93,23 +99,18 @@ print("  1->single-hop, 3->temporal, str passthrough, 99->unknown OK")
 -- Test 6: end-to-end via locomo_run.lua against fixture
 -- ---------------------------------------------------------------------------
 header("end-to-end against fixture (hash embedder)")
-local OUT = "eval/results/locomo_hash_smoke.json"
-os.execute("rm -f " .. OUT)
-local cmd = string.format(
-    "PGHOST=%s PGPORT=%s PGDATABASE=%s PGUSER=%s PGPASSWORD=%s "
-    .. "lua5.1 eval/locomo_run.lua --embedder hash --corpus %s --out %s 2>&1 | tail -20",
-    os.getenv("PGHOST")     or "127.0.0.1",
-    os.getenv("PGPORT")     or "5432",
-    os.getenv("PGDATABASE") or "lm_bruteforce_test",
-    os.getenv("PGUSER")     or "postgres",
-    os.getenv("PGPASSWORD") or "postgres",
-    FIXTURE, OUT)
+-- Smoke output goes to a temp file, not eval/results/ (real benchmark results).
+local OUT = os.tmpname()
+assert(os.getenv("MEMO_DB") and os.getenv("MEMO_DB") ~= "", "MEMO_DB must name the database for the end-to-end run")
+local cmd = string.format("%s eval/locomo_run.lua --embedder hash --corpus %s --out %s 2>&1 | tail -20",
+    LUA_BIN, FIXTURE, OUT)
 print("  $ " .. cmd)
 local rc = os.execute(cmd)
 assert(rc == 0 or rc == true, "locomo_run.lua exit non-zero")
 
 local fh = assert(io.open(OUT, "rb"), "smoke output not written: " .. OUT)
 local raw = fh:read("*a"); fh:close()
+os.remove(OUT)
 local report = assert(cjson.decode(raw), "smoke output malformed JSON")
 assert(report.overall and report.overall.n_questions == 4,
     "expected 4 QA pairs across the fixture, got "

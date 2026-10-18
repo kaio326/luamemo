@@ -6,8 +6,8 @@
 --   4. opts.extensions={lua=true} narrows the walk back to Lua only
 --   5. Re-ingest is idempotent (file + symbol counts stable)
 --
--- Requires MEMO_DB_URL.
--- Run: lua5.1 eval/tests/test_index_fileindex.lua
+-- Requires MEMO_DB.
+-- Run: luajit eval/tests/test_index_fileindex.lua
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 
@@ -23,14 +23,13 @@ local function ge(a, b, label)
     else fail(label .. " — got " .. tostring(a) .. " expected >= " .. tostring(b)) end
 end
 
-local db_url = os.getenv("MEMO_DB_URL")
-if not db_url or db_url == "" then
-    io.stderr:write("[SKIP] MEMO_DB_URL not set\n"); os.exit(0)
+local db_name = os.getenv("MEMO_DB")
+if not db_name or db_name == "" then
+    io.stderr:write("[SKIP] MEMO_DB not set\n"); os.exit(0)
 end
 
 local luamemo = require("luamemo")
-local cfg = { db_url = db_url, auth_fn = function() return true end,
-              embedder_local = os.getenv("MEMO_EMBEDDER") or "hash" }
+local cfg = { embedder_local = os.getenv("MEMO_EMBEDDER") or "hash" }
 local ed = tonumber(os.getenv("MEMO_EMBED_DIM")); if ed then cfg.embed_dim = ed end
 local ok_setup, serr = pcall(luamemo.setup, cfg)
 if not ok_setup then io.stderr:write("[ERROR] setup: " .. tostring(serr) .. "\n"); os.exit(1) end
@@ -42,19 +41,16 @@ local st, db = luamemo.store, require("luamemo.db")
 
 local function wipe()
     st.delete_where({ scope = scope })
-    db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
+    db.run("DELETE FROM lm_kg_facts WHERE scope = ?", scope)
 end
 
 local function count(kind)
-    local r = db.query(("SELECT COUNT(*) AS n FROM lm_memories WHERE scope=%s AND kind=%s")
-        :format(db.escape_literal(scope), db.escape_literal(kind)))
-    return r and r[1] and tonumber(r[1].n) or 0
+    return tonumber(db.value("SELECT COUNT(*) FROM lm_memories WHERE scope = ? AND kind = ?", scope, kind)) or 0
 end
 
 local function file_exists(path)
-    local r = db.query(("SELECT COUNT(*) AS n FROM lm_memories WHERE scope=%s AND kind='file' AND metadata->>'path'=%s")
-        :format(db.escape_literal(scope), db.escape_literal(path)))
-    return (r and r[1] and tonumber(r[1].n) or 0) > 0
+    return (tonumber(db.value("SELECT COUNT(*) FROM lm_memories WHERE scope = ? AND kind = 'file' "
+        .. "AND json_extract(metadata, '$.path') = ?", scope, path)) or 0) > 0
 end
 
 wipe()

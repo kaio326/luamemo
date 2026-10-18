@@ -5,13 +5,12 @@
 > because the new session has a different uuid. Without intervention,
 > every new session starts cold.
 
-`luamemo` solves this with one helper — `memory.promote()` — that
-folds a hot session scope into a long-term scope at session end. The
-next session searches the long-term scope and finds the carried-over
-context.
+luamemo solves this with one operation — **promote** (`memory_promote` over
+MCP, `memo promote` in a terminal) — that folds a hot session scope into a
+long-term scope at session end. The next session searches the long-term scope
+and finds the carried-over context.
 
-No new tables, no new columns. Pure convention on top of `scope` plus
-the existing summarizer.
+Nothing else is needed: a convention on top of `scope`, plus the summarizer.
 
 ---
 
@@ -19,62 +18,66 @@ the existing summarizer.
 
 | Scope                       | Lifetime          | Read by               | Written by             |
 |-----------------------------|-------------------|-----------------------|------------------------|
-| `session:<uuid>`            | One session       | Current session only  | Agent during session   |
-| `user:<id>:long_term`       | Forever           | Every future session  | `promote()` at exit    |
+| `session:<uuid>`            | One session       | Current session only  | Agent (and the capture hooks) during the session |
+| `user:<id>:long_term`       | Forever           | Every future session  | promote, at the end    |
 
 You're free to pick any names — `session:<uuid>` and `user:<id>:long_term`
-are recommendations, not requirements.
+are recommendations, not requirements. A coding agent usually keeps its
+long-term memories in the project's scope (`repo:<project>`).
+
+---
+
+## Capture conventions
+
+Recording a conversation as it happens takes four kinds of write — every one is
+a plain `memo write` (CLI) or `memory_write` (MCP) with these fields. Turns go
+to the session scope `user:<id>:session:<sid>`; decisions go straight to
+`user:<id>:long_term`, so they survive the session even without a promotion.
+
+| What | scope | kind | title | tags | metadata | dedup |
+|---|---|---|---|---|---|---|
+| user turn | session | `chat` | `user: <first 80 chars>` | `chat,user` | `role: "user"`, `user_id`, `session_id` | `append` |
+| assistant turn | session | `chat` | `assistant: <first 80 chars>` | `chat,assistant` | `role: "assistant"`, `user_id`, `session_id`, `tool_calls` | `append` |
+| tool call | session | `tool_call` | `tool: <name>` | `tool,<name>` | `role: "tool"`, `tool`, `args`, `result`, `success`, `user_id`, `session_id` | `update` |
+| decision | long-term | `decision` | the decision's title | `decision` | `role: "decision"`, `user_id`, `session_id` | `update` |
+
+- The body is the turn's text; for a tool call it is
+  `tool: <name>\nsuccess: <true|false>\nargs: <args>\nresult: <result>` (args and
+  result cut at 400 characters), which embeds well while the metadata keeps the
+  full structured call.
+- Decisions get `--importance 3` (they outrank chat in later searches) and no decay.
+- `append` for chat: the same words twice can mean different things. `update` for
+  tool calls and decisions: repeating one merges into the existing memory instead
+  of piling up copies.
+- An empty turn is not written.
+
+```bash
+memo write --scope user:42:session:abc --kind chat --title "user: I want to refactor the auth helper." \
+    --body "I want to refactor the auth helper." --tags chat,user --dedup-strategy append \
+    --metadata '{"role":"user","user_id":"42","session_id":"abc"}'
+
+memo write --scope user:42:long_term --kind decision --title "preference: tailwind v4" \
+    --body "User prefers Tailwind v4 utilities." --tags decision --importance 3 --dedup-strategy update \
+    --metadata '{"role":"decision","user_id":"42","session_id":"abc"}'
+```
+
+Over MCP, `memory_write` takes the same fields (`tags` as a list, `metadata` as an
+object, `dedup_strategy`); `items` writes several turns in one call.
+
+In Claude Code the capture hooks do the session part for you: they save the last
+messages into `session:<session id>` before a compaction and every few minutes
+while the agent works (README → *Session continuity and hooks*).
 
 ---
 
 ## End-of-session recipe
 
-When your host detects the session is ending (last message timestamp,
-explicit `/end` command, websocket close, etc.), call `promote()`:
-
-### From Lua
-
-```lua
-local memory = require("luamemo")
-
-local result = memory.promote({
-    from_scope    = "session:" .. session_uuid,
-    to_scope      = "user:" .. user_id .. ":long_term",
-    delete_source = true,   -- session rows are no longer useful
-})
-
-if result.promoted == 1 then
-    ngx.log(ngx.INFO, "promoted session ", session_uuid,
-        " -> summary id=", result.summary_id,
-        " (", #result.source_ids, " source rows)")
-end
-```
-
-### From HTTP
-
-```bash
-curl -sS -X POST https://your-app/api/memory/promote \
-  -H "Authorization: Bearer $MEMO_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "from_scope":    "session:abc-123",
-        "to_scope":      "user:42:long_term",
-        "delete_source": true
-      }' | jq .
-```
-
-### From the CLI
-
-```bash
-memo promote \
-    --from session:abc-123 \
-    --to   user:42:long_term \
-    --delete-source
-```
+When the session is ending (the user says so, an explicit `/end`, the last
+message of the day…), promote the session scope.
 
 ### From an MCP-aware agent
 
-Tool name: `memory_promote`.
+Tool `memory_promote`:
 
 ```json
 {
@@ -84,73 +87,69 @@ Tool name: `memory_promote`.
 }
 ```
 
-The tool description in the MCP schema explicitly tells agents
-**when** to call it ("at end of session"), so capable models invoke it
-on their own once it's exposed.
+Its description tells agents **when** to call it ("at end of session"), so
+capable models invoke it on their own; the luamemo agent and the session-memory
+skill say so too.
+
+### From a terminal or a script
+
+```bash
+memo promote --from session:abc-123 --to user:42:long_term --delete-source
+memo promote --from session:abc-123 --to user:42:long_term --dry-run   # what would be folded
+```
 
 ---
 
 ## Next-session retrieval
 
-The promoted summary lives in `user:<id>:long_term`. Search it as a
-default scope at session start:
+The promoted summary lives in `user:<id>:long_term`. Search it at session start
+— alone, or with the other scopes the answer could be in:
 
-```lua
-local hits = memory.search({
-    q     = user_first_message,
-    scope = "user:" .. user_id .. ":long_term",
-    limit = 5,
-})
+```json
+{ "query": "what was decided last time", "scopes": ["user:42:long_term", "repo:my-app"], "limit": 5 }
 ```
 
-Or pass `scope = nil` to search everywhere — the long-term summary
-will rank naturally alongside other memories.
+```bash
+memo search "what was decided last time" --scopes user:42:long_term,repo:my-app --limit 5
+```
 
 ---
 
 ## Worked example: two sessions
 
-**Session 1** (Tuesday, uuid `abc-123`):
+**Session 1** (Tuesday, `session:abc-123`) — the agent notes what it learns as
+it goes:
 
-```lua
-memory.write({ scope="session:abc-123", body="user prefers Postgres over MySQL" })
-memory.write({ scope="session:abc-123", body="user is building a Lua/Lapis SaaS" })
-memory.write({ scope="session:abc-123", body="user wants single-instance deploy on OVH VPS" })
--- ... 12 more notes during the chat ...
+```bash
+memo write --scope session:abc-123 --title "db choice" --body "user prefers SQLite over MySQL for this app"
+memo write --scope session:abc-123 --title "stack" --body "user is building a Lua web service"
+memo write --scope session:abc-123 --title "deploy" --body "user wants a single-instance deploy on a VPS"
+# … a dozen more notes during the chat …
 
--- on session end:
-memory.promote({
-    from_scope    = "session:abc-123",
-    to_scope      = "user:42:long_term",
-    delete_source = true,
-})
+# at the end:
+memo promote --from session:abc-123 --to user:42:long_term --delete-source
 ```
 
-After promotion the long-term scope contains one row with
-`title = "[promoted] Summary: ..."`,
-`metadata.promoted_from = "session:abc-123"`, and
-`metadata.source_ids = {1, 2, 3, ...}` — useful for audit and rollback.
+The long-term scope now holds one memory titled `[promoted] …` (kind `summary`)
+with `metadata.promoted_from = "session:abc-123"` and `metadata.source_ids` —
+useful for audit.
 
-**Session 2** (Thursday, uuid `xyz-789`) — user opens the chat and
-asks "what database should I use again?":
+**Session 2** (Thursday, `session:xyz-789`) — the user asks "which database
+should I use again?":
 
-```lua
-local hits = memory.search({
-    q     = "what database should I use",
-    scope = "user:42:long_term",
-    limit = 3,
-})
--- hits[1].body contains the promoted summary including
--- "user prefers Postgres over MySQL" → agent answers correctly.
+```bash
+memo search "which database should I use" --scope user:42:long_term --limit 3
+# the first result is the promoted summary, including
+# "user prefers SQLite over MySQL" → the agent answers correctly.
 ```
 
-The new session knows the previous session's content. No memory loss.
+The new session knows what the previous one knew.
 
 ---
 
 ## Provenance metadata
 
-Every promoted summary row carries:
+Every promoted summary carries:
 
 ```json
 {
@@ -159,74 +158,62 @@ Every promoted summary row carries:
 }
 ```
 
-Use `metadata.promoted_from` to audit which session a summary came
-from. Use `metadata.source_ids` if you kept `delete_source = false`
-and later want to fetch the raw history.
-
-The title is prefixed with `[promoted] ` so promoted summaries are
-visually distinct from background-summarizer summaries.
+`promoted_from` says which session a summary came from; `source_ids` lets you
+fetch the raw notes later if you kept them (no `delete_source`). The title is
+prefixed with `[promoted] ` so promoted summaries stand apart from the
+summarizer's.
 
 ---
 
-## API reference
+## Reference
 
-```lua
-memory.promote({
-    from_scope    = "session:abc",       -- required
-    to_scope      = "user:42:long_term", -- required, must differ from from_scope
-    delete_source = false,               -- default false; true hard-deletes source rows
-    dry_run       = false,               -- default false; true reports without writing
-    limit         = 200,                 -- max source rows to fold (cap 1000)
-    min_rows      = 1,                   -- bail with reason="no_rows" below this
-})
--- returns:
---   { promoted = 1, summary_id = N, source_ids = {...},
---     dry_run = false, deleted_source = true }
--- or on no-op:
---   { promoted = 0, source_ids = {}, reason = "no_rows" }
--- or on error:
---   { promoted = 0, errors = {"..."} }
-```
+| Parameter (`memory_promote`) | `memo promote` | Default | Meaning |
+|---|---|---|---|
+| `from_scope` | `--from` | required | the session scope |
+| `to_scope` | `--to` | required | the long-term scope (must differ) |
+| `delete_source` | `--delete-source` | false | delete the session's memories after folding them |
+| `dry_run` | `--dry-run` | false | report what would happen, write nothing |
+| `limit` | `--limit N` | 200 (at most 1,000) | the most memories folded, oldest first |
+| `min_rows` | `--min-rows N` | 1 | do nothing below this many |
 
-The HTTP endpoint, MCP tool, and CLI command accept the same fields
-and return the same shape (wrapped in `{ ok, result }` for HTTP).
+Result: `{ promoted = 1, summary_id, source_ids, dry_run, deleted_source }`;
+nothing to fold: `{ promoted = 0, source_ids = [], reason = "no_rows" }`; an
+error: `{ promoted = 0, errors = [...] }`. Summaries already in the session
+scope (kind `summary`) are not folded again. A dev's read-only org replica can be
+promoted from, but `delete_source` is refused there.
 
 ---
 
 ## When NOT to promote
 
-- **One-off scratch sessions** (debugging a bot, smoke-testing the
-  API). The session content has no long-term value — just let
-  `session:<uuid>` rows expire via the background summarizer +
-  retention sweep, or delete them outright.
-- **Sessions that contain secrets** (passwords typed in chat, etc.)
-  that you do not want to persist. Either skip `promote()` or
-  pre-filter the source rows with `delete()` before promoting.
-- **Agent loops that never "end"** (always-on assistants). Promote on
-  a time-based trigger instead — e.g. every 24 hours roll the last
-  24 h of session rows into long-term.
+- **One-off scratch sessions** (debugging, smoke tests). The content has no
+  long-term value — delete the scope (`memo delete --scope session:<id> --yes`)
+  or let it age out (give such notes a `decay_rate`).
+- **Sessions that contain secrets** (a key pasted into the chat by mistake) you
+  don't want to keep. Delete those memories first, or skip the promotion.
+- **Agents that never "end"** (always-on assistants). Promote on a schedule
+  instead — e.g. every 24 hours.
 
 ---
 
 ## Cost & quality notes
 
-- The summary quality depends entirely on your configured
-  `summarizer_adapter`. The default `noop` adapter concatenates source
-  bodies (zero cost, perfect fidelity, no compression). For real
-  compression configure `ollama` or `openai`.
-- `promote()` makes **one** adapter call regardless of how many source
-  rows you have (capped by `limit`). If your adapter has a context
-  window smaller than the session, lower `limit` or pre-summarize via
-  `memory.summarize()` first, then promote the resulting summaries.
-- Promoted summaries bypass dedup (`dedup_strategy = "append"`) so
-  back-to-back promotions of related sessions never silently merge.
+- The summary's quality depends on the summarizer (`MEMO_SUMMARIZER_ADAPTER`).
+  The default `noop` joins the source memories (no cost, nothing lost, no
+  compression); `ollama` or `openai` compress them (see
+  [SETTINGS.md](SETTINGS.md) → Summarizer).
+- Promotion makes **one** summarizer call however many memories it folds (up to
+  `limit`). If your model's context is smaller than the session, lower `limit`
+  and promote in several passes.
+- Promoted summaries are never merged by dedup, so back-to-back promotions of
+  related sessions stay separate.
 
 ---
 
 ## See also
 
-- [EMBEDDERS.md](EMBEDDERS.md) — pick the right embedder so the
-  next-session search actually finds the promoted summary.
-- [RETRIEVAL_TUNING.md](RETRIEVAL_TUNING.md) — `since` / `until`
-  filters pair well with promoted summaries: "what did we discuss
-  this week" = `search({ scope="user:42:long_term", since=epoch_now-7d })`.
+- [EMBEDDERS.md](EMBEDDERS.md) — the right embedder makes the next session's
+  search find the promoted summary.
+- [RETRIEVAL_TUNING.md](RETRIEVAL_TUNING.md) — `since` / `until` pair well with
+  promoted summaries: "what did we discuss this week" =
+  `memo search "…" --scope user:42:long_term --since 2026-10-03`.

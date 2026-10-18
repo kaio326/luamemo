@@ -32,7 +32,7 @@
 --   (RecMultiSession excluded)
 --   Total: 7×1000 + 3×500 = 8500
 
-local cjson = require("cjson.safe")
+local cjson = require("luamemo.json")
 
 -- All category file names (without .json) in MemData/FirstAgent/.
 local ALL_CATS = {
@@ -51,11 +51,21 @@ local ROLE_KEYED = {
 local M = {}
 M.ALL_CATS = ALL_CATS
 
+-- JSON numbers decode as floats on Lua 5.3+ (1 → 1.0, tostring → "1.0") but
+-- print as "1" on 5.1 / LuaJIT; format integral ids as integers so turn sids
+-- and target sids are the same strings on every interpreter.
+local function id_str(v)
+    if type(v) == "number" and v == math.floor(v) then return string.format("%d", v) end
+    return tostring(v)
+end
+
 --- Load all category files from data_dir.
 -- opts.topic  (string)  topic filter for topic-keyed files (default "movie")
 -- opts.cats   (table)   list of categories to load (default: all except RecMultiSession)
 -- opts.limit  (number)  stop after this many total questions
--- Returns sorted array of question objects.
+-- Returns an array of question objects in a deterministic order: category
+-- order (opts.cats, else ALL_CATS), then topic key (sorted), then file order;
+-- ids are assigned 1..N in that order. Missing category files are skipped.
 function M.load(data_dir, opts)
     assert(data_dir, "membench.load: data_dir required")
     opts = opts or {}
@@ -84,7 +94,14 @@ function M.load(data_dir, opts)
             if not file_data then
                 io.stderr:write("membench: bad JSON in " .. path .. ": " .. tostring(jerr) .. "\n")
             else
-                for topic_key, items in pairs(file_data) do
+                -- Topic keys in sorted order: pairs() order is unspecified (and
+                -- differs between PUC Lua and LuaJIT), which made question ids —
+                -- and therefore which questions a --n subset picks — vary by VM.
+                local topic_keys = {}
+                for topic_key in pairs(file_data) do topic_keys[#topic_keys + 1] = topic_key end
+                table.sort(topic_keys)
+                for _, topic_key in ipairs(topic_keys) do
+                    local items = file_data[topic_key]
                     -- For topic-keyed files, only load the requested topic.
                     if not ROLE_KEYED[cat] and topic_key ~= topic_filter then
                         -- skip
@@ -100,7 +117,7 @@ function M.load(data_dir, opts)
                                     for _, turn in ipairs(session) do
                                         -- topic-keyed turns use 'mid' and 'user'/'assistant';
                                         -- role-keyed turns use 'sid' and 'user_message'/'assistant_message'
-                                        local sid_str = tostring(turn.sid or turn.mid or "")
+                                        local sid_str = id_str(turn.sid or turn.mid or "")
                                         local user = turn.user_message or turn.user or ""
                                         local asst = turn.assistant_message or turn.assistant or ""
                                         local text = "User: " .. user
@@ -114,7 +131,7 @@ function M.load(data_dir, opts)
                             local target_sids = {}
                             for _, step in ipairs(qa.target_step_id or {}) do
                                 if type(step) == "table" and step[1] ~= nil then
-                                    target_sids[tostring(step[1])] = true
+                                    target_sids[id_str(step[1])] = true
                                 end
                             end
                             q_id = q_id + 1

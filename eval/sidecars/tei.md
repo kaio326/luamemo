@@ -67,27 +67,19 @@ curl -s -X POST http://127.0.0.1:8082/rerank \
 
 ## Wiring into `luamemo`
 
-```lua
-local memory = require("luamemo")
-memory.setup({
-    -- ... regular config ...
-    rerank_url   = "http://127.0.0.1:8082/rerank",
-    rerank_model = "BAAI/bge-reranker-v2-m3",   -- ignored by TEI; sent for Cohere/Jina compat
-})
-
-local hits = memory.search({
-    query  = "...",
-    scope  = "...",
-    limit  = 20,
-    rerank = "cross_encoder",
-    rerank_top_n = 20,
-})
+```bash
+memo config set MEMO_RERANK_ADAPTER cross_encoder
+memo config set MEMO_RERANK_URL http://127.0.0.1:8082/rerank
+memo config set MEMO_RERANK_MODEL BAAI/bge-reranker-v2-m3   # ignored by TEI; sent for Cohere/Jina
+memo config set MEMO_RERANK_TOP_N 20
+memo search "…" --scope repo:my-app --rerank on              # or MEMO_RERANK_ENABLED true
 ```
 
-For a Cohere or Jina hosted endpoint, point `rerank_url` at
+For a Cohere or Jina hosted endpoint, point `MEMO_RERANK_URL` at
 `https://api.cohere.com/v1/rerank` (or the Jina equivalent), set
-`rerank_model = "rerank-english-v3.0"` (or jina equivalent) and pass
-the API key via `rerank_headers = { Authorization = "Bearer ..." }`.
+`MEMO_RERANK_MODEL` to `rerank-english-v3.0` (or the Jina equivalent), store
+the API key with `memo secret-store cohere` and set
+`MEMO_RERANK_HEADERS '{"Authorization": "Bearer {secret:cohere}"}'`.
 
 ## Resource cost
 
@@ -203,16 +195,15 @@ curl -s -X POST http://127.0.0.1:8081/embed \
 
 ### Wiring into `luamemo`
 
-```lua
-local memory = require("luamemo")
-memory.setup({
-    -- ... regular config ...
-    embedder_url     = "http://127.0.0.1:8081/embed",
-    embedder_adapter = "tei",
-    embedder_model   = "BAAI/bge-m3",   -- documentation only
-    embed_dim        = 1024,
-})
+```bash
+memo config set MEMO_EMBEDDER_ADAPTER tei
+memo config set MEMO_EMBEDDER_URL http://127.0.0.1:8081/embed
+memo config set MEMO_EMBEDDER_MODEL BAAI/bge-m3   # documentation only
+memo config set MEMO_EMBED_DIM 1024
+memo reembed --all                                # if the project already has memories
 ```
+
+(`memo calibrate` finds a running TEI container and sets this up by itself.)
 
 ### Resource cost (measured 2026-05-05, RTX 2060 6 GB)
 
@@ -231,17 +222,15 @@ cd luamemo
 docker compose -f eval/sidecars/docker-compose.yml up -d tei-embed
 # wait for "Ready" in `docker compose logs tei-embed`
 
-# bench: bge-m3 via TEI, baseline (no rerank)
-PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
-  TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
-  lua5.1 eval/longmemeval_run.lua --embedder tei \
+# bench: bge-m3 via TEI, baseline (no rerank) — MEMO_DB: a scratch database
+MEMO_DB=bench TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
+  luajit eval/longmemeval_run.lua --embedder tei \
     --corpus eval/data/longmemeval_s.json --n 200 \
     --out eval/results/longmemeval_tei_bge-m3_s_n200.json
 
 # bench: bge-m3 via TEI + noop rerank
-PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
-  TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
-  lua5.1 eval/longmemeval_run.lua --embedder tei \
+MEMO_DB=bench TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
+  luajit eval/longmemeval_run.lua --embedder tei \
     --corpus eval/data/longmemeval_s.json --n 200 \
     --rerank --rerank-adapter noop --rerank-top-n 20 \
     --out eval/results/longmemeval_tei_bge-m3_s_n200_rerank-noop.json

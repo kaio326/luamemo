@@ -9,21 +9,10 @@ local M = {}
 -- Config construction is shared with the other CLI entrypoints via _common.
 -- ---------------------------------------------------------------------------
 local common = require("luamemo.cli._common")
+-- Integral numbers as plain integers.
+local fmt_num = require("luamemo.index.format").num
 
-local function setup()
-    local ok, luamemo = pcall(require, "luamemo")
-    if not ok then
-        io.stderr:write("memo index: cannot load luamemo: " .. tostring(luamemo) .. "\n")
-        os.exit(1)
-    end
-    local cfg = common.config_from_env({ auth = true })
-    local ok2, err = pcall(luamemo.setup, cfg)
-    if not ok2 then
-        io.stderr:write("memo index: setup failed: " .. tostring(err) .. "\n")
-        os.exit(1)
-    end
-    return luamemo
-end
+local function setup() return common.setup_or_die(common.die_for("index"), { prefix = "setup failed: " }) end
 
 -- ---------------------------------------------------------------------------
 -- Argument parser
@@ -53,24 +42,29 @@ local function parse_args(argv)
 end
 
 -- Apply the scan-related flags shared by ingest and update onto an opts table:
---   --exclude a,b,c       comma-separated exclude patterns
+--   --exclude a,b,c       comma-separated exclude patterns, ADDED to the defaults
+--                         (.git, vendor/, node_modules/)
+--   --no-gitignore        also index files git ignores (default: skip them)
 --   --extensions lua,py   narrow the walk (or "*" for all text files; default)
 --   --no-symbols          file-level index only (skip symbol extraction)
 --   --embed-file-rows     also embed file rows (default: file rows are FTS-only)
 --   --no-ctags            disable universal-ctags enrichment for non-native langs
+-- Credential files (.env, .luamemorc, *.pem, …) are never indexed, whatever the flags.
 local function apply_scan_opts(opts, flags)
     if flags.exclude and flags.exclude ~= true then
         local excludes = {}
+        for _, p in ipairs(require("luamemo.index").DEFAULT_EXCLUDES) do excludes[#excludes + 1] = p end
         for p in flags.exclude:gmatch("[^,]+") do excludes[#excludes + 1] = p end
         opts.exclude_patterns = excludes
     end
+    if flags.no_gitignore then opts.respect_gitignore = false end
     if flags.extensions and flags.extensions ~= true then
         if flags.extensions == "*" then
             opts.extensions = "*"
         else
             local exts = {}
-            for e in flags.extensions:gmatch("[^,]+") do
-                e = e:gsub("%s+", ""):gsub("^%.", "")
+            for raw in flags.extensions:gmatch("[^,]+") do
+                local e = raw:gsub("%s+", ""):gsub("^%.", "")
                 if e ~= "" then exts[e] = true end
             end
             opts.extensions = exts
@@ -187,10 +181,10 @@ local function cmd_search(argv)
 
     for i, r in ipairs(rows) do
         local meta = r.metadata or {}
-        local loc = meta.path and (meta.path .. (meta.line and (":" .. meta.line) or "")) or ""
+        local loc = meta.path and (meta.path .. (meta.line and (":" .. fmt_num(meta.line)) or "")) or ""
         io.write(("[%d] %s  [%s]  %s\n  %s\n"):format(
             i, r.title or "", r.kind or "", loc,
-            (r.body or ""):sub(1, 120)))
+            require("luamemo.util").cut_utf8(r.body or "", 120)))
     end
 end
 
@@ -208,7 +202,7 @@ local function cmd_status(argv)
         os.exit(1)
     end
 
-    local scope_str = opts.scope or ("codeindex:" .. (opts.project or "default"))
+    local scope_str = luamemo.index.scope_for(opts)
     io.write(("scope: %s\n"):format(scope_str))
     for kind, n in pairs(counts) do
         io.write(("  %-12s %d\n"):format(kind, n))
@@ -340,7 +334,7 @@ local function cmd_explore(argv)
         io.write(("\n%s (%d):\n"):format(label, #rows))
         for _, r in ipairs(rows) do
             local meta = r.metadata or {}
-            local loc = meta.path and (meta.path .. (meta.line and (":" .. tostring(meta.line)) or "")) or ""
+            local loc = meta.path and (meta.path .. (meta.line and (":" .. fmt_num(meta.line)) or "")) or ""
             io.write(("  %-40s %s\n"):format(r.title or "", loc))
         end
     end

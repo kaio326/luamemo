@@ -39,8 +39,11 @@ local M = {}
 
 local db          = require("luamemo.db")
 local util        = require("luamemo.util")
-local embed       = require("luamemo.embed")
+local vectors     = require("luamemo.vectors")
 local consolidate = require("luamemo.consolidate")
+-- Federation: never mutate a dev's org replica; never create or alter org
+-- directives (tier 3) on the central. No-op when role=solo.
+local policy      = require("luamemo.federation.policy")
 
 -- ---------------------------------------------------------------------------
 -- Config
@@ -54,6 +57,7 @@ local DEFAULTS = {
     digest_promote_tier2_at = 3,
     digest_promote_tier3_at = 5,
     auto_digest_interval    = 3600,   -- min seconds between lazy auto-digests per scope
+    consolidate_threshold   = 0.80,   -- clustering similarity (run's default threshold)
 }
 
 function M.configure(cfg)
@@ -96,19 +100,19 @@ local _running = false
 function M.maybe_run(scope, opts)
     if _running then return false end
     if not scope or scope == "" then return false end
-    if not util.table_exists("lm_digest_state") then return false end
+    if policy.replica(scope) then return false end   -- replicas mirror the central
     local interval = math.floor(tonumber(_cfg.auto_digest_interval) or 3600)
     if interval < 0 then interval = 0 end
 
     -- Atomic "claim the slot if due" — inserts on first sight, else updates only
     -- when the cursor is older than the interval. RETURNING tells us if we won it.
-    local claim = db.query(
-        "INSERT INTO lm_digest_state (scope, last_digested_at) VALUES ("
-        .. db.escape_literal(scope) .. ", now()) "
-        .. "ON CONFLICT (scope) DO UPDATE SET last_digested_at = now() "
-        .. "WHERE lm_digest_state.last_digested_at <= now() - interval '"
-        .. interval .. " seconds' RETURNING scope")
-    if not (claim and claim[1]) then return false end   -- not due, or lost the race
+    local now = util.now_us()
+    local claim = db.first(
+        "INSERT INTO lm_digest_state (scope, last_digested_at) VALUES (?, ?) "
+        .. "ON CONFLICT (scope) DO UPDATE SET last_digested_at = excluded.last_digested_at "
+        .. "WHERE lm_digest_state.last_digested_at <= ? RETURNING scope",
+        scope, now, now - interval * 1000000)
+    if not claim then return false end   -- not due, or lost the race
 
     _running = true
     local ok, res = pcall(M.run, scope, opts or {})
@@ -155,13 +159,20 @@ local function _reinforce_relevance(current, delta)
     return math.max(c, math.min(1.0, new))
 end
 
--- Derive tier from importance via the shared formula in util.
-local _tier_from_imp = util.importance_to_tier
+-- The digest's own 0–1 relevance (_escalate / _diminish / _reinforce_relevance
+-- stay within 0–1) → tier, for escalation and reversal. (Write-time tiers use
+-- util.importance_to_tier on importance's 0–10 scale.)
+local function _tier_from_relevance(v)
+    v = tonumber(v) or 0
+    if v < 0.3 then return 0 end
+    if v < 0.6 then return 1 end
+    if v < 0.85 then return 2 end
+    return 3
+end
 
 -- ---------------------------------------------------------------------------
 -- Public: record_event
--- Log a discrete reinforcement event for a memory. Silently does nothing if
--- the lm_reinforcements table has not been created (migration 009 not applied).
+-- Log a discrete reinforcement event for a memory.
 --
 -- For "reversal" events the memory's importance is also immediately diminished
 -- and its tier is updated to match.  The raw secret value of the change is
@@ -169,7 +180,6 @@ local _tier_from_imp = util.importance_to_tier
 -- contradictions and evolve the related observation.
 -- ---------------------------------------------------------------------------
 function M.record_event(memory_id, scope, event_type, delta, note)
-    if not util.table_exists("lm_reinforcements") then return end
     if not memory_id or not scope then return end
     local valid_types = {
         direct_command = true, mistake = true,
@@ -182,40 +192,42 @@ function M.record_event(memory_id, scope, event_type, delta, note)
 
     local clamped_delta = math.max(-1.0, math.min(1.0, tonumber(delta) or 0.5))
 
-    local sql = ([[
-        INSERT INTO lm_reinforcements
-            (memory_id, scope, event_type, delta, note)
-        VALUES (%d, %s, %s, %s, %s)
-    ]]):format(
-        mid,
-        db.escape_literal(scope),
-        db.escape_literal(event_type),
-        db.escape_literal(tostring(clamped_delta)),
-        note and db.escape_literal(note) or "NULL"
-    )
-    db.query(sql)  -- fire-and-forget; errors silently discarded
+    -- fire-and-forget; errors silently discarded (e.g. the memory is gone)
+    db.run("INSERT INTO lm_reinforcements (memory_id, scope, event_type, delta, note, created_at) "
+        .. "VALUES (?, ?, ?, ?, ?, ?)", mid, scope, event_type, clamped_delta, note, util.now_us())
+    M.apply_event_effect(mid, scope, event_type, clamped_delta)
+end
 
-    -- Reversal: immediately apply importance diminishment + tier demotion.
-    -- Miss: immediately apply an importance BUMP + tier promotion so the memory
-    -- that retrieval failed to surface becomes more findable next time.
+-- ---------------------------------------------------------------------------
+-- Public: apply_event_effect
+-- The immediate row effect of a reinforcement event, separated from logging it
+-- so the org central can apply it exactly once for an idempotent pushed event
+-- (insert ON CONFLICT DO NOTHING → apply only when the row was new).
+--   Reversal: importance diminishment + tier demotion.
+--   Miss: importance BUMP + tier promotion so the memory that retrieval failed
+--   to surface becomes more findable next time.
+-- Federation: replica rows and org directives are never changed; other org
+-- rows are capped at tier 2 on the central.
+-- ---------------------------------------------------------------------------
+function M.apply_event_effect(memory_id, scope, event_type, delta)
+    local mid = math.floor(tonumber(memory_id) or 0)
+    if mid == 0 then return end
+    local clamped_delta = math.max(-1.0, math.min(1.0, tonumber(delta) or 0.5))
     if event_type == "reversal" or event_type == "miss" then
-        local mem_rows = db.query(
-            "SELECT importance FROM lm_memories WHERE id = "
-            .. mid .. " LIMIT 1")
-        if mem_rows and mem_rows[1] then
-            local cur_imp = tonumber(mem_rows[1].importance) or 0.5
+        local mem = db.first("SELECT importance, tier FROM lm_memories WHERE id = ?", mid)
+        if mem and policy.feedback_may_mutate(scope, mem.tier) then
+            local cur_imp = tonumber(mem.importance) or 0.5
+            local cur_tier = tonumber(mem.tier) or 1
             local new_imp = (event_type == "miss")
                 and _reinforce_relevance(cur_imp, clamped_delta)
                 or  _diminish(cur_imp, clamped_delta)
-            local new_tier = _tier_from_imp(new_imp)
-            db.query(([[
-                UPDATE lm_memories
-                   SET importance = %s, tier = %d
-                 WHERE id = %d
-            ]]):format(
-                db.escape_literal(tostring(new_imp)),
-                new_tier,
-                mid))
+            -- A miss raises importance (ranking) and never demotes; a reversal
+            -- demotes to what its lowered relevance supports — never raises.
+            local new_tier = (event_type == "miss") and cur_tier
+                or math.min(cur_tier, _tier_from_relevance(new_imp))
+            new_tier = policy.cap_tier(scope, new_tier)
+            db.run("UPDATE lm_memories SET importance = ?, tier = ? WHERE id = ?",
+                new_imp, math.floor(new_tier), mid)
         end
     end
 end
@@ -226,34 +238,14 @@ end
 
 -- Fetch tier-0 memories that have not yet been consolidated for a scope.
 local function _fetch_tier0(scope)
-    if not util.table_exists("lm_memories") then return {} end
-    -- Cast embedding to REAL[] on pgvector backend so Lua gets a Lua array.
-    local emb_col = "embedding"
-    local rows, err = db.query(([[
-        SELECT id, scope, title, body, importance, decay_rate, created_at,
-               %s AS embedding
-        FROM lm_memories
-        WHERE scope = %s
-          AND tier = 0
-          AND consolidated_at IS NULL
-        ORDER BY importance DESC, created_at ASC
-        LIMIT 500
-    ]]):format(emb_col, db.escape_literal(scope)))
+    local rows, err = db.query("SELECT id, scope, title, body, importance, decay_rate, tier, created_at, embedding "
+        .. "FROM lm_memories WHERE scope = ? AND tier = 0 AND consolidated_at IS NULL "
+        .. "ORDER BY importance DESC, created_at ASC LIMIT 500", scope)
     if not rows then
         if util.log then util.log("digest: fetch tier-0 error: " .. tostring(err)) end
         return {}
     end
-    -- Parse embedding arrays returned as strings by pgmoon.
-    for _, r in ipairs(rows) do
-        if type(r.embedding) == "string" then
-            -- Attempt to parse "{a,b,c,...}" format.
-            local arr = {}
-            for v in r.embedding:gmatch("[^{},]+") do
-                arr[#arr + 1] = tonumber(v) or 0
-            end
-            r.embedding = #arr > 0 and arr or nil
-        end
-    end
+    for _, r in ipairs(rows) do r.embedding = vectors.unpack(r.embedding) end
     return rows
 end
 
@@ -266,15 +258,10 @@ end
 -- query.  Returns a table keyed by memory_id (as string) → count (number).
 -- Only 'mistake' and 'direct_command' events are counted.
 local function _fetch_mistake_counts(ids)
-    if not util.table_exists("lm_reinforcements") then return {} end
     if #ids == 0 then return {} end
-    local id_list, err = util.sql_id_list(ids)
-    if not id_list then return {} end
-    local rows = db.query(
-        "SELECT memory_id, COUNT(*) AS n FROM lm_reinforcements "
-        .. "WHERE memory_id IN (" .. id_list .. ") "
-        .. "AND event_type IN ('mistake', 'direct_command') "
-        .. "GROUP BY memory_id")
+    local rows = db.query("SELECT memory_id, COUNT(*) AS n FROM lm_reinforcements "
+        .. "WHERE memory_id IN (" .. db.placeholders(#ids) .. ") "
+        .. "AND event_type IN ('mistake', 'direct_command') GROUP BY memory_id", unpack(ids, 1, #ids))
     local by_id = {}
     for _, r in ipairs(rows or {}) do
         by_id[tostring(r.memory_id)] = tonumber(r.n) or 0
@@ -284,111 +271,73 @@ end
 
 -- Stamp consolidated_at on a list of memory IDs.
 local function _stamp_consolidated(ids)
-    local id_list = util.sql_id_list(ids)
-    if not id_list then return end
-    db.query("UPDATE lm_memories SET consolidated_at = NOW() "
-        .. "WHERE id IN (" .. id_list .. ")")
+    if #ids == 0 then return end
+    local params = { util.now_us() }
+    for _, id in ipairs(ids) do params[#params + 1] = id end
+    db.run("UPDATE lm_memories SET consolidated_at = ? WHERE id IN (" .. db.placeholders(#ids) .. ")",
+        unpack(params, 1, #params))
+end
+
+-- UPDATE lm_memories SET tier = <to> WHERE id IN ids AND tier = <from> → rows changed
+local function _set_tier(ids, from, to)
+    if #ids == 0 then return 0 end
+    local params = { to }
+    for _, id in ipairs(ids) do params[#params + 1] = id end
+    params[#params + 1] = from
+    return db.run("UPDATE lm_memories SET tier = ? WHERE id IN (" .. db.placeholders(#ids) .. ") AND tier = ?",
+        unpack(params, 1, #params)) or 0
 end
 
 -- Promote tier-0/1 rows based on proof_count and mistake history.
 -- Returns counts of tier-1→2 and tier-2→3 promotions.
 local function _promote(scope)
     local promoted2, promoted3 = 0, 0
+    if policy.replica(scope) then return 0, 0 end
     local tier2_at = tonumber(_cfg.digest_promote_tier2_at) or 3
     local tier3_at = tonumber(_cfg.digest_promote_tier3_at) or 5
 
-    -- Tier-1 → tier-2: observations with proof_count >= tier2_at, trend != stale.
-    -- We join lm_observations (if it exists) to check proof_count.
-    if util.table_exists("lm_observations") then
-        -- Promote memories whose consolidated observation has enough proof.
-        -- We match on scope and check the corresponding observation proof.
-        local obs_rows = db.query(([[
-            SELECT o.id AS obs_id, o.proof_count, o.freshness_trend,
-                   o.evidence_ids
-            FROM lm_observations o
-            WHERE o.scope = %s
-              AND o.proof_count >= %d
-              AND o.freshness_trend != 'stale'
-        ]]):format(db.escape_literal(scope), tier2_at))
-        if obs_rows and #obs_rows > 0 then
-            for _, obs in ipairs(obs_rows) do
-                -- Get the evidence memory IDs from the observation.
-                local ev_ids = obs.evidence_ids
-                if type(ev_ids) == "string" then
-                    local arr = {}
-                    for v in ev_ids:gmatch("[^{},]+") do
-                        arr[#arr + 1] = tonumber(v)
-                    end
-                    ev_ids = arr
-                end
-                if type(ev_ids) == "table" and #ev_ids > 0 then
-                    local id_list = util.sql_id_list(ev_ids)
-                    if id_list then
-                        local upd = db.query(
-                            "UPDATE lm_memories SET tier = 2 "
-                            .. "WHERE id IN (" .. id_list .. ") AND tier = 1")
-                        if upd and type(upd) == "table" then
-                            -- pgmoon returns affected_rows in the result table.
-                            promoted2 = promoted2 + (tonumber(upd.affected_rows) or 0)
-                        end
-                    end
-                end
-            end
+    -- Tier-1 → tier-2: memories whose consolidated observation has enough proof
+    -- (proof_count >= tier2_at, trend != stale).
+    local obs_rows = db.query("SELECT id AS obs_id, proof_count, freshness_trend, evidence_ids "
+        .. "FROM lm_observations WHERE scope = ? AND proof_count >= ? AND freshness_trend != 'stale'",
+        scope, tier2_at)
+    for _, obs in ipairs(obs_rows or {}) do
+        local ev_ids = {}
+        for _, v in ipairs(type(obs.evidence_ids) == "table" and obs.evidence_ids or {}) do
+            if tonumber(v) then ev_ids[#ev_ids + 1] = math.floor(tonumber(v)) end
         end
+        promoted2 = promoted2 + _set_tier(ev_ids, 1, 2)
     end
 
     -- Tier-2 → tier-3: memories with enough mistake-escalated reinforcements.
-    if util.table_exists("lm_reinforcements") then
-        -- Find memory IDs in this scope with >= tier3_at mistake/direct_command events.
-        local mistake_rows = db.query(([[
-            SELECT memory_id, COUNT(*) AS n
-            FROM lm_reinforcements
-            WHERE scope = %s
-              AND event_type IN ('mistake', 'direct_command')
-            GROUP BY memory_id
-            HAVING COUNT(*) >= %d
-        ]]):format(db.escape_literal(scope), tier3_at))
-        if mistake_rows and #mistake_rows > 0 then
-            local promote3_ids = {}
-            for _, mr in ipairs(mistake_rows) do
-                local mid = math.floor(tonumber(mr.memory_id) or 0)
-                if mid > 0 then
-                    promote3_ids[#promote3_ids + 1] = mid
-                end
-            end
-            if #promote3_ids > 0 then
-                local id_list = util.sql_id_list(promote3_ids)
-                if id_list then
-                    local upd = db.query(
-                        "UPDATE lm_memories SET tier = 3 "
-                        .. "WHERE id IN (" .. id_list .. ") AND tier = 2")
-                    if upd and type(upd) == "table" then
-                        promoted3 = promoted3 + (tonumber(upd.affected_rows) or 0)
-                    end
-                end
-            end
+    -- Never on a protected org scope: there the core tier is directive-only.
+    if not policy.protected(scope) then
+        local mistake_rows = db.query("SELECT memory_id, COUNT(*) AS n FROM lm_reinforcements "
+            .. "WHERE scope = ? AND event_type IN ('mistake', 'direct_command') "
+            .. "GROUP BY memory_id HAVING COUNT(*) >= ?", scope, tier3_at)
+        local promote3_ids = {}
+        for _, mr in ipairs(mistake_rows or {}) do
+            local mid = math.floor(tonumber(mr.memory_id) or 0)
+            if mid > 0 then promote3_ids[#promote3_ids + 1] = mid end
         end
+        promoted3 = promoted3 + _set_tier(promote3_ids, 2, 3)
     end
 
     return promoted2, promoted3
 end
 
 -- Delete tier-0 rows whose consolidated_at is older than grace_days,
--- relative to `before_epoch` (the start of the current run). Using the
--- run-start epoch instead of NOW() prevents rows stamped during this run
+-- relative to `before_us` (the start of the current run). Using the
+-- run-start time instead of now prevents rows stamped during this run
 -- from being deleted: those rows have consolidated_at >= run_start > cutoff.
-local function _purge_stale(scope, before_epoch)
+local function _purge_stale(scope, before_us)
     local grace = math.max(0, math.floor(tonumber(_cfg.digest_grace_days) or 7))
-    local cutoff_epoch = math.floor(before_epoch) - grace * 86400
-    local sql = ([[
-        DELETE FROM lm_memories
-        WHERE scope = %s
-          AND tier = 0
-          AND consolidated_at IS NOT NULL
-          AND consolidated_at < to_timestamp(%d)
-    ]]):format(db.escape_literal(scope), cutoff_epoch)
-    local res = db.query(sql)
-    return (res and type(res) == "table" and tonumber(res.affected_rows)) or 0
+    local cutoff_us = before_us - grace * 86400 * 1000000
+    -- Federation: a bulk delete never touches rows the role must keep
+    -- (replicas; directives + approved org knowledge on the central).
+    local excl = policy.maintenance_exclusion_sql()
+    return db.run("DELETE FROM lm_memories WHERE scope = ? AND tier = 0 AND consolidated_at IS NOT NULL "
+        .. "AND consolidated_at < ?" .. (excl and (" AND " .. excl) or ""), scope, cutoff_us) or 0
 end
 
 -- ---------------------------------------------------------------------------
@@ -409,7 +358,7 @@ function M.run(scope, opts)
                       or tonumber(_cfg.consolidate_threshold) or 0.80
     -- Capture start time before any DB writes so _purge_stale can exclude
     -- rows stamped during this run.
-    local run_start = os.time()
+    local run_start = util.now_us()
 
     local summary = {
         processed  = 0,
@@ -419,8 +368,10 @@ function M.run(scope, opts)
         errors     = {},
     }
 
-    if not util.table_exists("lm_memories") then
-        summary.errors[#summary.errors + 1] = "lm_memories table not found"
+    -- Federation: a dev's org replica mirrors the central — the central runs
+    -- the digest for it (and ships the result); nothing to do here.
+    if policy.replica(scope) then
+        summary.skipped = "replica"
         return summary
     end
 
@@ -471,7 +422,7 @@ function M.run(scope, opts)
             -- a. Check if cluster overlaps an existing observation.
             local best_vec = best.embedding
             local obs_hit = nil
-            if type(best_vec) == "table" and util.table_exists("lm_observations") then
+            if type(best_vec) == "table" then
                 local obs_limit = 5
                 local ok_search, obs_rows = pcall(consolidate.search,
                     scope, best_vec, obs_limit)
@@ -493,19 +444,17 @@ function M.run(scope, opts)
                 -- c. Synthesise: use consolidate.process for new observations,
                 --    OR apply mistake escalation if triggered.
                 if mistake_n > 0 then
-                    -- Escalate importance of the best member and bump its tier.
+                    -- Escalate importance of the best member and bump its tier
+                    -- with the mistake count: _escalate is a 0–1 relevance, so its
+                    -- tier comes from the relevance thresholds (2 mistakes → 1,
+                    -- 5 → 2, ~15 → 3), never below where it is.
                     local new_imp = _escalate(best.importance, mistake_n)
-                    local new_tier = _tier_from_imp(new_imp)
+                    local new_tier = policy.cap_tier(scope,
+                        math.max(tonumber(best.tier) or 0, _tier_from_relevance(new_imp)))
                     local mid = math.floor(tonumber(best.id) or 0)
-                    if mid > 0 then
-                        db.query(([[
-                            UPDATE lm_memories
-                               SET importance = %s, tier = %d
-                             WHERE id = %d
-                        ]]):format(
-                            db.escape_literal(new_imp),
-                            new_tier,
-                            mid))
+                    if mid > 0 and policy.feedback_may_mutate(scope, best.tier) then
+                        db.run("UPDATE lm_memories SET importance = ?, tier = ? WHERE id = ?",
+                            new_imp, math.floor(new_tier), mid)
                     end
                 end
                 -- Let consolidate.process handle observation creation for the

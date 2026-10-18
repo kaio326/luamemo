@@ -5,8 +5,8 @@
 --   3. Affected symbols attributed in diff row metadata
 --   4. CLI round-trip: memo index diff --commit <sha> ingestable
 --
--- Requires MEMO_DB_URL to be set.
--- Run: lua5.1 eval/tests/test_index_diff.lua
+-- Requires MEMO_DB to be set.
+-- Run: luajit eval/tests/test_index_diff.lua
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 
@@ -126,9 +126,9 @@ end
 -- ---------------------------------------------------------------------------
 -- DB-dependent tests
 -- ---------------------------------------------------------------------------
-local db_url = os.getenv("MEMO_DB_URL")
-if not db_url or db_url == "" then
-    io.stderr:write("[SKIP] MEMO_DB_URL not set — DB tests skipped\n")
+local db_name = os.getenv("MEMO_DB")
+if not db_name or db_name == "" then
+    io.stderr:write("[SKIP] MEMO_DB not set — DB tests skipped\n")
     io.write(("\n=== Phase 5 results: %d passed, %d failed (digester only) ===\n"):format(PASS, FAIL))
     os.exit(FAIL > 0 and 1 or 0)
 end
@@ -140,7 +140,7 @@ if not ok_lm then
 end
 
 local embedder_url = os.getenv("MEMO_EMBEDDER_URL")
-local cfg = { db_url = db_url, auth_fn = function() return true end }
+local cfg = {}
 if embedder_url and embedder_url ~= "" then
     cfg.embedder_url     = embedder_url
     cfg.embedder_adapter = os.getenv("MEMO_EMBEDDER_ADAPTER") or "generic"
@@ -188,10 +188,7 @@ else
 end
 
 -- Verify rows exist in DB.
-local diff_count = db.query(
-    ("SELECT COUNT(*) AS n FROM lm_memories WHERE scope = %s AND kind = 'diff'"):format(
-        db.escape_literal(scope)))
-local n_diff = diff_count and diff_count[1] and tonumber(diff_count[1].n) or 0
+local n_diff = tonumber(db.value("SELECT COUNT(*) FROM lm_memories WHERE scope = ? AND kind = 'diff'", scope)) or 0
 assert_ge(n_diff, 2, "diff rows in lm_memories >= 2")
 
 -- ---------------------------------------------------------------------------
@@ -259,10 +256,8 @@ if real_diff_content and real_diff_content ~= "" then
         assert_eq(#real_result.errors, 0, "0 errors on real fixture")
 
         -- Check metadata on a stored row.
-        local meta_check = db.query(
-            ("SELECT metadata FROM lm_memories WHERE scope = %s AND kind = 'diff' "
-          .. "AND metadata->>'commit' = 'ca80e2e' LIMIT 1"):format(
-                db.escape_literal(scope)))
+        local meta_check = db.query("SELECT metadata FROM lm_memories WHERE scope = ? AND kind = 'diff' "
+          .. "AND json_extract(metadata, '$.commit') = 'ca80e2e' LIMIT 1", scope)
         if meta_check and #meta_check > 0 then
             pass("diff row with commit=ca80e2e found in DB")
         else
@@ -272,6 +267,27 @@ if real_diff_content and real_diff_content ~= "" then
 else
     info("eval/fixtures/store_patch.diff not found — skipping fixture test")
     pass("fixture test skipped (acceptable without fixture)")
+end
+
+-- ---------------------------------------------------------------------------
+-- A commit touching 9,000 files: the symbol lookup for its files is ONE
+-- statement whatever their number (LuaJIT's unpack stops near 8,000 values).
+-- ---------------------------------------------------------------------------
+io.write("\n--- Large commit ---\n")
+do
+    local parts = {}
+    for i = 1, 9000 do
+        parts[#parts + 1] = ("diff --git a/big/f%d.lua b/big/f%d.lua\n--- a/big/f%d.lua\n+++ b/big/f%d.lua\n"
+            .. "@@ -1,1 +1,1 @@\n-local x = %d\n+local x = %d\n"):format(i, i, i, i, i, i + 1)
+    end
+    local ok, big, berr = pcall(luamemo.index.ingest_diff, table.concat(parts), {
+        scope = scope, commit_sha = "b16c0", commit_message = "chore: touch every file", author = "test" })
+    if ok and big then
+        assert_eq(big.rows, 9000, "9,000-file commit: one row per hunk")
+        assert_eq(#big.errors, 0, "9,000-file commit: 0 errors")
+    else
+        fail("9,000-file commit failed: " .. tostring(ok and berr or big))
+    end
 end
 
 -- ---------------------------------------------------------------------------

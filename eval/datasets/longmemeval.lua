@@ -27,7 +27,7 @@
 --   curl -sL -o eval/data/longmemeval_oracle.json \
 --     https://huggingface.co/datasets/xiaowu0162/longmemeval/resolve/main/longmemeval_oracle
 
-local cjson = require("cjson.safe")
+local cjson = require("luamemo.json")
 
 local M = {}
 
@@ -52,10 +52,10 @@ end
 --- transcript; we serialise it into a "USER: ... | ASSISTANT: ..." block
 --- so it embeds as one document. This matches the way agents would write
 --- the session into luamemo at run time.
---- Strip bytes that would cause PostgreSQL UTF-8 encoding errors.
---- The corpus contains truncated multi-byte sequences (e.g. 0xEF 0x27)
---- that pgmoon passes through verbatim. Replace any non-ASCII byte that
---- is not followed by a valid continuation byte with a space.
+--- Strip invalid UTF-8 (embedders reject it, as Postgres did).
+--- The corpus contains truncated multi-byte sequences (e.g. 0xEF 0x27).
+--- Replace any non-ASCII byte that is not followed by a valid
+--- continuation byte with a space.
 local function sanitize_utf8(s)
     if type(s) ~= "string" then return s end
     -- Fast path: all ASCII

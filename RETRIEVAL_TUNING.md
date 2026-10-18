@@ -1,307 +1,237 @@
-# Retrieval Tuning — How to Get the Most Out of `luamemo`
+# Retrieval tuning — getting the most out of luamemo
 
-> **TL;DR:** the biggest cost lever in any memory-backed agent is `K`
-> (how many memory rows you stuff into the prompt). The work below is
-> ordered by how much it actually moves agent answer quality and prompt
-> token spend — top to bottom, highest impact first.
+> **TL;DR:** the biggest cost lever in a memory-backed agent is `K` — how many
+> memories go into the prompt. The levers below are ordered by how much they
+> move answer quality and prompt size, highest first. Each one exists to make the
+> top K trustworthy enough that a smaller K is safe.
 
 ---
 
-## Why this matters: token cost is dominated by K
+## Why this matters: prompt size is dominated by K
 
-Every memory-backed agent turn looks roughly like:
+Every memory-backed turn looks roughly like:
 
 ```
-prompt = [system] + [conversation] + top_K(memory.search(query)) + [user_turn]
+prompt = [system] + [conversation] + top_K(memory_search(query)) + [user turn]
 ```
 
-If your average memory row is ~200 tokens, every `K` you add costs
-~200 prompt tokens *every single turn, every single user, forever*.
+At ~200 tokens per memory, every result you add costs ~200 prompt tokens on
+every turn, for every session:
 
-| K dropped | tokens saved / turn | $ saved per 1M sessions* |
-|-----------|---------------------|--------------------------|
-| 10 → 5    | 1,000               | ~$25,000                 |
-| 10 → 3    | 1,400               | ~$35,000                 |
-| 10 → 1    | 1,800               | ~$45,000                 |
+| K dropped | tokens saved per turn | saved per 1M sessions* |
+|---|---|---|
+| 10 → 5 | 1,000 | ~$25,000 |
+| 10 → 3 | 1,400 | ~$35,000 |
+| 10 → 1 | 1,800 | ~$45,000 |
 
-\* assumes ~200 token/row, 10 turns/session, ~$2.50 per 1M input tokens.
+\* ~200 tokens per memory, 10 turns per session, ~$2.50 per 1M input tokens.
 
-**You can't safely drop K unless your top-K is trustworthy.** Everything
-below is in service of making top-K trustworthy enough that you can ship
-with a smaller K.
+**You can't safely drop K unless the top K is trustworthy.** Everything below
+serves that.
 
 ---
 
 ## Priority 1 — use a real embedder
 
-**Biggest single win, by far.**
+**The biggest single win, by far.** The default `hash` embedder is fast,
+deterministic and needs nothing, but it matches words, not meaning: it can't
+tell that "car" and "automobile" are related. Any real embedding model — the
+in-process GGUF embedder, Ollama, TEI, a hosted API — gains more than every
+other change in this document combined. Until you switch, treat the tuning
+below as polishing the rim of a shallow bowl.
 
-The default `embedder_local = "hash"` is fast, deterministic, and
-dependency-free, but it is essentially keyword matching with extra
-steps. It does not capture semantic similarity. If you have any room
-in your stack for a real embedding model (a small sentence-transformer,
-an OpenAI/Voyage/Cohere embedding endpoint, etc.) you will gain more
-accuracy by switching the embedder than from any other change in this
-document.
-
-Until you switch off `hash`, treat all the tuning below as
-"polishing the rim of a shallow bowl."
+`memo calibrate` picks the best embedder that works on your machine;
+[EMBEDDERS.md](EMBEDDERS.md) covers the choices and the switch
+(`memo reembed --all` afterwards).
 
 ---
 
-## Priority 2 — scope your writes properly
+## Priority 2 — scope your writes
 
-`scope` is a hard filter. Two memories in the wrong scope are worse
-than no memories at all, because they fill up your top-K with
-irrelevant rows.
+`scope` is a hard filter. Memories in the wrong scope are worse than none: they
+fill the top K with rows that can't answer.
 
-Rules of thumb:
+- One scope per *thing the agent reasons about* — `repo:my-app`,
+  `user:me`, `session:<id>` — not one for everything.
+- Prefer narrow scopes; search several at once when an answer could be in any
+  of them (`memory_search` with `scopes = ["repo:my-app", "user:me"]`, or
+  `memo search --scopes repo:my-app,user:me`). Higher-tier memories rank first
+  across the set.
+- If you keep adding `kind` or `metadata_filter` filters at search time, the
+  scope is probably too wide.
 
-- One scope per *concept the agent reasons about*, not one scope per
-  user. A user can have memories across many scopes.
-- Prefer narrow scopes (`user_42:billing_history`) over wide scopes
-  (`user_42:all`).
-- If you find yourself adding lots of `kind` or `tags` filters at
-  read-time, that is a smell that the scope is too wide.
-
-This is free. Do this before you tune anything.
+This is free. Do it before tuning anything.
 
 ---
 
-## Priority 3 — tune `hybrid_weights`
+## Priority 3 — time filters
 
-`hybrid_weights = { vector = 0.7, fts = 0.3 }` is the library default.
-**That number is a guess.** The right blend is corpus-specific:
-
-- Corpora with lots of named-entity / exact-token hits (codes, IDs,
-  product names, SKUs) want more `fts`.
-- Corpora that are mostly free-form prose (chat, notes, docs) want
-  more `vector`.
-
-The library ships a runner that figures out the right blend
-empirically, with **zero labeling work** — your existing rows are the
-gold pairs (leave-one-out self-retrieval).
-
-### How to run it
+When the question is about a period ("what did we decide this week?"), say so:
+`since` / `until` cut the candidates **before** ranking, so a small K stays
+trustworthy.
 
 ```bash
-# Local Postgres pointing at your real (or test) database:
-PGHOST=127.0.0.1 PGPORT=5432 PGDATABASE=mydb PGUSER=postgres \
-  lua5.1 eval/tune_weights.lua --scope <your_scope>
+memo search "decisions" --scope repo:my-app --since 2026-10-01
 ```
 
-Optional flags:
+Over MCP: `memory_search` with `since` / `until` (ISO 8601 or Unix seconds). A
+query that merely *mentions* a time ("last week", "in June") already favours
+memories from then (`MEMO_TEMPORAL_ALPHA` sets how strongly).
 
-- `--samples N` — how many rows to sweep (default: 50).
-- `--primary r_at_1 | r_at_3 | r_at_5 | r_at_10 | mrr` — which
-  metric to optimize for (default: `r_at_1`).
+---
 
-### How to read the output
+## Priority 4 — tune the search blend
+
+Every search blends a vector score and a full-text score:
+`MEMO_HYBRID_WEIGHTS='{"vector": 0.7, "fts": 0.3}'` by default. **That blend is
+a guess**, and the right one depends on the corpus:
+
+- lots of exact tokens — codes, ids, product names, file names — want more `fts`;
+- free-form prose — chat, notes, docs — wants more `vector`.
+
+luamemo measures it for a scope with **no labelling work**: each sampled memory
+is searched for by its own title (or the start of its body), at every blend from
+1.0 / 0.0 to 0.0 / 1.0, and the report counts how often it comes back first, in
+the top 3, 5, 10.
+
+```bash
+memo tune-weights --scope repo:my-app
+```
 
 ```
-blend(v/f)   R@1     R@3     R@5     R@10    MRR
- 0.4 / 0.6   72.0%   88.0%   92.0%   96.0%   0.812
- 0.3 / 0.7   70.0%   86.0%   90.0%   96.0%   0.793
- 0.7 / 0.3   62.0%   80.0%   86.0%   94.0%   0.731   <-- default
+repo:my-app — 50 memories, each searched for by its title (or the start of its body) at 11 blends, no model calls
+
+vector   fts     R@1     R@3     R@5    R@10    MRR
+ 0.40   0.60   72.0%   88.0%   92.0%   96.0%  0.812
+ 0.30   0.70   70.0%   86.0%   90.0%   96.0%  0.793
  ...
+ 0.70   0.30   62.0%   80.0%   86.0%   94.0%  0.731   ← in force
+
+Best for R@1: vector 0.40 / fts 0.60 — 72.0% (+10.0 points over the blend in force)
+Safe K: 3 — the fewest results that still hold the right memory 85% of the time.
+Apply it: memo config set MEMO_HYBRID_WEIGHTS '{"fts":0.6,"vector":0.4}'
 ```
 
-The columns are **Recall@K** — what fraction of the time the
-"correct" row landed in the top-K results. Higher is better.
+`--samples N` (default 50) and `--metric r_at_1 | r_at_3 | r_at_5 | r_at_10 |
+mrr` (what "best" maximises); `--json` for the raw report. Over MCP:
+`memory_tune_weights` returns the same report — an agent shows it, and the
+person applies it (settings are changed by people).
 
-The recommendation block at the bottom tells you:
-
-1. The best blend.
-2. How much it gains over the default.
-3. The smallest K where R@K ≥ 85% — i.e. the smallest K you can ship
-   without losing answers.
-4. The dollar amount that K reduction saves you per 1M sessions.
-
-### How to apply the result
-
-Set the recommended blend in your `memory.setup({...})`:
-
-```lua
-memory.setup({
-    -- ...
-    hybrid_weights = { vector = 0.4, fts = 0.6 },
-})
-```
-
-Or, if different scopes have different blends, override per call:
-
-```lua
-memory.search({
-    query = q,
-    scope = "billing_history",
-    limit = 5,                     -- the new lower K
-    hybrid_weights = { vector = 0.4, fts = 0.6 },
-})
-```
-
-### When to re-run
-
-- After any major embedder change.
-- After you load substantially different content into a scope.
-- Periodically (quarterly is plenty for stable corpora).
-
-It is cheap: pure SQL + Lua, no LLM calls.
-
----
-
-## Priority 4 — rerank the top-N
-
-If `tune_weights` says "no blend reaches R@5 ≥ 85%" on a scope you
-care about, the next lever is a **reranker** — a second pass that
-takes the top-N candidates from hybrid search and re-scores them
-against the query using a smarter (and more expensive) model.
-
-Since v0.2 this is built into `luamemo`. Three adapters ship:
-
-| Adapter  | Cost / latency       | Notes                                    |
-|----------|----------------------|------------------------------------------|
-| `noop`   | ~zero, in-process    | Lexical token-overlap. Surprisingly strong baseline. No external calls. |
-| `ollama` | local LLM, ~1 call   | Calls a local Ollama model with `format=json`; default model `llama3.2`. |
-| `openai` | hosted LLM, ~1 call  | Calls OpenAI Chat Completions with `response_format=json_object`. |
-
-### Configure once at setup
-
-```lua
-memory.setup({
-    -- ...
-    rerank_adapter  = "noop",   -- "noop" | "ollama" | "openai"
-    rerank_top_n    = 20,       -- candidate pool size before rerank
-    rerank_enabled  = false,    -- global default; opt-in per call below
-    -- adapter-specific (only needed for ollama / openai):
-    rerank_url      = "http://127.0.0.1:11434/api/generate",
-    rerank_model    = "llama3.2",
-    rerank_headers  = { Authorization = "Bearer ..." },  -- openai
-    rerank_timeout_ms = 30000,
-})
-```
-
-### Opt-in per search
-
-```lua
-memory.search({
-    query  = q,
-    scope  = "billing_history",
-    limit  = 5,           -- final K
-    rerank = true,        -- overrides cfg.rerank_enabled for this call
-})
-```
-
-The store over-fetches `max(limit, rerank_top_n)` candidates from the
-hybrid pass, hands them to the adapter, and trims to `limit` after
-rerank. If the adapter fails (network error, malformed JSON, etc.) the
-search **falls back to the baseline ranking** and logs a warning — it
-never hard-errors.
-
-Returned rows gain two extra fields:
-
-- `rerank_score` — normalised to [0, 1].
-- `rerank_rank`  — 1-based position in the reranked list.
-
-### Measured impact (LongMemEval `_s` first-50, single-session-user)
-
-| Mode                 | R@1   | R@5   | R@10  | R@20  | MRR   | elapsed |
-|----------------------|-------|-------|-------|-------|-------|---------|
-| baseline (ollama)    | 0.560 | 0.760 | 0.800 | 0.860 | 0.648 | 299 s   |
-| `+ rerank=noop`      | 0.680 | 0.800 | 0.840 | 0.860 | 0.736 | 310 s   |
-
-Even the lexical `noop` adapter lifted R@1 by **+12 pts** and MRR by
-**+0.088** at ~4 % wall-clock overhead. R@20 is unchanged because rerank
-only **reorders** the existing candidate pool — it cannot recall what
-hybrid search missed. To improve R@20 you must improve the embedder or
-the hybrid blend (Priorities 1 and 3).
-
-Reproduce:
+**Apply it** for every search of the project:
 
 ```bash
-lua5.1 eval/longmemeval_run.lua --embedder ollama \
-    --corpus eval/data/longmemeval_s.json --n 50 \
-    --out eval/results/baseline.json
-
-lua5.1 eval/longmemeval_run.lua --embedder ollama \
-    --corpus eval/data/longmemeval_s.json --n 50 \
-    --rerank --rerank-adapter noop --rerank-top-n 20 \
-    --out eval/results/rerank-noop.json
+memo config set MEMO_HYBRID_WEIGHTS '{"fts":0.6,"vector":0.4}'
 ```
 
-### When to enable
+— or for one search: `memo search … --hybrid-weights '{"vector":0.4,"fts":0.6}'`,
+or `hybrid_weights` on `memory_search`.
 
-- You've exhausted Priorities 1–3 and R@1 is still leaking answers.
-- You need a higher-quality top-1/top-3 (e.g. for a single "best answer"
-  feed) without expanding the prompt budget.
-- Rule of thumb: **`noop` first** (free, often enough). Move to `cross_encoder`
-  only if your reranker comes from a **different model family** than your embedder.
+**Safe K** is the smallest K whose recall reaches 85 % at the best blend — the K
+an agent can ask for without losing answers.
 
-### Cross-encoder adapter (`cross_encoder`) — measured negative result
-
-`luamemo/rerankers/cross_encoder.lua` exposes a TEI / Cohere / Jina
-`POST /rerank` sidecar as a drop-in reranker. It was benched
-(2026-05-06) with `bge-m3` embeddings + `bge-reranker-v2-m3` reranker,
-n=200, `longmemeval_s`:
-
-| Config                                   | R@1   | R@5   | MRR   |
-|------------------------------------------|------:|------:|------:|
-| bge-m3, no rerank (Phase 16.1 baseline)  | 0.800 | 0.935 | 0.862 |
-| bge-m3, rerank=noop top_n=20             | 0.725 | 0.925 | 0.809 |
-| **bge-m3 + bge-reranker-v2-m3 top_n=20**| **0.800** | **0.935** | **0.862** |
-
-**Result: zero net improvement.** `bge-reranker-v2-m3` is fine-tuned
-from the same `bge-m3` base and agrees with bi-encoder ordering
-point-for-point. Cross-encoder adds +0.43 s per query overhead with
-no quality gain when used with its own-family embedder.
-
-**When cross-encoder IS worth enabling:** pair it with a
-*different-family* reranker — e.g. Cohere Rerank v3 or
-Jina Reranker v2 on top of `bge-m3` embeddings. Those combinations
-are not yet benched; the negative result here is specific to the
-same-family `bge-m3` + `bge-reranker-v2-m3` pairing.
+**Re-run it** after switching embedders, after loading very different content
+into the scope, or now and then (it's cheap: searches only, no model calls).
 
 ---
 
-## Footnote — `bruteforce_candidate_limit` and LSH
+## Priority 5 — rerank the top results
 
-The brute-force backend has a `bruteforce_candidate_limit` config knob
-(default 5,000) that caps how many rows the in-Lua cosine pass
-considers. Tuning this knob is a **latency** decision, not an accuracy
-or token-cost decision.
+If no blend reaches the recall you need, the next lever is a **reranker**: a
+second pass that re-scores the hybrid top N against the query.
 
-For corpora beyond ~10 000 rows per scope, `luamemo` automatically
-activates its built-in **LSH (Locality-Sensitive Hashing) index**
-(`luamemo.lsh`) which pre-filters the candidate pool to ≈100–300
-rows before cosine ranking, eliminating most of the I/O cost without
-changing the scoring or result shape. This is transparent — no config
-change needed. You can tune `lsh_rebuild_at` (default 10 000),
-`lsh_tables` (default 8), and `lsh_bits` (default 12), or set
-`lsh_enabled = false` to opt out.
+| Adapter | Cost | Notes |
+|---|---|---|
+| `noop` | ~zero, in-process | Word overlap between query and memory. A surprisingly strong baseline |
+| `learned` | ~zero, in-process | Trained per scope on how memories were used ([README → Learning from use](README.md#learning-from-use)); `memo learn` promotes it only when it beats the current one |
+| `ollama` | a local LLM call | Ollama with JSON output (`MEMO_RERANK_MODEL`, default `llama3.2`) |
+| `openai` | a hosted LLM call | OpenAI chat completions with JSON output; the key as `{secret:NAME}` in `MEMO_RERANK_HEADERS` |
+| `cross_encoder` | a sidecar call | A TEI / Cohere / Jina `/rerank` endpoint |
 
-Beyond LSH, the correct fix for very large corpora is still to install
-pgvector (HNSW O(log N)) or to scope writes more narrowly — not to
-raise `bruteforce_candidate_limit` and pay the CPU bill on every search.
+```bash
+memo config set MEMO_RERANK_ADAPTER noop
+memo config set MEMO_RERANK_TOP_N 20         # results the reranker sees (a cost cap)
+memo config set MEMO_RERANK_ENABLED true     # every search (a call can still turn it off)
+```
+
+Or per search: `memo search … --rerank on` / `memory_search` with `rerank: true`.
+The search fetches `max(limit, MEMO_RERANK_TOP_N)` candidates, the reranker
+reorders them, the result is cut to `limit`. If the reranker fails (network,
+malformed answer), the search keeps the hybrid order — it never fails because of
+it. Reranked rows carry `rerank_score` (0–1) and `rerank_rank`.
+
+### Measured impact (LongMemEval `_s`, first 50, single-session-user)
+
+| Mode | R@1 | R@5 | R@10 | R@20 | MRR | elapsed |
+|---|---|---|---|---|---|---|
+| baseline (ollama nomic-embed-text) | 0.560 | 0.760 | 0.800 | 0.860 | 0.648 | 299 s |
+| + rerank `noop` | 0.680 | 0.800 | 0.840 | 0.860 | 0.736 | 310 s |
+
+The free `noop` reranker lifted R@1 by **12 points** and MRR by **0.088** at ~4 %
+more time. R@20 doesn't move: a reranker only **reorders** the candidates — it
+can't recall what the hybrid search missed. For that, improve the embedder or the
+blend (priorities 1 and 4).
+
+Reproduce (any scratch database — the runner wipes its own scopes):
+
+```bash
+MEMO_DB=bench luajit eval/longmemeval_run.lua --embedder ollama \
+    --corpus eval/data/longmemeval_s.json --n 50 --out /tmp/baseline.json
+MEMO_DB=bench luajit eval/longmemeval_run.lua --embedder ollama \
+    --corpus eval/data/longmemeval_s.json --n 50 \
+    --rerank --rerank-adapter noop --rerank-top-n 20 --out /tmp/rerank-noop.json
+```
+
+### When to enable it
+
+- You have done priorities 1–4 and the top result is still often wrong.
+- You need a better top 1–3 (a single "best answer") without a bigger prompt.
+- **`noop` first** (free, often enough), and **not on top of a strong
+  embedder**: with bge-m3 the word-overlap pass shuffles good candidates down
+  (R@1 −7.5 points measured).
+
+### Cross-encoders — a measured negative result
+
+`cross_encoder` was benched with `bge-m3` embeddings and the `bge-reranker-v2-m3`
+reranker (n = 200, `longmemeval_s`):
+
+| Config | R@1 | R@5 | MRR |
+|---|---:|---:|---:|
+| bge-m3, no rerank | 0.800 | 0.935 | 0.862 |
+| bge-m3, rerank `noop`, top 20 | 0.725 | 0.925 | 0.809 |
+| **bge-m3 + bge-reranker-v2-m3, top 20** | **0.800** | **0.935** | **0.862** |
+
+**No gain**: the reranker is fine-tuned from the same base as the embedder and
+agrees with its order point for point, at +0.43 s per query. A cross-encoder from
+a **different** model family (Cohere Rerank, Jina Reranker on top of bge-m3) may
+help — not yet measured.
+
+---
+
+## Search cost
+
+Search is **exact** at every size: every vector in the searched scopes is
+scored (a float32 scan in LuaJIT), and the full-text index adds its own top
+matches. There is no approximate index to tune and no candidate cap that could
+hide the right memory. Measured (one scope, 384 dimensions, median of 15
+searches):
+
+| Memories in scope | 1,000 | 5,000 | 20,000 | 100,000 |
+|---|---|---|---|---|
+| search | 3.9 ms | 18.3 ms | 71 ms | 233 ms |
+
+Above ~100,000 memories in one scope, narrower scopes keep searches fast — the
+time grows with the memories searched, not with the database.
 
 ---
 
 ## Lever priority — quick reference
 
-| # | Lever                       | Impact on agent quality | Effort  |
-|---|-----------------------------|--------------------------|---------|
-| 1 | Real embedder               | Huge                     | Medium  |
-| 2 | Scope writes properly       | Large                    | Free    |
-| 3 | `since` / `until` filters   | Large (when applicable)  | Trivial |
-| 4 | `tune_weights` hybrid blend | Medium                   | Trivial |
-| 5 | Reranker (built-in)         | Medium (+12pt R@1 noop)  | Trivial |
-| — | `bruteforce_candidate_limit`| Latency only             | n/a     |
-| — | LSH (auto at >10k rows)     | Latency only (automatic) | None    |
+| # | Lever | Impact on answer quality | Effort |
+|---|---|---|---|
+| 1 | A real embedder | Huge | Medium (`memo calibrate`) |
+| 2 | Scope writes properly | Large | Free |
+| 3 | `since` / `until` | Large, when the question has a period | Trivial |
+| 4 | Tune the blend (`memo tune-weights`) | Medium | Trivial |
+| 5 | A reranker | Medium (+12 points R@1 with `noop` on nomic) | Trivial |
 
-Work top-down. Don't tune things below something you haven't done yet.
-
-> **Temporal filters first, K second.** When the agent asks "what did
-> we discuss this week" it is cheaper and more accurate to pass
-> `since = 7 days ago` than to bump K hoping recent rows survive the
-> all-time blend. `since` / `until_` shrink the candidate pool BEFORE
-> the ANN/FTS rank step, so top-K stays trustworthy at a smaller K.
-> See the inline `since` / `until_` args on `memory.search()` and the
-> matching HTTP / MCP / CLI surface.
+Work top-down. Don't tune a lever below one you haven't done yet.

@@ -1,0 +1,78 @@
+# The full test suite and the rock's smoke test, on every push and pull request.
+# Linux is the reference; macOS runs too but may fail without blocking (the tests use a
+# few GNU tools — script -qec, stat -c — not yet ported).
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}${{ matrix.cjson && ', lua-cjson' || '' }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both JSON backends: the bundled dkjson (lua-cjson is optional) and lua-cjson.
+          - os: ubuntu-24.04
+            experimental: false
+            cjson: false
+          - os: ubuntu-24.04
+            experimental: false
+            cjson: true
+          - os: macos-14
+            experimental: true
+            cjson: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0 (pinned by commit)
+        with:
+          fetch-depth: 0   # the codebase-index and calibrate tests read git history
+
+      - name: Install (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            luajit luarocks libsqlite3-0 libsodium23 lua-socket lua-sec jq git universal-ctags
+          git config --global user.email ci@example.invalid
+          git config --global user.name CI
+
+      - name: lua-cjson
+        if: matrix.cjson
+        run: sudo apt-get install -y --no-install-recommends lua-cjson
+
+      - name: Install (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install luajit luarocks sqlite libsodium jq universal-ctags
+          luarocks --lua-dir="$(brew --prefix luajit)" --lua-version 5.1 install luasocket
+          echo "MEMO_LIB_SODIUM=$(brew --prefix libsodium)/lib/libsodium.dylib" >> "$GITHUB_ENV"
+          echo "MEMO_LIB_SQLITE3=$(brew --prefix sqlite)/lib/libsqlite3.dylib" >> "$GITHUB_ENV"
+          eval "$(luarocks --lua-dir="$(brew --prefix luajit)" --lua-version 5.1 path)"
+          echo "LUA_PATH=$LUA_PATH" >> "$GITHUB_ENV"
+          echo "LUA_CPATH=$LUA_CPATH" >> "$GITHUB_ENV"
+          git config --global user.email ci@example.invalid
+          git config --global user.name CI
+
+      - name: Versions
+        run: |
+          luajit -v
+          luajit -e 'package.path="./?.lua;./?/init.lua;"..package.path
+            print("SQLite", require("luamemo.native.sqlite").version())'
+
+      - name: Test suite
+        run: luajit eval/tests/run.lua --timeout 900
+
+      - name: Rock smoke test
+        run: |
+          v=$(luajit -e 'package.path="./?.lua;./?/init.lua;"..package.path io.write(require("luamemo").VERSION)')
+          luajit eval/release/rockspec.lua "$v" --check
+          bash eval/release/smoke.sh "luamemo-$v-1.rockspec"

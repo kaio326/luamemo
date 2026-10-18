@@ -1,0 +1,25 @@
+{
+  "events": [
+    {
+      "tid": 0,
+      "message_list": [
+        [
+          { "sid": 10, "user_message": "We used to run MySQL in production.", "assistant_message": "MySQL is widely used.", "time": "2024-01-10 14:00", "place": "office" }
+        ],
+        [
+          { "sid": 11, "user_message": "We migrated the production database to PostgreSQL last quarter.", "assistant_message": "PostgreSQL is excellent for production workloads.", "time": "2024-04-02 11:00", "place": "office" },
+          { "sid": 12, "user_message": "Yes, especially with the pgvector extension for embeddings.", "assistant_message": "pgvector makes similarity search easy.", "time": "2024-04-02 11:10", "place": "office" }
+        ]
+      ],
+      "QA": {
+        "qid": 0,
+        "question": "Which database does the team run in production now?",
+        "answer": "PostgreSQL",
+        "target_step_id": [[11, 0]],
+        "choices": { "A": "MySQL", "B": "PostgreSQL", "C": "SQLite", "D": "MongoDB" },
+        "ground_truth": "B",
+        "time": "2024-04-05 09:00"
+      }
+    }
+  ]
+}

@@ -1,19 +1,19 @@
 -- eval/tests/test_core.lua
 -- Merged core DB tests:
---   Section 1: Bruteforce   (write / dedup / search, both backends)
+--   Section 1: Write / dedup / search
 --   Section 2: Write-Many   (batched ingest via memory.write_many)
 --   Section 3: Tiers        (Plan 10 memory-tier derivation + search filtering)
 --   Section 4: Promote      (memory.promote session-continuity helper)
 --   Section 5: Decay+Dedup+Summary (decay ranking, dedup merge, summarizer compaction)
 --
--- Usage:
---   MEMO_DB_URL=postgresql://postgres:postgres@127.0.0.1:5432/luamemo_dev \
---     lua5.1 eval/tests/test_core.lua
+-- Usage (the test runner sets a new MEMO_DB per file):
+--   MEMO_DB=/tmp/test_core.db luajit eval/tests/test_core.lua
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
 local db     = require("luamemo.db")
 local memory = require("luamemo")
+local util   = require("luamemo.util")
 
 local pass = 0
 local fail = 0
@@ -32,22 +32,28 @@ local function header(s)
     io.write(string.format("\n=== %s ===\n", s))
 end
 
+local function count(sql, ...) return tonumber((db.value(sql, ...))) end
+
+-- Backdate rows' updated_at (setting it explicitly: the touch trigger only moves an
+-- updated_at the UPDATE leaves alone).
+local DAY_US = 86400 * 1000000
+local function backdate(where, param, days)
+    assert(db.run("UPDATE lm_memories SET updated_at = ? WHERE " .. where, util.now_us() - days * DAY_US, param))
+end
+
 -- =========================================================================
--- Section 1: Bruteforce / write / dedup / search
+-- Section 1: write / dedup / search
 -- =========================================================================
-header("Bruteforce — write / dedup / search")
+header("Write / dedup / search")
 
 memory.setup({
-    db_table       = "lm_memories",
     embedder_local = "hash",
     embed_dim      = 384,
-    backend        = "auto",
     default_scope  = "smoke",
-    auth_fn        = function() return true end,
 })
-io.write("resolved backend = " .. tostring(memory.store.backend()) .. "\n")
+io.write("storage = " .. tostring(memory.store.backend()) .. "\n")
 
-db.query("DELETE FROM lm_memories WHERE scope = 'smoke'")
+db.run("DELETE FROM lm_memories WHERE scope = 'smoke'")
 
 do
     local seeds = {
@@ -106,17 +112,14 @@ end
 header("Write-Many")
 
 memory.setup({
-    db_table        = "lm_memories",
     embedder_local  = "hash",
     embed_dim       = 384,
-    backend         = "auto",
     default_scope   = "smoke_wm",
     dedup_enabled   = true,
     dedup_threshold = 0.95,
-    auth_fn         = function() return true end,
 })
 
-db.query("DELETE FROM lm_memories WHERE scope LIKE 'smoke_wm%'")
+db.run("DELETE FROM lm_memories WHERE scope LIKE 'smoke_wm%'")
 
 do
     -- Happy path: 5 rows in single chunk
@@ -143,7 +146,7 @@ do
     end
 
     -- Multi-chunk: 12 rows with batch_size=5
-    db.query("DELETE FROM lm_memories WHERE scope = 'smoke_wm'")
+    db.run("DELETE FROM lm_memories WHERE scope = 'smoke_wm'")
     local big = {}
     for i = 1, 12 do
         big[i] = { scope = "smoke_wm", kind = "fact",
@@ -161,7 +164,7 @@ do
     end
 
     -- Mixed validation errors
-    db.query("DELETE FROM lm_memories WHERE scope = 'smoke_wm'")
+    db.run("DELETE FROM lm_memories WHERE scope = 'smoke_wm'")
     local mixed = {
         { scope = "smoke_wm", kind = "fact", title = "good 1", body = "alpha aaa" },
         { scope = "smoke_wm", kind = "fact", title = "",       body = "" },
@@ -185,7 +188,7 @@ do
     end
 
     -- Dedup skip
-    db.query("DELETE FROM lm_memories WHERE scope = 'smoke_wm'")
+    db.run("DELETE FROM lm_memories WHERE scope = 'smoke_wm'")
     local seed = memory.write({ scope = "smoke_wm", kind = "fact",
         title = "Postgres backup strategy",
         body  = "Use pg_dump nightly and ship to S3 with retention." })
@@ -207,6 +210,104 @@ do
     check("write_many dedup: second=inserted",
         results ~= nil and results[2] ~= nil and results[2].action == "inserted",
         tostring(results and results[2] and results[2].action))
+
+    -- Two near-duplicates in one batch, dedup "update": the second merges into the first.
+    -- Its text was lost (only the caller's args got it, the row was written without), the
+    -- caller's table was changed, and a first item without a body crashed.
+    db.run("DELETE FROM lm_memories WHERE scope = 'smoke_wm'")
+    local gate = "the deploy goes through the staging gate before production every time"
+    local pair = { { scope = "smoke_wm", title = "deploy", body = gate, tags = { "a" } },
+                   { scope = "smoke_wm", title = "deploy", body = gate .. " ROLLBACK", tags = { "b" } } }
+    results = memory.write_many(pair, { dedup_strategy = "update" })
+    local merged_row = db.first("SELECT body, tags FROM lm_memories WHERE scope = 'smoke_wm'")
+    check("write_many in-batch merge: one row holding both texts, the later tags",
+        results and results[2] and results[2].action == "merged" and merged_row
+        and merged_row.body == gate .. "\n" .. gate .. " ROLLBACK"
+        and require("luamemo.json").encode(merged_row.tags) == '["b"]',
+        require("luamemo.json").encode({ results and results[1] and results[1].action,
+            results and results[2] and results[2].action, merged_row }))
+    check("… the caller's rows are left as given", pair[1].body == gate and pair[1].tags[1] == "a")
+    db.run("DELETE FROM lm_memories WHERE scope = 'smoke_wm'")
+    local ok_nb, res_nb = pcall(memory.write_many, { { scope = "smoke_wm", title = gate },
+        { scope = "smoke_wm", title = gate, body = "gate" } }, { dedup_strategy = "update" })
+    -- Rerank is best-effort: a model's malformed answer (index 2.5 passed the range check,
+    -- pool[2.5] is nil → the search raised) or any error raised by an adapter falls back to
+    -- the baseline ranking.
+    package.loaded["luamemo.rerankers.halfstub"] = { rerank = function()
+        return { { index = 2.5, score = 0.9 }, { index = 1, score = 0.1 } } end }
+    package.loaded["luamemo.rerankers.raisestub"] = { rerank = function() error("adapter blew up") end }
+    db.run("DELETE FROM lm_memories WHERE scope = 'smoke_rr'")
+    for i = 1, 3 do memory.write({ scope = "smoke_rr", title = "deploy note " .. i, body = "the staging gate " .. i }) end
+    local rr = require("luamemo.rerank")
+    local r_half, e_half = rr.rerank("staging gate", { { id = 1 }, { id = 2 }, { id = 3 } },
+        { rerank_adapter = "halfstub", rerank_top_n = 3 })
+    check("rerank: an adapter's fractional index is refused (nil, why), not a crash",
+        r_half == nil and tostring(e_half):find("invalid index", 1, true) ~= nil, tostring(e_half))
+    local all_ok = true
+    for _, a in ipairs({ "halfstub", "raisestub" }) do
+        local ok_s, rows_s = pcall(memory.search, { query = "staging gate", scope = "smoke_rr", limit = 3,
+            rerank = true, rerank_adapter = a })
+        all_ok = all_ok and ok_s and type(rows_s) == "table" and #rows_s >= 3   -- (+ observations)
+    end
+    check("search falls back to the baseline ranking when the reranker refuses or raises", all_ok)
+    -- The FTS leg starts from the FTS index: with a bound LIMIT ? SQLite walked every row of
+    -- the scope by the (scope, tier) index and ran MATCH per row (0.5–2 s at 5,000 memories).
+    local plan = db.query("EXPLAIN QUERY PLAN " .. require("luamemo.store")._fts_sql(" AND m.scope = ? AND m.tier >= ?"),
+        '"staging"', "smoke_rr", 1, 50) or {}
+    -- A batch write's duplicate check reads the scope's newest candidates from the
+    -- (scope, updated_at) index (migration 003) — without it SQLite sorted the whole scope.
+    local cplan = db.query("EXPLAIN QUERY PLAN SELECT id, embedding, emb_norm FROM lm_memories "
+        .. "WHERE scope = ? AND embedding IS NOT NULL ORDER BY updated_at DESC LIMIT ?", "smoke_rr", 1000) or {}
+    local cdetail = {}
+    for _, r in ipairs(cplan) do cdetail[#cdetail + 1] = tostring(r.detail) end
+    check("a batch write's candidates come from the (scope, updated_at) index, no sort of the scope",
+        table.concat(cdetail, " | "):find("lm_memories_scope_updated_idx", 1, true) ~= nil
+        and not table.concat(cdetail, " | "):find("TEMP B-TREE", 1, true), table.concat(cdetail, " | "))
+    -- A file's code-map rows are found by metadata.path from the path index (migration 004):
+    -- index ingest / update replace each file's rows through this filter — it scanned the
+    -- scope per file (files × rows: 47 s for 2,000 files) — and index_outline (59 ms at 5,000).
+    local function plan_of(sql, ...)
+        local d = {}
+        for _, r in ipairs(db.query("EXPLAIN QUERY PLAN " .. sql, ...) or {}) do d[#d + 1] = tostring(r.detail) end
+        return table.concat(d, " | ")
+    end
+    local pw, pp = require("luamemo.store")._bulk_where({ scope = "codeindex:x", metadata_filter = { path = "src/a.lua" } }, "t")
+    local dplan = plan_of("SELECT id FROM lm_memories" .. pw .. " LIMIT 500", unpack(pp, 1, #pp))
+    local oplan = plan_of("SELECT id FROM lm_memories WHERE scope = ? AND kind = 'symbol' "
+        .. "AND json_extract(metadata, '$.path') = ? ORDER BY CAST(json_extract(metadata, '$.line') AS INTEGER) "
+        .. "LIMIT ?", "codeindex:x", "src/a.lua", 200)
+    check("a path filter (index ingest's per-file delete) and index_outline use the path index",
+        dplan:find("lm_memories_path_idx", 1, true) ~= nil and oplan:find("lm_memories_path_idx", 1, true) ~= nil,
+        dplan .. " || " .. oplan)
+    db.run("DROP INDEX lm_memories_path_idx")
+    db.run("DELETE FROM lm_migrations WHERE name = '004_path_idx'")
+    local h = assert(db.open(os.getenv("MEMO_DB")))
+    check("… and a database made before it gets it when next opened",
+        h.value("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'lm_memories_path_idx'") == 1)
+    h.close()
+    -- A search consolidates a bounded slice inline (it clustered the whole backlog: 9 s
+    -- after a 5,000-row write); the rest stays pending for the next searches.
+    db.run("DELETE FROM lm_memories WHERE scope = 'smoke_cons'")
+    local many_rows = {}
+    for i = 1, 150 do many_rows[i] = { scope = "smoke_cons", title = "cons " .. i, body = "consolidation slice note " .. i } end
+    memory.write_many(many_rows, { dedup_strategy = "append" })
+    local function unconsolidated()
+        return tonumber(db.value("SELECT count(*) FROM lm_memories WHERE scope = 'smoke_cons' AND consolidated_at IS NULL"))
+    end
+    memory.search({ query = "consolidation slice", scope = "smoke_cons", limit = 3 })
+    local after1 = unconsolidated()
+    memory.search({ query = "consolidation slice", scope = "smoke_cons", limit = 3 })
+    local after2 = unconsolidated()
+    check("a search consolidates at most 100 pending memories; the next one goes on (150 → 50 → 0)",
+        after1 == 50 and after2 == 0, ("%s, %s"):format(tostring(after1), tostring(after2)))
+    db.run("DELETE FROM lm_memories WHERE scope = 'smoke_cons'")
+    check("search's text step scans the FTS index first (not every row of the scope)",
+        plan[1] and tostring(plan[1].detail):find("lm_memories_fts", 1, true) ~= nil,
+        plan[1] and plan[1].detail)
+    db.run("DELETE FROM lm_memories WHERE scope = 'smoke_rr'")
+    check("… a first item with no body doesn't crash it (it takes the second's)", ok_nb
+        and res_nb[2] and res_nb[2].action == "merged"
+        and db.value("SELECT body FROM lm_memories WHERE scope = 'smoke_wm'") == "gate", tostring(res_nb))
 end
 
 -- =========================================================================
@@ -215,45 +316,37 @@ end
 header("Tiers")
 
 memory.setup({
-    db_table          = "lm_memories",
     embedder_local    = "hash",
     embed_dim         = 384,
-    backend           = "auto",
     default_scope     = "smoke:tiers",
-    auth_fn           = function() return true end,
     summarizer_adapter = "noop",
     skip_observations = true,
 })
 
 local TIERS_SCOPE = "smoke:tiers"
-db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(TIERS_SCOPE))
+db.run("DELETE FROM lm_memories WHERE scope = ?", TIERS_SCOPE)
 
 do
-    -- Migration check
-    local col_check = db.query([[
-        SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'lm_memories'
-           AND column_name = 'tier' LIMIT 1]])
-    local tiers_ok = col_check and #col_check > 0
-    check("tiers: lm_memories.tier column exists (migration 008)", tiers_ok,
-        "apply luamemo/migrations/008_tiers.sql")
+    -- Schema check
+    local tiers_ok = db.value("SELECT 1 FROM pragma_table_info('lm_memories') WHERE name = 'tier'") ~= nil
+    check("tiers: lm_memories.tier column exists", tiers_ok)
 
     if tiers_ok then
-        -- Auto tier from importance
+        -- Auto tier from importance, on importance's 0–10 scale (default 1.0 → tier 1)
         local r0 = memory.write({ scope = TIERS_SCOPE, body = "ephemeral event A", importance = 0.2 })
         check("tiers: importance=0.2 → tier=0",
             r0 ~= nil and tonumber(r0.tier) == 0, "tier=" .. tostring(r0 and r0.tier))
 
-        local r1 = memory.write({ scope = TIERS_SCOPE, body = "working memory B", importance = 0.5 })
-        check("tiers: importance=0.5 → tier=1",
+        local r1 = memory.write({ scope = TIERS_SCOPE, body = "working memory B" })
+        check("tiers: default importance (1.0) → tier=1 (a normal write is not 'core')",
             r1 ~= nil and tonumber(r1.tier) == 1, "tier=" .. tostring(r1 and r1.tier))
 
-        local r2 = memory.write({ scope = TIERS_SCOPE, body = "consolidated fact C", importance = 0.7 })
-        check("tiers: importance=0.7 → tier=2",
+        local r2 = memory.write({ scope = TIERS_SCOPE, body = "consolidated fact C", importance = 6 })
+        check("tiers: importance=6 → tier=2",
             r2 ~= nil and tonumber(r2.tier) == 2, "tier=" .. tostring(r2 and r2.tier))
 
-        local r3 = memory.write({ scope = TIERS_SCOPE, body = "core decision D", importance = 1.5 })
-        check("tiers: importance=1.5 → tier=3",
+        local r3 = memory.write({ scope = TIERS_SCOPE, body = "core decision D", importance = 9.5 })
+        check("tiers: importance=9.5 → tier=3",
             r3 ~= nil and tonumber(r3.tier) == 3, "tier=" .. tostring(r3 and r3.tier))
 
         -- Explicit override
@@ -267,8 +360,8 @@ do
         -- write_many tier derivation
         local wm_results = memory.write_many({
             { scope = TIERS_SCOPE, body = "batch ephemeral", importance = 0.1 },
-            { scope = TIERS_SCOPE, body = "batch working",   importance = 0.4 },
-            { scope = TIERS_SCOPE, body = "batch core",      importance = 2.0 },
+            { scope = TIERS_SCOPE, body = "batch working",   importance = 2.0 },
+            { scope = TIERS_SCOPE, body = "batch core",      importance = 9.0 },
         }, { dedup_strategy = "append" })
         check("tiers write_many: 3 results", #wm_results == 3)
         check("tiers write_many: ephemeral tier=0",
@@ -318,7 +411,7 @@ do
             r3 ~= nil and type(tonumber(r3.tier)) == "number")
     end
 
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(TIERS_SCOPE))
+    db.run("DELETE FROM lm_memories WHERE scope = ?", TIERS_SCOPE)
 end
 
 -- =========================================================================
@@ -327,20 +420,16 @@ end
 header("Promote")
 
 memory.setup({
-    db_table          = "lm_memories",
     embedder_local    = "hash",
     embed_dim         = 384,
-    backend           = "auto",
     default_scope     = "session:phase12",
-    auth_fn           = function() return true end,
     summarizer_adapter = "noop",
 })
 
 local FROM = "session:phase12"
 local TO   = "user:phase12:lt"
 
-db.query("DELETE FROM lm_memories WHERE scope IN ("
-    .. db.escape_literal(FROM) .. ", " .. db.escape_literal(TO) .. ")")
+db.run("DELETE FROM lm_memories WHERE scope IN (?, ?)", FROM, TO)
 
 do
     local seed_bodies = {
@@ -363,10 +452,18 @@ do
     check("promote case1: dry_run source_ids=5",
         r1 ~= nil and r1.source_ids ~= nil and #r1.source_ids == 5,
         tostring(r1 and r1.source_ids and #r1.source_ids))
-    local after_dry = db.query("SELECT count(*) AS n FROM lm_memories WHERE scope = "
-        .. db.escape_literal(TO))[1]
-    check("promote case1: dry_run no DB mutation", tonumber(after_dry.n) == 0,
-        "rows written=" .. tostring(after_dry.n))
+    local after_dry = count("SELECT count(*) FROM lm_memories WHERE scope = ?", TO)
+    check("promote case1: dry_run no DB mutation", after_dry == 0, "rows written=" .. tostring(after_dry))
+
+    -- Tier-0 rows (the hooks' raw transcript chunks, the digest's input) are not folded in:
+    -- they made a 122 KB "summary" searches returned whole. They stay for the digest.
+    local t0 = memory.write({ scope = FROM, title = "Periodic save", body = ("USER: hi\nASSISTANT: hello\n"):rep(50),
+        tier = 0, importance = 0.4 })
+    local r0 = memory.promote({ from_scope = FROM, to_scope = TO, dry_run = true })
+    local has_t0 = false
+    for _, id in ipairs(r0 and r0.source_ids or {}) do if t0 and id == t0.id then has_t0 = true end end
+    check("promote: tier-0 transcript chunks are not folded in", t0 ~= nil and r0 and #r0.source_ids == 5
+        and not has_t0, tostring(r0 and r0.source_ids and #r0.source_ids))
 
     -- Real promote, keep source
     local r2 = memory.promote({ from_scope = FROM, to_scope = TO, delete_source = false })
@@ -374,8 +471,7 @@ do
     check("promote case2: summary_id present", r2 ~= nil and r2.summary_id ~= nil)
     check("promote case2: deleted_source=false", r2 ~= nil and r2.deleted_source == false)
 
-    local sum = db.query("SELECT title, kind, metadata FROM lm_memories WHERE id = "
-        .. tostring(r2 and r2.summary_id or 0))[1]
+    local sum = db.first("SELECT title, kind, metadata FROM lm_memories WHERE id = ?", r2 and r2.summary_id or 0)
     check("promote case2: kind=summary", sum ~= nil and sum.kind == "summary",
         "kind=" .. tostring(sum and sum.kind))
     check("promote case2: title has [promoted] prefix",
@@ -383,31 +479,25 @@ do
         "title=" .. tostring(sum and sum.title))
 
     local meta = sum and sum.metadata
-    if type(meta) == "string" then
-        meta = require("cjson").decode(meta)
-    end
     check("promote case2: metadata.promoted_from",
-        meta ~= nil and meta.promoted_from == FROM, tostring(meta and meta.promoted_from))
+        type(meta) == "table" and meta.promoted_from == FROM, tostring(type(meta) == "table" and meta.promoted_from))
     check("promote case2: metadata.source_ids has 5",
-        meta ~= nil and type(meta.source_ids) == "table" and #meta.source_ids == 5)
+        type(meta) == "table" and type(meta.source_ids) == "table" and #meta.source_ids == 5)
 
-    local src_after = db.query("SELECT count(*) AS n FROM lm_memories WHERE scope = "
-        .. db.escape_literal(FROM) .. " AND kind != 'summary'")[1]
-    check("promote case2: source rows preserved",
-        tonumber(src_after.n) == 5, "got " .. tostring(src_after.n))
+    local src_after = count("SELECT count(*) FROM lm_memories WHERE scope = ? AND kind != 'summary' AND tier >= 1", FROM)
+    check("promote case2: source rows preserved", src_after == 5, "got " .. tostring(src_after))
 
     -- Real promote, delete source
     local r3 = memory.promote({ from_scope = FROM, to_scope = TO, delete_source = true })
     check("promote case3: promoted=1", r3 ~= nil and r3.promoted == 1)
     check("promote case3: deleted_source=true", r3 ~= nil and r3.deleted_source == true)
-    local src_gone = db.query("SELECT count(*) AS n FROM lm_memories WHERE scope = "
-        .. db.escape_literal(FROM))[1]
-    check("promote case3: source deleted", tonumber(src_gone.n) == 0,
-        "got " .. tostring(src_gone.n))
-    local target_count = db.query("SELECT count(*) AS n FROM lm_memories WHERE scope = "
-        .. db.escape_literal(TO))[1]
-    check("promote case3: target has 2 summaries", tonumber(target_count.n) == 2,
-        "got " .. tostring(target_count.n))
+    local src_gone = count("SELECT count(*) FROM lm_memories WHERE scope = ? AND tier >= 1", FROM)
+    check("promote case3: source deleted", src_gone == 0, "got " .. tostring(src_gone))
+    check("… the tier-0 chunk left for the digest", count("SELECT count(*) FROM lm_memories WHERE scope = ? AND tier = 0",
+        FROM) == 1)
+    db.run("DELETE FROM lm_memories WHERE scope = ? AND tier = 0", FROM)
+    local target_count = count("SELECT count(*) FROM lm_memories WHERE scope = ?", TO)
+    check("promote case3: target has 2 summaries", target_count == 2, "got " .. tostring(target_count))
 
     -- Empty source -> no_rows
     local r4 = memory.promote({ from_scope = FROM, to_scope = TO })
@@ -424,8 +514,7 @@ do
         r6 ~= nil and r6.promoted == 0 and r6.errors ~= nil
         and r6.errors[1]:find("from_scope == to_scope"))
 
-    db.query("DELETE FROM lm_memories WHERE scope IN ("
-        .. db.escape_literal(FROM) .. ", " .. db.escape_literal(TO) .. ")")
+    db.run("DELETE FROM lm_memories WHERE scope IN (?, ?)", FROM, TO)
 end
 
 -- =========================================================================
@@ -434,12 +523,9 @@ end
 header("Decay + Dedup + Summary")
 
 memory.setup({
-    db_table       = "lm_memories",
     embedder_local = "hash",
     embed_dim      = 384,
-    backend        = "auto",
     default_scope  = "h83",
-    auth_fn        = function() return true end,
     summarizer_adapter          = "noop",
     summarizer_weight_threshold = 0.5,
     summarizer_retention_days   = 7,
@@ -447,7 +533,7 @@ memory.setup({
     summarizer_max_batches      = 2,
 })
 
-db.query("DELETE FROM lm_memories WHERE scope LIKE 'h83%'")
+db.run("DELETE FROM lm_memories WHERE scope LIKE 'h83%'")
 
 do
     -- Decay
@@ -468,9 +554,7 @@ do
     })
     check("decay: rotting row written", rotting ~= nil)
 
-    db.query("ALTER TABLE lm_memories DISABLE TRIGGER lm_memories_touch_updated_at_trg")
-    db.query("UPDATE lm_memories SET updated_at = now() - interval '30 days' WHERE id = " .. (rotting and rotting.id or 0))
-    db.query("ALTER TABLE lm_memories ENABLE TRIGGER lm_memories_touch_updated_at_trg")
+    backdate("id = ?", rotting and rotting.id or 0, 30)
 
     local post = memory.search({
         query = "deploy procedure runbook", scope = "h83-decay",
@@ -523,9 +607,8 @@ do
     check("dedup: append creates new row",
         d3 ~= nil and a3 == "inserted" and d1 ~= nil and d3.id ~= d1.id)
 
-    local n = db.query("SELECT count(*) AS c FROM lm_memories WHERE scope = 'h83-dedup'")
-    check("dedup: 2 rows total (1 merged + 1 appended)",
-        n ~= nil and tonumber(n[1].c) == 2, "got " .. tostring(n and n[1] and n[1].c))
+    local n = count("SELECT count(*) FROM lm_memories WHERE scope = 'h83-dedup'")
+    check("dedup: 2 rows total (1 merged + 1 appended)", n == 2, "got " .. tostring(n))
 
     -- Summarizer
     for i = 1, 4 do
@@ -538,13 +621,10 @@ do
         check("summarizer seed " .. i, r ~= nil)
     end
 
-    db.query("ALTER TABLE lm_memories DISABLE TRIGGER lm_memories_touch_updated_at_trg")
-    db.query("UPDATE lm_memories SET updated_at = now() - interval '30 days' WHERE scope = 'h83-sum'")
-    db.query("ALTER TABLE lm_memories ENABLE TRIGGER lm_memories_touch_updated_at_trg")
+    backdate("scope = ?", "h83-sum", 30)
 
-    local pre_count = db.query("SELECT count(*) AS c FROM lm_memories WHERE scope = 'h83-sum'")
-    check("summarizer: 4 rows before summarize",
-        pre_count ~= nil and tonumber(pre_count[1].c) == 4, tostring(pre_count and pre_count[1] and pre_count[1].c))
+    local pre_count = count("SELECT count(*) FROM lm_memories WHERE scope = 'h83-sum'")
+    check("summarizer: 4 rows before summarize", pre_count == 4, tostring(pre_count))
 
     local dry = memory.summarizer.run({
         scope = "h83-sum", weight_threshold = 0.5, retention_days = 7,
@@ -555,9 +635,8 @@ do
     check("summarizer dry-run: 4 replaced_ids", dry ~= nil and #dry.replaced_ids == 4,
         tostring(dry and #dry.replaced_ids))
 
-    local mid_count = db.query("SELECT count(*) AS c FROM lm_memories WHERE scope = 'h83-sum'")
-    check("summarizer dry-run: no mutation",
-        mid_count ~= nil and tonumber(mid_count[1].c) == 4, tostring(mid_count and mid_count[1] and mid_count[1].c))
+    local mid_count = count("SELECT count(*) FROM lm_memories WHERE scope = 'h83-sum'")
+    check("summarizer dry-run: no mutation", mid_count == 4, tostring(mid_count))
 
     local real = memory.summarizer.run({
         scope = "h83-sum", weight_threshold = 0.5, retention_days = 7,
@@ -572,16 +651,10 @@ do
     check("summarizer: 1 row remains", rows ~= nil and #rows == 1, "got " .. tostring(rows and #rows))
     check("summarizer: kind=summary",  rows ~= nil and rows[1] ~= nil and rows[1].kind == "summary")
 
-    local raw_meta = rows and rows[1] and rows[1].metadata
-    local meta_t
-    if type(raw_meta) == "table" then
-        meta_t = raw_meta
-    else
-        meta_t = require("cjson.safe").decode(raw_meta or "{}") or {}
-    end
+    local meta_t = rows and rows[1] and rows[1].metadata
     check("summarizer: metadata.summarized_ids has 4",
-        meta_t ~= nil and meta_t.summarized_ids ~= nil and #meta_t.summarized_ids == 4,
-        tostring(meta_t and meta_t.summarized_ids and #meta_t.summarized_ids))
+        type(meta_t) == "table" and meta_t.summarized_ids ~= nil and #meta_t.summarized_ids == 4,
+        tostring(type(meta_t) == "table" and meta_t.summarized_ids and #meta_t.summarized_ids))
 end
 
 -- =========================================================================

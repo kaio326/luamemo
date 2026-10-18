@@ -1,11 +1,11 @@
-# Standalone docker-compose for lapis-memory bench-only sidecars.
+# Standalone docker-compose for luamemo bench-only sidecars.
 #
 # This file is intentionally separate from the host project's
 # docker-compose.yml so that the embedding/rerank sidecars do not
 # pollute production deployments. Bring them up only when running
 # the eval harness:
 #
-#   cd lapis-memory
+#   cd luamemo
 #   docker compose -f eval/sidecars/docker-compose.yml up -d tei-embed
 #   docker compose -f eval/sidecars/docker-compose.yml logs -f tei-embed
 #   # wait for "Ready"

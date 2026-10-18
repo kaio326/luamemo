@@ -24,6 +24,7 @@ typedef struct {
     struct llama_context     * ctx;
     const struct llama_vocab * vocab;
     int                        n_embd;
+    int                        last_truncated;   /* the last lmembed_embed input exceeded n_ctx */
 } lmembed_t;
 
 static int g_backend_ready = 0;
@@ -56,6 +57,7 @@ void * lmembed_load(const char * path, int n_ctx, int n_gpu_layers) {
     h->ctx    = ctx;
     h->vocab  = llama_model_get_vocab(model);
     h->n_embd = llama_model_n_embd(model);
+    h->last_truncated = 0;
     return h;
 }
 
@@ -64,22 +66,25 @@ int lmembed_dim(void * handle) {
 }
 
 /* Embed `text` into `out` (up to max_dim floats). Returns the number of floats
- * written (the embedding dim), or -1 on failure. Output is L2-normalised. */
+ * written (the embedding dim), or -1 on failure. Output is L2-normalised.
+ * Input longer than the context is embedded from its first n_ctx tokens, and
+ * lmembed_last_truncated() then returns 1. */
 int lmembed_embed(void * handle, const char * text, float * out, int max_dim) {
     if (!handle || !text || !out) return -1;
     lmembed_t * h = (lmembed_t *) handle;
     const int32_t n_ctx = (int32_t) llama_n_ctx(h->ctx);
     const int32_t tlen  = (int32_t) strlen(text);
+    h->last_truncated = 0;
 
-    /* two-pass tokenise: first get the count (negated), then fill */
+    /* two-pass tokenise: first get the count (negated), then fill. The buffer
+     * must hold EVERY token — given less, llama_tokenize fills nothing. */
     int32_t need = -llama_tokenize(h->vocab, text, tlen, NULL, 0, true, false);
     if (need <= 0) return -1;
-    if (need > n_ctx) need = n_ctx;                 /* truncate to context */
     llama_token * toks = (llama_token *) malloc(sizeof(llama_token) * need);
     if (!toks) return -1;
     int32_t n = llama_tokenize(h->vocab, text, tlen, toks, need, true, false);
-    if (n < 0) n = need;                            /* was truncated */
     if (n <= 0) { free(toks); return -1; }
+    if (n > n_ctx) { n = n_ctx; h->last_truncated = 1; }   /* keep the first n_ctx tokens */
 
     struct llama_batch batch = llama_batch_init(n, 0, 1);
     for (int32_t i = 0; i < n; i++) {
@@ -110,6 +115,11 @@ int lmembed_embed(void * handle, const char * text, float * out, int max_dim) {
     llama_batch_free(batch);
     free(toks);
     return d;
+}
+
+/* 1 when the last lmembed_embed input was cut to the context length, else 0. */
+int lmembed_last_truncated(void * handle) {
+    return handle ? ((lmembed_t *) handle)->last_truncated : 0;
 }
 
 void lmembed_free(void * handle) {

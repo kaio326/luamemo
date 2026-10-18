@@ -6,8 +6,8 @@
 --   4. KG "required_by" facts created (reverse direction)
 --   5. Re-ingest is idempotent: no duplicate KG facts
 --
--- Requires MEMO_DB_URL to be set.
--- Run: lua5.1 eval/tests/test_index_deps.lua
+-- Requires MEMO_DB to be set.
+-- Run: luajit eval/tests/run.lua --only index_deps
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 
@@ -72,9 +72,9 @@ end
 -- ---------------------------------------------------------------------------
 -- DB-dependent tests
 -- ---------------------------------------------------------------------------
-local db_url = os.getenv("MEMO_DB_URL")
-if not db_url or db_url == "" then
-    io.stderr:write("[SKIP] MEMO_DB_URL not set — DB tests skipped\n")
+local db_name = os.getenv("MEMO_DB")
+if not db_name or db_name == "" then
+    io.stderr:write("[SKIP] MEMO_DB not set — DB tests skipped\n")
     io.write(("\n=== Phase 4 results: %d passed, %d failed (resolver only) ===\n"):format(PASS, FAIL))
     os.exit(FAIL > 0 and 1 or 0)
 end
@@ -86,7 +86,7 @@ if not ok_lm then
 end
 
 local embedder_url = os.getenv("MEMO_EMBEDDER_URL")
-local cfg = { db_url = db_url, auth_fn = function() return true end }
+local cfg = {}
 if embedder_url and embedder_url ~= "" then
     cfg.embedder_url     = embedder_url
     cfg.embedder_adapter = os.getenv("MEMO_EMBEDDER_ADAPTER") or "generic"
@@ -109,7 +109,7 @@ local kg = luamemo.kg
 
 -- Wipe scope and KG facts before start.
 luamemo.store.delete_where({ scope = scope })
-db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
+db.run("DELETE FROM lm_kg_facts WHERE scope = ?", scope)
 info("wiped scope " .. scope .. " before test")
 
 -- ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ local result, ierr = luamemo.index.ingest(".", {
 if not result then
     fail("ingest failed: " .. tostring(ierr))
     luamemo.store.delete_where({ scope = scope })
-    db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
+    db.run("DELETE FROM lm_kg_facts WHERE scope = ?", scope)
     io.write(("\n=== Phase 4 results: %d passed, %d failed ===\n"):format(PASS, FAIL))
     os.exit(1)
 end
@@ -135,18 +135,14 @@ assert_eq(#result.errors, 0, "ingest: 0 file errors")
 assert_ge(result.requires, 10, "ingest: at least 10 dependency rows written")
 
 -- Verify dependency rows exist in DB.
-local dep_count = db.query(
-    ("SELECT COUNT(*) AS n FROM lm_memories WHERE scope = %s AND kind = 'dependency'"):format(
-        db.escape_literal(scope)))
-local n_dep = dep_count and dep_count[1] and tonumber(dep_count[1].n) or 0
+local n_dep = tonumber(db.value("SELECT COUNT(*) FROM lm_memories WHERE scope = ? AND kind = 'dependency'",
+    scope)) or 0
 assert_ge(n_dep, 10, "dependency rows in lm_memories >= 10")
 
 -- Check a known dependency: luamemo/init.lua requires luamemo.store
-local init_deps = db.query(
-    ("SELECT * FROM lm_memories WHERE scope = %s AND kind = 'dependency' "
-  .. "AND metadata->>'from_path' = 'luamemo/init.lua' "
-  .. "AND metadata->>'to_module' LIKE '%%store%%' LIMIT 5"):format(
-        db.escape_literal(scope)))
+local init_deps = db.query("SELECT * FROM lm_memories WHERE scope = ? AND kind = 'dependency' "
+  .. "AND json_extract(metadata, '$.from_path') = 'luamemo/init.lua' "
+  .. "AND json_extract(metadata, '$.to_module') LIKE '%store%' LIMIT 5", scope)
 if init_deps and #init_deps > 0 then
     pass("luamemo/init.lua → luamemo.store dependency row found")
     -- Check resolved_path is set.
@@ -230,9 +226,7 @@ end
 -- ---------------------------------------------------------------------------
 io.write("\n--- Test 5: KG idempotency ---\n")
 
-local kg_count_before = db.query(
-    ("SELECT COUNT(*) AS n FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
-local n_before = kg_count_before and kg_count_before[1] and tonumber(kg_count_before[1].n) or 0
+local n_before = tonumber(db.value("SELECT COUNT(*) FROM lm_kg_facts WHERE scope = ?", scope)) or 0
 info("KG facts before re-ingest: " .. n_before)
 
 -- Re-ingest.
@@ -243,9 +237,7 @@ local result2, _ = luamemo.index.ingest(".", {
 if not result2 then
     fail("second ingest failed")
 else
-    local kg_count_after = db.query(
-        ("SELECT COUNT(*) AS n FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
-    local n_after = kg_count_after and kg_count_after[1] and tonumber(kg_count_after[1].n) or 0
+    local n_after = tonumber(db.value("SELECT COUNT(*) FROM lm_kg_facts WHERE scope = ?", scope)) or 0
     info("KG facts after re-ingest: " .. n_after)
     assert_eq(n_before, n_after, "KG fact count unchanged after re-ingest (no duplicates)")
 end
@@ -254,7 +246,7 @@ end
 -- Cleanup
 -- ---------------------------------------------------------------------------
 luamemo.store.delete_where({ scope = scope })
-db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
+db.run("DELETE FROM lm_kg_facts WHERE scope = ?", scope)
 info("cleaned up scope and KG facts")
 
 -- ---------------------------------------------------------------------------

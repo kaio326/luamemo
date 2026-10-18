@@ -12,7 +12,7 @@
 --   rollback()                    (restore the previously-current version)
 --   load_current() -> weights|nil (what the adapter serves)
 
-local cjson   = require("cjson.safe")
+local cjson   = require("luamemo.json")   -- lua-cjson when installed, else the bundled dkjson
 local learned = require("luamemo.rerankers.learned")
 
 local M = {}

@@ -65,7 +65,7 @@ end
 function M.reset_cache() _loaded = nil; _W = nil end
 
 function M.embed(text, cfg)
-    local base_name = cfg and (cfg.projected_base or cfg.embedder_base)
+    local base_name = cfg and cfg.projected_base
     if not base_name or base_name == "" then
         return nil, "projected: projected_base required (e.g. 'gguf_ffi' or 'hash')"
     end
@@ -73,14 +73,14 @@ function M.embed(text, cfg)
     if not ok or type(base.embed) ~= "function" then
         return nil, "projected: base embedder '" .. tostring(base_name) .. "' not found or has no embed()"
     end
-    local x, err = base.embed(text, cfg)
+    local x, err, truncated = base.embed(text, cfg)   -- truncated: the base cut the input
     if type(x) ~= "table" then return nil, err or "projected: base embed failed" end
 
     local W = current_W(cfg)
     if type(W) ~= "table" or (W.dim and W.dim ~= #x) then
-        return x                          -- identity: no matching W -> base unchanged
+        return x, nil, truncated          -- identity: no matching W -> base unchanged
     end
-    return l2norm(M.apply_W(x, W))
+    return l2norm(M.apply_W(x, W)), nil, truncated
 end
 
 function M.selftest(cfg)

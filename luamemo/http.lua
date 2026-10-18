@@ -1,13 +1,14 @@
 -- luamemo.http
--- Portable HTTP client abstraction.
+-- HTTP client: luasocket's socket.http; HTTPS through luasec (required for
+-- https:// URLs).
 --
--- Priority order for the underlying transport:
---   1. resty.http   — non-blocking, available inside OpenResty workers.
---                     Preferred when present because it avoids blocking the
---                     event loop.
---   2. ssl.https    — luasec-backed HTTPS for plain-Lua environments.
---                     Required when calling HTTPS URLs outside OpenResty.
---   3. socket.http  — plain HTTP via luasocket.  No TLS support.
+-- Every https:// server is VERIFIED: its certificate chain against the
+-- system's CA bundle (SSL_CERT_FILE / SSL_CERT_DIR, else the usual OS
+-- locations) plus MEMO_CA_FILE (a self-hosted server's CA or self-signed
+-- certificate), and the certificate against the URL's host. No CA found →
+-- https refuses, saying what to set. Redirects are never followed (a redirect
+-- would take the request — and its headers — to a host the caller never
+-- checked); the 3xx status is returned.
 --
 -- Public API:
 --   http.request(url, opts) → status_code, body, err
@@ -26,62 +27,235 @@
 local M = {}
 
 -- ---------------------------------------------------------------------------
--- resty.http adapter  (OpenResty / non-blocking)
+-- TLS for socket.http (luasec). luasec's own ssl.https does not verify
+-- anything by default, and even with verify = "peer" it never checks the
+-- certificate against the host — so the connection is made here.
 -- ---------------------------------------------------------------------------
-local function try_resty(url, opts)
-    local ok, resty_http = pcall(require, "resty.http")
-    if not ok then return nil end
+M._ca_files = {                                          -- first readable one wins
+    "/etc/ssl/certs/ca-certificates.crt",                -- Debian / Ubuntu / Alpine / Arch / Gentoo
+    "/etc/pki/tls/certs/ca-bundle.crt",                  -- Fedora / RHEL
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", -- RHEL / CentOS 7+
+    "/etc/ssl/ca-bundle.pem",                            -- openSUSE
+    "/etc/pki/tls/cacert.pem",
+    "/etc/ssl/cert.pem",                                 -- macOS / Alpine / BSD
+    "/usr/local/etc/ssl/cert.pem",                       -- FreeBSD
+    "/opt/homebrew/etc/openssl@3/cert.pem",              -- macOS Homebrew
+    "/usr/local/etc/openssl@3/cert.pem",
+}
 
+local NO_CA = "https: no trusted CA certificates found on this machine — luamemo verifies every "
+    .. "https server and does not connect unverified. To fix: set SSL_CERT_FILE to your system's CA "
+    .. "bundle (a PEM file — install your OS's ca-certificates package, or download "
+    .. "https://curl.se/ca/cacert.pem); for a self-hosted server with its own CA or a self-signed "
+    .. "certificate, set MEMO_CA_FILE to that certificate (PEM)."
+
+local env, read_file = require("luamemo.util").env, require("luamemo.util").read_file
+
+local _tls_ctx = {}   -- trust configuration → luasec context (OpenSSL loads the CAs once)
+local _os_bundle      -- the OS bundle found (false: none), looked up once
+
+local function os_bundle()
+    if _os_bundle == nil then
+        _os_bundle = false
+        for _, p in ipairs(M._ca_files) do
+            local f = io.open(p, "rb")
+            if f then f:close(); _os_bundle = p; break end
+        end
+    end
+    return _os_bundle or nil
+end
+
+--- The client TLS context for the current trust configuration | nil, err.
+local function tls_context(ssl)
+    local extra, sys_file, sys_dir = env("MEMO_CA_FILE"), env("SSL_CERT_FILE"), env("SSL_CERT_DIR")
+    local from_env = sys_file
+    if not sys_file and not sys_dir then sys_file = os_bundle() end
+    local key = table.concat({ tostring(sys_file), tostring(sys_dir), tostring(extra) }, "\0")
+    if _tls_ctx[key] then return _tls_ctx[key] end
+
+    -- Building a context: check what it will read first (clear errors, not OpenSSL's).
+    if from_env then
+        local f = io.open(from_env, "rb")
+        if not f then
+            return nil, "https: SSL_CERT_FILE=" .. from_env .. " can't be read — point it at a PEM CA bundle, "
+                .. "or unset it to use the system's"
+        end
+        f:close()
+    end
+    if extra then
+        local pem = read_file(extra)
+        if not pem then
+            return nil, "https: MEMO_CA_FILE=" .. extra .. " can't be read — point it at the PEM certificate "
+                .. "(or CA) of the server you want to trust"
+        end
+        -- (OpenSSL would silently skip a file without a certificate in it)
+        if not pem:find("-----BEGIN CERTIFICATE-----", 1, true) then
+            return nil, "https: MEMO_CA_FILE=" .. extra .. " holds no PEM certificate (\"-----BEGIN CERTIFICATE-----\""
+                .. " … ) — export the server's certificate or CA in PEM format"
+        end
+    end
+    if not (sys_file or sys_dir or extra) then return nil, NO_CA end
+
+    -- MEMO_CA_FILE is trusted IN ADDITION to the system's CAs: one bundle file,
+    -- read by OpenSSL when the context is made, then removed.
+    local cafile, tmp = sys_file or extra, nil
+    if extra and sys_file then
+        tmp = os.tmpname()
+        local out = io.open(tmp, "wb")
+        if not out then
+            os.remove(tmp)
+            return nil, "https: cannot write a temporary CA bundle (" .. tmp .. ")"
+        end
+        out:write(read_file(sys_file), "\n", read_file(extra), "\n")
+        out:close()
+        cafile = tmp
+    end
+    -- TLS 1.2 or newer (1.0 and 1.1 are deprecated — RFC 8996); a luasec built without the
+    -- 1.1 switch gets the rest (its OpenSSL then predates 1.1 anyway).
+    local function context(opts)
+        return ssl.newcontext({ mode = "client", protocol = "any", verify = "peer", options = opts,
+            cafile = cafile, capath = sys_dir })
+    end
+    local ctx, err = context({ "all", "no_sslv2", "no_sslv3", "no_tlsv1", "no_tlsv1_1" })
+    if not ctx and tostring(err):find("no_tlsv1_1", 1, true) then
+        ctx, err = context({ "all", "no_sslv2", "no_sslv3", "no_tlsv1" })
+    end
+    if tmp then os.remove(tmp) end
+    if not ctx then
+        return nil, "https: cannot load the trusted CA certificates (" .. tostring(err)
+            .. ") — check SSL_CERT_FILE / SSL_CERT_DIR / MEMO_CA_FILE"
+    end
+    _tls_ctx[key] = ctx
+    return ctx
+end
+
+-- IP text → comparable form (IPv6 groups expanded), nil when not an IP.
+local function ip_key(s)
+    local ng = require("luamemo.netguard")
+    s = tostring(s or ""):gsub("^%[", ""):gsub("%]$", "")
+    if not ng.is_ip(s) then return nil end
+    local g = s:find(":", 1, true) and ng._parse_v6(s)
+    if not g then return s end
+    local parts = {}
+    for i = 1, 8 do parts[i] = ("%x"):format(g[i]) end
+    return table.concat(parts, ":")
+end
+
+-- RFC 6125: exact name, or one left-most wildcard label ("*.example.com"
+-- matches "a.example.com", not "example.com" nor "a.b.example.com").
+local function dns_match(pattern, host)
+    pattern = tostring(pattern or ""):lower():gsub("%.$", "")
+    if pattern == host then return true end
+    local rest = pattern:match("^%*%.([^*]+%.[^*]+)$")
+    return rest ~= nil and host:match("^[^.]+%.(.+)$") == rest
+end
+
+--- Does the certificate name `host`? → true | false, "the names it has".
+local function cert_names_host(cert, host)
+    host = tostring(host):lower():gsub("%.$", "")
+    local ext = cert:extensions() or {}
+    local san = ext["2.5.29.17"] or {}
+    local want_ip = ip_key(host)
+    local names = {}
+    for _, ip in ipairs(san.iPAddress or {}) do
+        names[#names + 1] = ip
+        if want_ip and ip_key(ip) == want_ip then return true end
+    end
+    local dns = san.dNSName or {}
+    for _, n in ipairs(dns) do
+        names[#names + 1] = n
+        if not want_ip and dns_match(n, host) then return true end
+    end
+    -- No DNS names in the certificate: its subject CN (OpenSSL's fallback; a
+    -- host name only — an IP must be listed as an IP address).
+    if #dns == 0 then
+        for _, e in ipairs(cert:subject() or {}) do
+            if e.oid == "2.5.4.3" or e.name == "commonName" or e.name == "CN" then
+                names[#names + 1] = e.value
+                if not want_ip and dns_match(e.value, host) then return true end
+            end
+        end
+    end
+    return false, (#names > 0 and table.concat(names, ", ") or "no name at all")
+end
+
+--- A socket.http `create` function whose connections are TLS, verified.
+local function tls_create(ssl)
+    local socket = require("socket")
     return function()
-        local httpc, herr = resty_http.new()
-        if not httpc then
-            return nil, nil, "http: resty.http.new() failed: " .. tostring(herr)
+        local ctx, cerr = tls_context(ssl)
+        if not ctx then return nil, cerr end
+        local conn = { sock = socket.tcp(), t = nil }
+        function conn:settimeout(t) self.t = t; return self.sock:settimeout(t) end
+        function conn:close() return self.sock:close() end   -- socket.http closes on a failed connect
+        function conn:connect(host, port)
+            local ok, err = self.sock:connect(host, port)
+            if not ok then return nil, err end
+            local s, werr = ssl.wrap(self.sock, ctx)
+            if not s then return nil, "https: " .. tostring(werr) end
+            self.sock = s
+            s:settimeout(self.t)
+            if not ip_key(host) then s:sni(host) end
+            local hok, herr = s:dohandshake()
+            if not hok then
+                s:close()
+                if tostring(herr):find("verify failed", 1, true) then
+                    return nil, ("https: %s's certificate is not trusted (%s) — for a self-hosted server with its "
+                        .. "own CA or a self-signed certificate, set MEMO_CA_FILE to that certificate (PEM)")
+                        :format(host, tostring(herr))
+                end
+                return nil, "https: TLS handshake with " .. host .. " failed: " .. tostring(herr)
+            end
+            local named, has = cert_names_host(s:getpeercertificate(), host)
+            if not named then
+                s:close()
+                return nil, ("https: %s's certificate is for %s, not %s — refusing (connect with a host name "
+                    .. "the certificate lists)"):format(host, has, host)
+            end
+            -- Everything else socket.http calls goes to the TLS socket.
+            for name, fn in pairs(getmetatable(s).__index) do
+                if type(fn) == "function" and name ~= "connect" then
+                    self[name] = function(me, ...) return fn(me.sock, ...) end
+                end
+            end
+            return 1
         end
-        httpc:set_timeout(opts.timeout_ms or 10000)
-        local res, rerr = httpc:request_uri(url, {
-            method  = opts.method  or "GET",
-            headers = opts.headers or {},
-            body    = opts.body,
-        })
-        if not res then
-            return nil, nil, "http: request failed: " .. tostring(rerr)
-        end
-        return res.status, res.body, nil
+        return conn
     end
 end
 
+M._cert_names_host = cert_names_host   -- tests
+
 -- ---------------------------------------------------------------------------
--- socket.http / ssl.https adapter  (plain Lua / luasocket)
+-- socket.http adapter  (plain Lua / luasocket; TLS via luasec)
 -- ---------------------------------------------------------------------------
 -- NOTE: This call BLOCKS the Lua thread for the full HTTP round-trip
--- (typically 10-2000 ms depending on the server and network).  In OpenResty
--- all requests go through try_resty() above, which is non-blocking via nginx
--- cosockets.  In plain Lua, use luamemo.async + M.request_async() when
--- concurrent HTTP fan-out is needed (see store.write_many()).
+-- (typically 10-2000 ms depending on the server and network). Use
+-- luamemo.async + M.request_async() when concurrent HTTP fan-out is needed
+-- (see store.write_many()).
 local function try_socket(url, opts)
     local scheme = url:match("^([%w+%-%.]+)://")
     local is_https = (scheme == "https")
 
-    local http_mod
+    pcall(require, "ltn12")
+    local ok_http, http_mod = pcall(require, "socket.http")
+    if not ok_http then
+        return nil, nil,
+            "http: socket.http unavailable. "
+            .. "Install luasocket: luarocks install luasocket"
+    end
+    local create, req_url = nil, url
     if is_https then
-        local ok, mod = pcall(require, "ssl.https")
+        local ok, ssl = pcall(require, "ssl")
         if not ok then
             return nil, nil,
                 "http: HTTPS request requires luasec (ssl.https). "
                 .. "Install it with: luarocks install luasec"
         end
-        http_mod = mod
-    else
-        -- Pre-load ltn12 before socket.http to prevent LuaSocket's lazy _G
-        -- assignment from triggering OpenResty's __newindex guard.
-        pcall(require, "ltn12")
-        local ok, mod = pcall(require, "socket.http")
-        if not ok then
-            return nil, nil,
-                "http: socket.http unavailable. "
-                .. "Install luasocket: luarocks install luasocket"
-        end
-        http_mod = mod
+        create = tls_create(ssl)
+        -- An explicit port: older luasocket defaults every scheme to 80.
+        local surl = require("socket.url")
+        req_url = surl.build(surl.parse(url, { port = 443 }))
     end
 
     local ok_ltn12, ltn12 = pcall(require, "ltn12")
@@ -106,12 +280,28 @@ local function try_socket(url, opts)
     local prev_timeout = http_mod.TIMEOUT
     http_mod.TIMEOUT = timeout_s
 
-    local chunks = {}
+    -- opts.max_bytes: keep at most that much of the body (the rest is read and
+    -- dropped — memory stays bounded); the 4th result says it was cut.
+    local chunks, kept, truncated = {}, 0, false
+    local max = tonumber(opts.max_bytes)
+    local sink = ltn12.sink.table(chunks)
+    if max then
+        sink = function(chunk)
+            if chunk then
+                local part = (kept < max) and chunk:sub(1, max - kept) or ""
+                if #part < #chunk then truncated = true end
+                if #part > 0 then chunks[#chunks + 1] = part; kept = kept + #part end
+            end
+            return 1
+        end
+    end
     local req = {
-        url    = url,
-        method = (opts.method or "GET"):upper(),
-        headers = headers,
-        sink   = ltn12.sink.table(chunks),
+        url      = req_url,
+        method   = (opts.method or "GET"):upper(),
+        headers  = headers,
+        sink     = sink,
+        redirect = false,   -- never followed: see the header comment
+        create   = create,  -- https: verified TLS (nil = plain TCP)
     }
     if req_body then
         req.source = ltn12.source.string(req_body)
@@ -122,28 +312,30 @@ local function try_socket(url, opts)
     -- Plain Lua is single-threaded so this is safe in normal use; avoid calling
     -- try_socket concurrently from coroutines.
 
-    local ok_call, code, _resp_headers, _status = pcall(http_mod.request, req)
+    -- The table form of socket.http.request returns
+    -- (1, code, headers, status_line) on success and (nil, err) on a transport
+    -- failure — the FIRST value is a success flag, the HTTP status is SECOND.
+    -- (Reading the flag as the status made every response look like "1", so
+    -- check_http's >= 300 test never fired: 404/500 bodies were parsed as data.)
+    local ok_call, r1, r2 = pcall(http_mod.request, req)
     http_mod.TIMEOUT = prev_timeout  -- restore regardless of outcome or error
+    -- Mask user:password@host credentials. Note: API keys passed as query
+    -- parameters (e.g. ?api_key=...) are not masked — current adapters use
+    -- Authorization headers instead, so this is intentionally not covered.
+    local safe_url = require("luamemo.util").redact_url(url)
     if not ok_call then
-        -- Mask user:password@host credentials. Note: API keys passed as query
-        -- parameters (e.g. ?api_key=...) are not masked — current adapters use
-        -- Authorization headers instead, so this is intentionally not covered.
-        local safe_url = url:gsub("(https?://[^:@]*:)[^@]*(@)", "%1***%2")
-        return nil, nil, "http: request error: " .. tostring(code) .. " — " .. safe_url
+        return nil, nil, "http: request error: " .. tostring(r1) .. " — " .. safe_url
     end
-
+    if not r1 then
+        -- Transport-level failure: r2 is the error ("timeout", "connection refused").
+        return nil, nil, "http: " .. tostring(r2 or "request failed (network error)") .. " — " .. safe_url
+    end
+    local code = tonumber(r2)
     if not code then
-        local safe_url = url:gsub("(https?://[^:@]*:)[^@]*(@)", "%1***%2")
-        return nil, nil, "http: request failed (network error) — " .. safe_url
-    end
-    if type(code) ~= "number" then
-        -- socket.http returns the error string as the second return when it
-        -- fails at the transport level (e.g. "timeout", "connection refused").
-        local safe_url = url:gsub("(https?://[^:@]*:)[^@]*(@)", "%1***%2")
-        return nil, nil, "http: " .. tostring(code) .. " — " .. safe_url
+        return nil, nil, "http: invalid status " .. tostring(r2) .. " — " .. safe_url
     end
 
-    return code, table.concat(chunks), nil
+    return code, table.concat(chunks), nil, truncated
 end
 
 -- ---------------------------------------------------------------------------
@@ -333,16 +525,7 @@ end
 -- @return string|nil  Response body
 -- @return string|nil  Error message
 function M.request(url, opts)
-    opts = opts or {}
-
-    -- Prefer resty.http when available (OpenResty / non-blocking).
-    local resty_fn = try_resty(url, opts)
-    if resty_fn then
-        return resty_fn()
-    end
-
-    -- Fall back to luasocket / luasec.
-    return try_socket(url, opts)
+    return try_socket(url, opts or {})
 end
 
 return M

@@ -4,7 +4,7 @@
 -- (Whether a trained W beats raw hash is measured by eval/projection_bench.lua.)
 --
 -- Usage:
---   MEMO_PROJECTION_W=/tmp/projW_test.json lua5.1 eval/tests/test_projection.lua
+--   luajit eval/tests/run.lua --only projection   (it sets MEMO_PROJECTION_W to a scratch path)
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 if not os.getenv("MEMO_PROJECTION_W") or os.getenv("MEMO_PROJECTION_W") == "" then

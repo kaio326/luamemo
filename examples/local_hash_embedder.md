@@ -1,78 +1,60 @@
-# Local-first: pure-Lua hash embedder
+# Local-first: the pure-Lua hash embedder
 
-The `hash` embedder runs **in-process**, in pure Lua. It needs:
+The `hash` embedder runs **in-process**, in pure Lua, and needs:
 
 - no network
 - no Python
 - no model files
-- no extra LuaRocks
-- no LuaJIT bit ops
+- no service
 
-It is the truly local-first option: the same OpenResty worker that handles
-the HTTP request also produces the embedding. Latency is microseconds.
+The process that writes or searches also produces the embedding, in
+microseconds. It is luamemo's default: with no embedder configured, `hash` is
+used (384 dimensions).
 
 ## Quality trade-off
 
-The hash embedder uses **signed feature hashing** over word tokens and
-character trigrams. This captures **lexical** similarity (shared words,
-shared sub-strings) but **not semantic** similarity — it cannot tell that
-"car" and "automobile" are related.
+`hash` uses **signed feature hashing** over word tokens and character trigrams.
+That captures **lexical** similarity — shared words and sub-strings — but not
+meaning: it can't tell that "car" and "automobile" are related.
 
-In practice this matters less than it sounds, because `luamemo`
-already runs a hybrid query: vector cosine **plus** Postgres FTS. The
-hash embedder mostly reinforces what FTS already finds, while still
-benefiting from pgvector's HNSW index for fast top-K filtering.
+That matters less than it sounds, because every luamemo search is hybrid: the
+vector score is blended with full-text ranking, and `hash` mostly reinforces
+what the text index already finds.
 
-**Recommended use:**
-
-| Tier | Embedder | Notes |
-|------|----------|-------|
-| Dev / offline / air-gapped | `hash` | zero deps, instant |
-| Self-hosted production     | `ollama` (`nomic-embed-text`) | local, semantic |
-| Cloud / highest quality    | `openai` (`text-embedding-3-small`) | paid |
-
-You can swap tiers at any time **without re-creating the table** — just
-re-embed existing rows by running `UPDATE lm_memories SET body = body`
-through your app, or call `memory.update(id, {body = row.body})` for each row.
+| Use | Embedder | Notes |
+|---|---|---|
+| Tests, offline, air-gapped, a first try | `hash` | nothing to set up, instant |
+| Everyday use on a workstation | `gguf_ffi` (in-process) or Ollama `nomic-embed-text` | semantic, local |
+| Best measured recall | TEI `bge-m3` | semantic, local service |
+| Hosted | OpenAI / Voyage / Cohere | an API key in the vault |
 
 ## Setup
 
-```lua
-local memory = require("luamemo")
-memory.setup({
-    embedder_local = "hash",     -- enables in-process embedder
-    embed_dim      = 384,        -- must match your schema's vector(N)
-    default_scope  = "repo:my-app",
-    auth_fn        = function(self) return is_admin(self) end,
-})
-memory.routes.register(app, { prefix = "/api/memory" })
+Nothing — or explicitly:
+
+```bash
+memo config set MEMO_EMBEDDER hash
+memo config set MEMO_EMBED_DIM 384
+memo ping --embedder
+memo embed "deploy the app" --compare-to "deploying the application"
 ```
 
-That's the entire integration. No embedder service to run, no extra
-container in `docker-compose.yml`, no API keys.
-
-## Self-test
-
-```lua
-local hash = require("luamemo.embedders.hash")
-local ok, err = hash.selftest({ embed_dim = 384 })
-assert(ok, err)
-```
+`memo calibrate` normally picks a semantic embedder when one works on the
+machine; `--allow-hash` lets it settle for `hash`.
 
 ## Switching to a real embedder later
 
-When you outgrow lexical-only similarity, change two lines in `setup()`:
+Change the settings (see [EMBEDDERS.md](../EMBEDDERS.md) for each option), then
+re-embed what is stored:
 
-```lua
-memory.setup({
-    -- embedder_local = "hash",
-    embedder_url     = "http://localhost:11434/api/embeddings",
-    embedder_adapter = "ollama",
-    embedder_model   = "nomic-embed-text",
-    embed_dim        = 768,         -- and update schema's vector(768)
-    ...
-})
+```bash
+memo config set MEMO_EMBEDDER_ADAPTER ollama
+memo config set MEMO_EMBEDDER_URL http://localhost:11434/api/embeddings
+memo config set MEMO_EMBEDDER_MODEL nomic-embed-text
+memo config set MEMO_EMBED_DIM 768
+memo reembed --all
 ```
 
-Then re-embed your existing rows once. The schema, API, and clients
-don't change.
+Every vector is rebuilt from the stored text — nothing is lost — and the
+database moves to the new dimension once every scope is re-embedded. Nothing
+else changes: the same tools, the same commands.

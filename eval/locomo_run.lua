@@ -17,10 +17,9 @@
 --
 -- Retrieval-side only — we do not score generated answers.
 --
--- Usage:
---   PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
---     lua5.1 eval/locomo_run.lua \
---       --embedder hash --corpus eval/data/fixtures/locomo_tiny.json \
+-- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes):
+--   MEMO_DB=bench luajit eval/locomo_run.lua \
+--       --embedder hash --corpus eval/fixtures/locomo_tiny.json \
 --       --out eval/results/locomo_hash_smoke.json
 --
 -- Output: `eval/results/locomo_<embedder>.json` with overall metrics
@@ -28,9 +27,8 @@
 -- open-domain, adversarial).
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;eval/datasets/?.lua;" .. package.path
-package.preload["resty.http"] = function() return require("helpers") end
 
-local cjson = require("cjson.safe")
+local cjson = require("luamemo.json")
 
 -- --- arg parsing ---------------------------------------------------------
 local args = {
@@ -39,7 +37,6 @@ local args = {
     k_max    = 20,
     out      = nil,
     corpus   = "eval/data/locomo.json",
-    backend  = "auto",
     rerank          = false,
     rerank_adapter  = "noop",
     rerank_top_n    = 20,
@@ -67,7 +64,6 @@ do
         elseif a == "--skip-temporal"     then args.skip_temporal = true; i = i + 1
         elseif a == "--no-timestamps"     then args.use_timestamps = false; i = i + 1
         elseif a == "--summarizer-model"  then args.summarizer_model = arg[i + 1]; i = i + 2
-        elseif a == "--backend"           then args.backend = arg[i + 1]; i = i + 2
         else io.stderr:write("unknown arg: " .. tostring(a) .. "\n"); os.exit(2) end
     end
 end
@@ -85,8 +81,7 @@ if not fh then
 end
 fh:close()
 
--- luamemo.db creates a pgmoon connection automatically from
--- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
+-- luamemo.db opens the database MEMO_DB names.
 
 local memory  = require("luamemo")
 local db      = require("luamemo.db")
@@ -94,9 +89,6 @@ local locomo  = require("locomo")
 
 -- --- embedder config (mirrors longmemeval_run.lua) -----------------------
 local setup_opts = {
-    db_table         = "lm_memories",
-    backend          = args.backend or "auto",
-    auth_fn          = function() return true end,
     skip_embed_probe = true,
     default_scope    = "locomo:" .. args.embedder,
 }
@@ -219,9 +211,9 @@ for ri, r in ipairs(rows) do
     local scope     = "locomo:" .. args.embedder .. ":" .. sample_id
 
     -- 1. wipe + ingest haystack once per sample
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(scope))
-    db.query("DELETE FROM lm_observations WHERE scope = " .. db.escape_literal(scope))
-    db.query("DELETE FROM lm_reinforcements WHERE scope = " .. db.escape_literal(scope))
+    assert(db.run("DELETE FROM lm_memories WHERE scope = ?", scope))
+    db.run("DELETE FROM lm_observations WHERE scope = ?", scope)
+    db.run("DELETE FROM lm_reinforcements WHERE scope = ?", scope)
 
     local n_haystack = 0
     local batch = {}

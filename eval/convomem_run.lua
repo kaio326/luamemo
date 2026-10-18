@@ -16,19 +16,17 @@
 --   3. Hit  = any top-K result's `metadata.session_id` is in
 --            `evidence_session_ids`. Rank = position of the first hit.
 --
--- Usage:
---   PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
---     lua5.1 eval/convomem_run.lua \
---       --embedder hash --corpus eval/data/fixtures/convomem_tiny.json \
+-- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes):
+--   MEMO_DB=bench luajit eval/convomem_run.lua \
+--       --embedder hash --corpus eval/fixtures/convomem_tiny.json \
 --       --out eval/results/convomem_hash_smoke.json
 --
 -- Output: `eval/results/convomem_<embedder>.json` with overall + per-
 -- category metrics.
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;eval/datasets/?.lua;" .. package.path
-package.preload["resty.http"] = function() return require("helpers") end
 
-local cjson = require("cjson.safe")
+local cjson = require("luamemo.json")
 
 local args = {
     embedder = "hash",
@@ -36,7 +34,6 @@ local args = {
     k_max    = 20,
     out      = nil,
     corpus   = "eval/data/convomem.json",
-    backend  = "auto",
     rerank          = false,
     rerank_adapter  = "noop",
     rerank_top_n    = 20,
@@ -65,7 +62,6 @@ do
         elseif a == "--skip-temporal"     then args.skip_temporal = true; i = i + 1
         elseif a == "--no-timestamps"     then args.use_timestamps = false; i = i + 1
         elseif a == "--summarizer-model"  then args.summarizer_model = arg[i + 1]; i = i + 2
-        elseif a == "--backend"           then args.backend = arg[i + 1]; i = i + 2
         else io.stderr:write("unknown arg: " .. tostring(a) .. "\n"); os.exit(2) end
     end
 end
@@ -83,17 +79,13 @@ if not fh then
 end
 fh:close()
 
--- luamemo.db creates a pgmoon connection automatically from
--- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
+-- luamemo.db opens the database MEMO_DB names.
 
 local memory   = require("luamemo")
 local db       = require("luamemo.db")
 local convomem = require("convomem")
 
 local setup_opts = {
-    db_table         = "lm_memories",
-    backend          = args.backend or "auto",
-    auth_fn          = function() return true end,
     skip_embed_probe = true,
     default_scope    = "convomem:" .. args.embedder,
 }
@@ -211,7 +203,7 @@ for ri, r in ipairs(rows) do
     local dlg_id = tostring(r.dialogue_id or ("row_" .. ri))
     local scope  = "convomem:" .. args.embedder .. ":" .. dlg_id
 
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(scope))
+    assert(db.run("DELETE FROM lm_memories WHERE scope = ?", scope))
 
     local n_haystack = 0
     local batch = {}

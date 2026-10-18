@@ -4,14 +4,14 @@
 -- (https://docs.anthropic.com/claude/docs/embeddings). Use this adapter
 -- when you want "Anthropic-quality" embeddings.
 --
--- Configure setup() with:
---   embedder_url     = "https://api.voyageai.com/v1/embeddings"
---   embedder_adapter = "voyage"
---   embedder_model   = "voyage-3"          -- or voyage-3-lite, voyage-large-2, etc.
---   embedder_headers = { Authorization = "Bearer " .. os.getenv("VOYAGE_API_KEY") }
---   embed_dim        = 1024                 -- voyage-3 default; check model docs
+-- Settings (memo config set, or .luamemorc):
+--   MEMO_EMBEDDER_URL=https://api.voyageai.com/v1/embeddings
+--   MEMO_EMBEDDER_ADAPTER=voyage
+--   MEMO_EMBEDDER_MODEL=voyage-3                  (or voyage-3-lite, voyage-large-2, …)
+--   MEMO_EMBEDDER_HEADERS={"Authorization": "Bearer {secret:voyage}"}   (memo secret-store voyage)
+--   MEMO_EMBED_DIM=1024                           (voyage-3 default; check model docs)
 --
--- Optional: cfg.embedder_input_type = "document" | "query"
+-- Optional: MEMO_EMBEDDER_INPUT_TYPE=document | query
 --   Voyage models support an asymmetric "input_type" hint that improves
 --   retrieval quality. Stored memories should be embedded as "document";
 --   search queries as "query". The library does not auto-distinguish, so

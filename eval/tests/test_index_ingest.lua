@@ -7,8 +7,8 @@
 --   5. index.status() shows correct counts
 --   6. Re-running index.ingest() is idempotent (no duplicate rows)
 --
--- Requires MEMO_DB_URL to be set and lm_memories table to exist.
--- Run: lua5.1 eval/tests/test_index_ingest.lua [--root <path>] [--scope codeindex:test]
+-- Requires MEMO_DB (the database; the test runner sets a new one per file).
+-- Run: luajit eval/tests/test_index_ingest.lua [--root <path>] [--scope codeindex:test]
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 
@@ -38,11 +38,11 @@ for i, a in ipairs(arg or {}) do
     if a == "--scope" and arg[i+1] then scope = arg[i+1] end
 end
 
--- Check MEMO_DB_URL.
-local db_url = os.getenv("MEMO_DB_URL")
-if not db_url or db_url == "" then
-    io.stderr:write("[SKIP] MEMO_DB_URL not set — DB tests skipped\n")
-    io.write("Phase 2 tests require a running DB. Set MEMO_DB_URL and re-run.\n")
+-- Check MEMO_DB.
+local db_name = os.getenv("MEMO_DB")
+if not db_name or db_name == "" then
+    io.stderr:write("[SKIP] MEMO_DB not set — DB tests skipped\n")
+    io.write("Phase 2 tests need a database. Set MEMO_DB and re-run.\n")
     os.exit(0)
 end
 
@@ -63,8 +63,6 @@ else
 end
 local embed_dim = tonumber(os.getenv("MEMO_EMBED_DIM"))
 if embed_dim then cfg.embed_dim = embed_dim end
-cfg.db_url  = db_url
-cfg.auth_fn = function() return true end
 
 local ok_setup, setup_err = pcall(luamemo.setup, cfg)
 if not ok_setup then

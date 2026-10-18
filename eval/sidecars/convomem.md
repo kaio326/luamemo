@@ -103,7 +103,7 @@ symmetry with `locomo_run.lua` is intentional.
 After downloading a candidate JSON file:
 
 ```bash
-lua5.1 -e 'local cjson=require"cjson.safe"; local f=io.open("eval/data/convomem.json","rb"); \
+luajit -e 'local cjson=require"luamemo.json"; local f=io.open("eval/data/convomem.json","rb"); \
   local rows=cjson.decode(f:read("*a")); print(#rows, "rows"); \
   local r=rows[1]; print("top-level keys:"); for k in pairs(r) do print("  "..k) end; \
   print("session[1] keys:"); for k in pairs((r.sessions or {})[1] or {}) do print("  "..k) end; \
@@ -117,16 +117,15 @@ maps to gold sessions — adjust the loader if the upstream uses
 
 If the candidate file uses different field names, **edit the loader
 once** so that `iter_sessions`, `qa_gold_sessions`, and `iter_qa`
-return the same Lua-side shape as today, then re-run
-`eval/smoke_convomem.lua`. The runner does not need to change.
+return the same Lua-side shape as today, then re-run the smoke test
+(below). The runner does not need to change.
 
 ## Run
 
-Smoke (uses the hand-crafted fixture, no download needed):
+Smoke (the tracked fixture `eval/fixtures/convomem_tiny.json`, no download needed):
 
 ```bash
-PGHOST=127.0.0.1 PGPORT=5432 PGDATABASE=lm_bruteforce_test \
-  PGUSER=postgres PGPASSWORD=postgres lua5.1 eval/smoke_convomem.lua
+luajit eval/tests/run.lua --only convomem
 ```
 
 ### Live download + corpus build
@@ -140,7 +139,7 @@ for n in 005 020 030; do
     "https://huggingface.co/datasets/Salesforce/ConvoMem/resolve/main/core_benchmark/pre_mixed_testcases/user_evidence/1_evidence/batched_${n}.json"
 done
 # Convert HF schema → loader contract (writes eval/data/convomem.json)
-lua5.1 eval/build_convomem_corpus.lua
+luajit eval/build_convomem_corpus.lua
 ```
 
 To expand the sample (e.g. add `assistant_facts_evidence` or higher
@@ -153,20 +152,20 @@ verbatim as part of `dialogue_id`.
 Hash baseline:
 
 ```bash
-PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
-  lua5.1 eval/convomem_run.lua --embedder hash \
+MEMO_DB=bench luajit eval/convomem_run.lua --embedder hash \
   --out eval/results/convomem_hash.json
 ```
 
 Ollama:
 
 ```bash
-PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
-  OLLAMA_URL=http://127.0.0.1:11434/api/embeddings \
+MEMO_DB=bench OLLAMA_URL=http://127.0.0.1:11434/api/embeddings \
   OLLAMA_MODEL=nomic-embed-text OLLAMA_DIM=768 \
-  lua5.1 eval/convomem_run.lua --embedder ollama \
+  luajit eval/convomem_run.lua --embedder ollama \
   --out eval/results/convomem_ollama.json
 ```
+
+(`MEMO_DB`: a scratch database — the run wipes its own scopes.)
 
 ## Decision rule for promotion
 

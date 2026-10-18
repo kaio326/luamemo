@@ -71,25 +71,25 @@ json.null = setmetatable ({}, {
   __tojson = function () return "null" end
 })
 
+-- luamemo change (keeps the two JSON backends alike — luamemo.json uses lua-cjson when
+-- installed): a field `n` is a field like any other (dkjson read a numeric `n` as the
+-- array's length, so {n = 7} became seven nulls), and an empty table is an object, {}
+-- (json.empty_array — __jsontype "array" — still encodes as []).
 local function isarray (tbl)
-  local max, n, arraylen = 0, 0, 0
-  for k,v in pairs (tbl) do
-    if k == 'n' and type(v) == 'number' then
-      arraylen = v
-      if v > max then
-        max = v
-      end
-    else
-      if type(k) ~= 'number' or k < 1 or floor(k) ~= k then
-        return false
-      end
-      if k > max then
-        max = k
-      end
-      n = n + 1
+  local max, n = 0, 0
+  for k in pairs (tbl) do
+    if type(k) ~= 'number' or k < 1 or floor(k) ~= k then
+      return false
     end
+    if k > max then
+      max = k
+    end
+    n = n + 1
   end
-  if max > 10 and max > arraylen and max > n * 2 then
+  if n == 0 then
+    return false
+  end
+  if max > 10 and max > n * 2 then
     return false -- don't create an array with too many holes
   end
   return true, max
@@ -293,6 +293,10 @@ encode2 = function (value, indent, level, buffer, buflen, tables, globalorder, s
     local isa, n = isarray (value)
     if n == 0 and valmeta and valmeta.__jsontype == 'object' then
       isa = false
+    end
+    -- luamemo: an empty table is an object (isarray) unless marked an array.
+    if not isa and next (value) == nil and valmeta and valmeta.__jsontype == 'array' then
+      isa, n = true, 0
     end
     local msg
     if isa then -- JSON array

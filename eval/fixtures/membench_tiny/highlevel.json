@@ -1,0 +1,41 @@
+{
+  "movie": [
+    {
+      "tid": 0,
+      "message_list": [
+        [
+          { "mid": 1, "user": "I loved Inception, the dream heist movie by Christopher Nolan.", "assistant": "Inception is a modern classic." },
+          { "mid": 2, "user": "Romantic comedies usually bore me.", "assistant": "Noted, fewer rom-coms then." }
+        ]
+      ],
+      "QA": {
+        "qid": 0,
+        "question": "Which Christopher Nolan movie did the user love?",
+        "answer": "Inception",
+        "target_step_id": [[1, 0]],
+        "choices": { "A": "Inception", "B": "Tenet", "C": "Memento", "D": "Dunkirk" },
+        "ground_truth": "A",
+        "time": "2024-07-01 20:00"
+      }
+    }
+  ],
+  "food": [
+    {
+      "tid": 0,
+      "message_list": [
+        [
+          { "mid": 1, "user": "I adore spicy ramen.", "assistant": "Spicy ramen is a great pick." }
+        ]
+      ],
+      "QA": {
+        "qid": 0,
+        "question": "What food does the user adore?",
+        "answer": "Spicy ramen",
+        "target_step_id": [[1, 0]],
+        "choices": { "A": "Spicy ramen", "B": "Pizza", "C": "Salad", "D": "Tacos" },
+        "ground_truth": "A",
+        "time": "2024-07-02 20:00"
+      }
+    }
+  ]
+}

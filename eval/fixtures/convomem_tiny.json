@@ -1,0 +1,81 @@
+[
+  {
+    "dialogue_id": "fixture-conv-1",
+    "sessions": [
+      {
+        "session_id": "s1",
+        "timestamp":  "2024-04-01T14:00:00Z",
+        "turns": [
+          { "speaker": "Alice", "text": "I just got back from Lisbon. The food was incredible." },
+          { "speaker": "Bob",   "text": "When did you go?" },
+          { "speaker": "Alice", "text": "Last week. We stayed in Alfama." }
+        ]
+      },
+      {
+        "session_id": "s2",
+        "timestamp":  "2024-04-15T09:30:00Z",
+        "turns": [
+          { "speaker": "Alice", "text": "Started a new job at Acme Corp on Monday." },
+          { "speaker": "Bob",   "text": "Congrats! Same role?" },
+          { "speaker": "Alice", "text": "No, switched to platform engineering." }
+        ]
+      },
+      {
+        "session_id": "s3",
+        "timestamp":  "2024-05-02T20:15:00Z",
+        "turns": [
+          { "speaker": "Alice", "text": "Adopted a dog. His name is Mango." },
+          { "speaker": "Bob",   "text": "What breed?" },
+          { "speaker": "Alice", "text": "Border collie mix, three years old." }
+        ]
+      }
+    ],
+    "qa": [
+      {
+        "question":             "Where did Alice travel recently?",
+        "answer":               "Lisbon",
+        "category":             "factual",
+        "evidence_session_ids": ["s1"]
+      },
+      {
+        "question":             "What is the name of Alice's dog?",
+        "answer":               "Mango",
+        "category":             "factual",
+        "evidence_session_ids": ["s3"]
+      },
+      {
+        "question":             "What is Alice's new job role?",
+        "answer":               "Platform engineering",
+        "category":             "factual",
+        "evidence_session_ids": ["s2"]
+      }
+    ]
+  },
+  {
+    "dialogue_id": "fixture-conv-2",
+    "sessions": [
+      {
+        "session_id": "s1",
+        "turns": [
+          { "speaker": "Carol",  "text": "Reading a book about Roman history." },
+          { "speaker": "Daniel", "text": "Which one?" },
+          { "speaker": "Carol",  "text": "SPQR by Mary Beard." }
+        ]
+      },
+      {
+        "session_id": "s2",
+        "turns": [
+          { "speaker": "Carol",  "text": "Finished SPQR. Starting one on Byzantine history next." }
+        ]
+      }
+    ],
+    "qa": [
+      {
+        "question":             "Which book on Roman history did Carol mention?",
+        "answer":               "SPQR by Mary Beard",
+        "category":             "multi-hop",
+        "evidence_session_ids": ["s1", "s2"]
+      }
+    ]
+  }
+]

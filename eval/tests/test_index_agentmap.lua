@@ -5,8 +5,8 @@
 --   3. Compact output is >=50% smaller (bytes) than the equivalent full-JSON rows
 --   4. Formatter degrades gracefully on missing fields / empty inputs
 --
--- Pure formatter tests need no DB. The outline round-trip + size check need MEMO_DB_URL.
--- Run: lua5.1 eval/tests/test_index_agentmap.lua
+-- Pure formatter tests need no DB. The outline round-trip + size check need MEMO_DB.
+-- Run: luajit eval/tests/run.lua --only index_agentmap
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 
@@ -75,16 +75,15 @@ ok(fmt.symbol_line({ kind = "symbol", title = "x" }):find("?", 1, true) ~= nil,
 -- ---------------------------------------------------------------------------
 -- DB-backed: outline round-trip + payload size
 -- ---------------------------------------------------------------------------
-local db_url = os.getenv("MEMO_DB_URL")
-if not db_url or db_url == "" then
-    io.stderr:write("[SKIP] MEMO_DB_URL not set — DB tests skipped\n")
+local db_name = os.getenv("MEMO_DB")
+if not db_name or db_name == "" then
+    io.stderr:write("[SKIP] MEMO_DB not set — DB tests skipped\n")
     io.write(("\n=== Phase 8 results: %d passed, %d failed (format only) ===\n"):format(PASS, FAIL))
     os.exit(FAIL > 0 and 1 or 0)
 end
 
 local luamemo = require("luamemo")
-local cfg = { db_url = db_url, auth_fn = function() return true end,
-              embedder_local = os.getenv("MEMO_EMBEDDER") or "hash" }
+local cfg = { embedder_local = os.getenv("MEMO_EMBEDDER") or "hash" }
 local ed = tonumber(os.getenv("MEMO_EMBED_DIM")); if ed then cfg.embed_dim = ed end
 assert(pcall(luamemo.setup, cfg))
 info("luamemo setup OK")
@@ -92,7 +91,7 @@ info("luamemo setup OK")
 local scope = "codeindex:test_agentmap"
 local st, db = luamemo.store, require("luamemo.db")
 st.delete_where({ scope = scope })
-db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
+db.run("DELETE FROM lm_kg_facts WHERE scope = ?", scope)
 
 luamemo.index.ingest("eval/fixtures/multilang", { scope = scope })
 
@@ -132,7 +131,7 @@ end
 
 -- cleanup
 st.delete_where({ scope = scope })
-db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
+db.run("DELETE FROM lm_kg_facts WHERE scope = ?", scope)
 info("cleaned up scope")
 
 io.write(("\n=== Phase 8 results: %d passed, %d failed ===\n"):format(PASS, FAIL))

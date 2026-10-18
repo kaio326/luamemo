@@ -13,9 +13,8 @@
 -- This is **retrieval-side only** — we do not score generated answers.
 -- The metric isolates luamemo's contribution from the downstream LLM.
 --
--- Usage:
---   PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
---     lua5.1 eval/longmemeval_run.lua \
+-- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes):
+--   MEMO_DB=bench luajit eval/longmemeval_run.lua \
 --       --embedder hash --out eval/results/longmemeval_hash.json
 --
 -- Dataset: `eval/data/longmemeval_oracle.json` (15 MB, 500 questions).
@@ -27,13 +26,8 @@
 -- AND a per-`question_type` breakdown.
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;eval/datasets/?.lua;" .. package.path
--- resty.http shim: lets luamemo.http use LuaSocket-backed HTTP in
--- plain lua5.1 (outside OpenResty). Without this, luamemo.http falls
--- back to socket.http directly which also works, but keeping the shim avoids
--- a second pcall round-trip inside http.lua.
-package.preload["resty.http"] = function() return require("helpers") end
 
-local cjson = require("cjson.safe")
+local cjson = require("luamemo.json")
 
 -- --- arg parsing ---------------------------------------------------------
 local args = {
@@ -42,7 +36,6 @@ local args = {
     k_max    = 20,
     out      = nil,
     corpus   = "eval/data/longmemeval_oracle.json",
-    backend  = "auto",
     rerank          = false,
     rerank_adapter  = "noop",
     rerank_top_n    = 20,
@@ -76,7 +69,6 @@ do
         elseif a == "--skip-temporal"     then args.skip_temporal = true; i = i + 1
         elseif a == "--no-timestamps"     then args.use_timestamps = false; i = i + 1
         elseif a == "--summarizer-model"  then args.summarizer_model = arg[i + 1]; i = i + 2
-        elseif a == "--backend"           then args.backend = arg[i + 1]; i = i + 2
         else io.stderr:write("unknown arg: " .. tostring(a) .. "\n"); os.exit(2) end
     end
 end
@@ -121,18 +113,13 @@ end
 fh:close()
 
 -- --- db / library --------------------------------------------------------
--- luamemo.db detects the absence of `ngx` and creates a pgmoon
--- connection automatically using PGHOST / PGDATABASE / PGUSER / PGPASSWORD
--- env vars. No separate shim or package.loaded injection needed.
+-- luamemo.db opens the database MEMO_DB names.
 local memory     = require("luamemo")
 local db         = require("luamemo.db")
 local longmemev  = require("longmemeval")
 
 -- --- embedder config (kept in sync with recall_bench.lua) ----------------
 local setup_opts = {
-    db_table         = "lm_memories",
-    backend          = args.backend or "auto",
-    auth_fn          = function() return true end,
     skip_embed_probe = true,
     default_scope    = "lme:" .. args.embedder,
 }
@@ -274,9 +261,9 @@ local t_start      = os.time()
 
 for qi, q in ipairs(rows) do
     local scope = "lme:" .. args.embedder .. ":" .. tostring(q.question_id)
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(scope))
-    db.query("DELETE FROM lm_observations WHERE scope = " .. db.escape_literal(scope))
-    db.query("DELETE FROM lm_reinforcements WHERE scope = " .. db.escape_literal(scope))
+    assert(db.run("DELETE FROM lm_memories WHERE scope = ?", scope))
+    db.run("DELETE FROM lm_observations WHERE scope = ?", scope)
+    db.run("DELETE FROM lm_reinforcements WHERE scope = ?", scope)
 
     local n_haystack = 0
     local batch = {}
@@ -294,9 +281,7 @@ for qi, q in ipairs(rows) do
             -- Trim any incomplete UTF-8 multi-byte sequence at the cut boundary.
             -- body:sub(1,N) cuts at a byte offset that may fall mid-character
             -- (e.g. the first two bytes of a 3-byte Korean char).  The trailing
-            -- fragment causes PostgreSQL to reject the whole INSERT batch with
-            -- "invalid byte sequence for encoding UTF8: 0xXX 0x27" (0x27 is the
-            -- pgmoon SQL literal closing-quote that immediately follows).
+            -- fragment is invalid UTF-8, which embedders reject (as Postgres did).
             -- Fix: walk back over any trailing continuation bytes to the lead byte,
             -- then drop the lead + its continuations if the sequence is incomplete.
             local n = #body

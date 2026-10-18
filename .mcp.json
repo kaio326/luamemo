@@ -1,10 +1,9 @@
 {
-  "_note": "The MCP server self-locates its bundled luamemo modules from its own script path (see the bootstrap at the top of mcp/server.lua), so no LUA_PATH is needed and a stale system LuaRocks install cannot shadow them. pgmoon/luasocket/cjson still resolve via the default (system LuaRocks) package path. ${CLAUDE_PLUGIN_ROOT} points at the installed plugin directory. For a bare dev clone opened as a project WITHOUT installing the plugin (so ${CLAUDE_PLUGIN_ROOT} is unset), register the server with an absolute path instead: claude mcp add luamemo -s local --env MEMO_DB_URL=... -- lua5.1 <repo>/mcp/server.lua",
+  "_note": "The plugin starts the MCP server through memo (run with bash: a git checkout of the plugin may not keep its executable bit). `memo mcp` reads the settings itself — the project's .luamemorc (found from the directory Claude Code starts it in, the project, upward) over ~/.luamemorc — so this entry needs no env and holds nothing secret. ${CLAUDE_PLUGIN_ROOT} points at the installed plugin directory. For a dev clone opened WITHOUT installing the plugin (so ${CLAUDE_PLUGIN_ROOT} is unset): claude mcp add luamemo -s local -- <repo>/cli/memo mcp",
   "mcpServers": {
     "luamemo": {
-      "command": "lua5.1",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/server.lua"],
-      "envFile": "${env:HOME}/.luamemorc"
+      "command": "bash",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/cli/memo", "mcp"]
     }
   }
 }

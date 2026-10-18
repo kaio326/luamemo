@@ -44,8 +44,8 @@ and smoke test are shipped without it (see Phase 16.6a in
 `evidence` strings are dialogue ids in `D<sess_no>:<turn_no>` form;
 the loader converts them to `session_<sess_no>` ids that match the
 ingested memories. If the upstream JSON shape differs from this
-contract, fix `eval/datasets/locomo.lua` first and re-run
-`eval/smoke_locomo.lua` before any live bench.
+contract, fix `eval/datasets/locomo.lua` first and re-run the smoke test
+(`luajit eval/tests/run.lua --only locomo`) before any live bench.
 
 ## Download
 
@@ -63,7 +63,7 @@ Expected size as of 2026-05: ~2.8 MB, 10 dialogues, 292 sessions, 1986 QAs
 Verify the schema matches the loader before running:
 
 ```bash
-lua5.1 -e 'local cjson=require"cjson.safe"; local f=io.open("eval/data/locomo.json","rb"); \
+luajit -e 'local cjson=require"luamemo.json"; local f=io.open("eval/data/locomo.json","rb"); \
   local rows=cjson.decode(f:read("*a")); print(#rows, "rows"); \
   local r=rows[1]; print("keys:"); for k in pairs(r) do print("  "..k) end; \
   print("conversation keys:"); for k in pairs(r.conversation or {}) do print("  "..k) end; \
@@ -75,18 +75,17 @@ Expected per-QA keys: `question`, `answer`, `category`, `evidence`.
 
 ## Run
 
-Smoke (uses the hand-crafted fixture, no download needed):
+Smoke (the tracked fixture `eval/fixtures/locomo_tiny.json`, no download needed):
 
 ```bash
-PGHOST=127.0.0.1 PGPORT=5432 PGDATABASE=lm_bruteforce_test \
-  PGUSER=postgres PGPASSWORD=postgres lua5.1 eval/smoke_locomo.lua
+luajit eval/tests/run.lua --only locomo
 ```
 
-Live, after download — hash baseline:
+Live, after download — hash baseline (`MEMO_DB`: a scratch database; the run
+wipes its own scopes):
 
 ```bash
-PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
-  lua5.1 eval/locomo_run.lua --embedder hash \
+MEMO_DB=bench luajit eval/locomo_run.lua --embedder hash \
   --out eval/results/locomo_hash.json
 ```
 
@@ -94,10 +93,9 @@ Live, ollama (`nomic-embed-text`, 768d):
 
 ```bash
 ollama pull nomic-embed-text
-PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test \
-  OLLAMA_URL=http://127.0.0.1:11434/api/embeddings \
+MEMO_DB=bench OLLAMA_URL=http://127.0.0.1:11434/api/embeddings \
   OLLAMA_MODEL=nomic-embed-text OLLAMA_DIM=768 \
-  lua5.1 eval/locomo_run.lua --embedder ollama \
+  luajit eval/locomo_run.lua --embedder ollama \
   --out eval/results/locomo_ollama.json
 ```
 

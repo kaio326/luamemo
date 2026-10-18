@@ -3,17 +3,18 @@
 -- `memo ping` — standalone connectivity check.
 --
 -- Verifies three things without requiring setup() to have been called:
---   1. DB connection  — opens a pgmoon connection and runs SELECT 1.
---   2. Table exists   — queries lm_memories; distinguishes "missing table"
---                       from other DB errors.
+--   1. Database       — opens the configured database file (creating it and
+--                       applying the schema when new) and reports the file, its
+--                       journal mode, and the native libraries (which copy, version).
+--   2. Memories       — counts lm_memories.
 --   3. Embedder URL   — if MEMO_EMBEDDER_URL is set, sends a probe embed
 --                       request and reports the detected dimension.
 --
 -- Exit codes: 0 = all selected checks passed, 1 = any check failed.
 --
 -- Flags:
---   --db           run only the DB-connection check
---   --table        run only the table-existence check (implies --db)
+--   --db           run only the database + libraries check
+--   --table        run only the memories check (implies --db)
 --   --embedder     run only the embedder check
 --   (no flags)     run all three checks
 
@@ -22,17 +23,6 @@ local M = {}
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
-
--- Mask the password in a postgresql:// URL for safe display.
-local function mask_url(url)
-    if not url or url == "" then return "(not set)" end
-    return (url:gsub("(postgresql?://[^:@]*:)[^@]*(@)", "%1***%2"))
-end
-
--- Classify a pgmoon/db error to detect "relation does not exist".
-local function is_missing_table(err)
-    return err and (err:match("does not exist") or err:match("relation") or err:match("42P01"))
-end
 
 -- Print one result line.
 local function result(status, label, detail)
@@ -46,55 +36,71 @@ end
 
 local function check_db()
     local db = require("luamemo.db")
-    local url = os.getenv("MEMO_DB_URL") or ""
-    local rows, err = db.query("SELECT 1 AS ok")
-    if rows then
-        result("PASS", "DB connection", mask_url(url))
-        return true
+    local loader = require("luamemo.native.loader")
+    local ok_all = true
+
+    local sq_ok, sq_ver = pcall(function() return require("luamemo.native.sqlite").version() end)
+    if sq_ok then
+        local _, where = loader.load("sqlite3")
+        result("PASS", "SQLite", ("%s (%s)"):format(sq_ver, tostring(where)))
     else
-        result("FAIL", "DB connection", (err or "unknown error") .. " — URL: " .. mask_url(url))
+        result("FAIL", "SQLite", tostring(sq_ver))
         return false
     end
+    local so_ok, so_ver = pcall(function() return require("luamemo.native.sodium").version() end)
+    if so_ok then
+        local _, where = loader.load("sodium")
+        result("PASS", "libsodium", ("%s (%s)"):format(so_ver, tostring(where)))
+    else
+        result("FAIL", "libsodium", tostring(so_ver))
+        ok_all = false
+    end
+
+    local path, perr = db.path()
+    if not path then
+        result("FAIL", "Database", tostring(perr))
+        return false
+    end
+    local h, err = db.get()
+    if not h then
+        result("FAIL", "Database", tostring(err))
+        return false
+    end
+    result("PASS", "Database", ("%s (journal: %s)"):format(path, tostring(h.value("PRAGMA journal_mode"))))
+    return ok_all
 end
 
 local function check_table(db_ok)
     if not db_ok then
-        result("SKIP", "Table exists", "(DB not reachable)")
+        result("SKIP", "Memories", "(database not available)")
         return false
     end
     local db = require("luamemo.db")
-    local rows, err = db.query("SELECT count(*) AS n FROM lm_memories")
-    if rows then
-        local n = rows[1] and tonumber(rows[1].n) or 0
-        result("PASS", "Table exists", "lm_memories (" .. n .. " rows)")
+    local n, err = db.value("SELECT count(*) FROM lm_memories")
+    if n then
+        result("PASS", "Memories", tostring(n) .. " rows")
         return true
-    elseif is_missing_table(err) then
-        result("FAIL", "Table exists", "lm_memories not found — run: memo migrate")
-        return false
-    else
-        result("FAIL", "Table exists", tostring(err))
-        return false
     end
+    result("FAIL", "Memories", tostring(err))
+    return false
 end
 
 local function check_embedder()
-    local url = os.getenv("MEMO_EMBEDDER_URL")
-    if url and url ~= "" then
-        -- Load the same config vars as the rest of the CLI so that ping
-        -- results are a reliable proxy for write/calibrate behaviour.
-        local adapter      = os.getenv("MEMO_EMBEDDER_ADAPTER") or "generic"
-        local model        = os.getenv("MEMO_EMBEDDER_MODEL")
-        local cfg_embed_dim = tonumber(os.getenv("MEMO_EMBED_DIM"))
-        local max_chars    = tonumber(os.getenv("MEMO_EMBED_MAX_CHARS"))
-
+    local cfg = require("luamemo.cli._common").config_from_env({ warn = false })
+    if cfg.settings_errors then
+        result("FAIL", "Embedder", table.concat(cfg.settings_errors, "; "))
+        return false
+    end
+    local url = cfg.embedder_url
+    if url then
+        -- The config every other command uses — headers included (a {secret:…} in
+        -- them is read from the vault) — so ping is a reliable proxy for writes and
+        -- calibrate.
+        local full = require("luamemo.settings").defaults()
+        for k, v in pairs(cfg) do full[k] = v end
+        require("luamemo.secrets").configure(full)
         local embed = require("luamemo.embed")
-        embed.configure({
-            embedder_url      = url,
-            embedder_adapter  = adapter,
-            embedder_model    = model,
-            embed_dim         = cfg_embed_dim,  -- may be nil; embed.lua guards for nil
-            embed_max_chars   = max_chars,
-        })
+        embed.configure(full)
 
         local dim, err = embed.probe()
         if dim then

@@ -2,14 +2,13 @@
 --
 -- Orchestrator: selects candidate memories, dispatches them to the
 -- configured summarizer adapter, and replaces the originals with one
--- summary row per batch. Used by:
---   * the background ngx.timer.every job (init.lua)
---   * the manual POST /api/memory/summarize endpoint (routes.lua)
---   * the `memo summarize` CLI
+-- summary row per batch. Used by the `memo summarize` CLI, the digest and
+-- the federation aggregate / adopt paths.
 
-local store = require("luamemo.store")
-local util  = require("luamemo.util")
-local db    = require("luamemo.db")
+local store  = require("luamemo.store")
+local util   = require("luamemo.util")
+local db     = require("luamemo.db")
+local policy = require("luamemo.federation.policy")
 
 local M = {}
 
@@ -94,6 +93,25 @@ function M.run(opts)
     return result
 end
 
+-- Lazy, debounced summarization on writes (MEMO_SUMMARIZER_INTERVAL_SECONDS > 0): at
+-- most one run per scope per interval, the slot claimed atomically in
+-- lm_summarize_state (the digest's pattern — survives stateless CLI calls; a race
+-- can't run it twice). Fail-soft: the run's result, or false when not due.
+local _running = false
+function M.maybe_run(scope)
+    local interval = math.floor(tonumber(cfg and cfg.summarizer_interval_seconds) or 0)
+    if interval <= 0 or _running or not scope or scope == "" or policy.replica(scope) then return false end
+    local now = util.now_us()
+    local claim = db.first("INSERT INTO lm_summarize_state (scope, last_summarized_at) VALUES (?, ?) "
+        .. "ON CONFLICT (scope) DO UPDATE SET last_summarized_at = excluded.last_summarized_at "
+        .. "WHERE lm_summarize_state.last_summarized_at <= ? RETURNING scope", scope, now, now - interval * 1000000)
+    if not claim then return false end
+    _running = true
+    local ok, res = pcall(M.run, { scope = scope })
+    _running = false
+    return ok and res or false
+end
+
 -- ---------------------------------------------------------------------------
 -- promote
 -- Roll all (non-summary) rows from `from_scope` into a single summary row in
@@ -129,14 +147,26 @@ function M.promote(opts)
     if opts.from_scope == opts.to_scope then
         return { promoted = 0, errors = { "promote: from_scope == to_scope" } }
     end
+    -- Federation: delete_source must not wipe a dev's read-only org replica
+    -- (reading from it is fine). On the central, directives survive (see DELETE).
+    if opts.delete_source then
+        local ok_m, merr = policy.check_mutation(opts.from_scope, nil)
+        if not ok_m then
+            return { promoted = 0, errors = { "promote: delete_source refused — " .. merr } }
+        end
+    end
 
     local adapter, aerr = load_adapter(cfg and cfg.summarizer_adapter)
     if not adapter then
         return { promoted = 0, errors = { aerr } }
     end
 
+    -- Tier ≥ 1: what was written as memory. Tier 0 is raw conversation the hooks save for
+    -- the digest — folded in, a session's transcript chunks made a 122 KB "summary" that
+    -- searches then returned whole. (It stays for the digest; delete_source leaves it.)
     local rows, lerr = store.list_by_scope(opts.from_scope, {
         limit = opts.limit or 200,
+        tier_min = 1,
     })
     if not rows then
         return { promoted = 0, errors = { tostring(lerr) } }
@@ -188,31 +218,27 @@ function M.promote(opts)
         dedup_strategy = "append",
     }
 
-    db.query("BEGIN")
-    local row, werr = store.write(insert_args)
-    if not row then
-        db.query("ROLLBACK")
-        return { promoted = 0, source_ids = source_ids,
-                 errors = { "promote: insert failed: " .. tostring(werr) } }
-    end
-
+    local row
     local deleted = false
-    if opts.delete_source then
-        local id_list, id_err = util.sql_id_list(source_ids)
-        if id_list then
-            local del_sql = "DELETE FROM " .. store.table_name()
-                .. " WHERE id IN (" .. id_list .. ")"
-            local _, derr = db.query(del_sql)
-            if derr then
-                db.query("ROLLBACK")
-                return { promoted = 0, source_ids = source_ids,
-                         errors = { "promote: delete failed: " .. tostring(derr) } }
-            end
+    local ok, terr = db.transaction(function(h)
+        local werr
+        row, werr = store.write(insert_args)
+        if not row then error("promote: insert failed: " .. tostring(werr), 0) end
+        local ids = {}
+        for _, id in ipairs(source_ids) do
+            if tonumber(id) then ids[#ids + 1] = math.floor(tonumber(id)) end
+        end
+        if opts.delete_source and #ids > 0 then
+            local excl = policy.maintenance_exclusion_sql()
+            local dn, derr = h.run("DELETE FROM " .. store.table_name() .. " WHERE id IN ("
+                .. db.placeholders(#ids) .. ")" .. (excl and (" AND " .. excl) or ""), unpack(ids, 1, #ids))
+            if not dn then error("promote: delete failed: " .. tostring(derr), 0) end
             deleted = true
         end
+    end)
+    if not ok then
+        return { promoted = 0, source_ids = source_ids, errors = { tostring(terr) } }
     end
-
-    db.query("COMMIT")
 
     return {
         promoted       = 1,

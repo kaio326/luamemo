@@ -41,7 +41,7 @@
 -- with both LongMemEval (`answer_session_ids`) and LoCoMo
 -- (`qa_gold_sessions`) so the bench runner stays symmetric.
 
-local cjson = require("cjson.safe")
+local cjson = require("luamemo.json")
 
 local M = {}
 

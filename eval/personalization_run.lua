@@ -1,4 +1,4 @@
-#!/usr/bin/env lua5.1
+#!/usr/bin/env luajit
 -- Project-personalization eval (Phase 2 of the learned-from-usage feature).
 --
 -- Measures whether luamemo surfaces THIS project's conventions/decisions/
@@ -15,17 +15,16 @@
 --      and find the rank of the gold row (metadata.item_id == gold_id).
 --   3. Report recall@{1,3,5,10} + MRR overall and by lexical_overlap bucket.
 --
--- Connection: pgmoon uses PGHOST/PGDATABASE/PGUSER/PGPASSWORD, or set MEMO_DB_URL.
--- Usage: MEMO_EMBEDDER defaults to hash (self-contained). Override with --embedder.
+-- Database: MEMO_DB (a scratch name or path; the run wipes its own scope).
+-- Usage: the embedder defaults to hash (self-contained). Override with --embedder.
 --
---   PGHOST=127.0.0.1 PGDATABASE=luamemo_dev PGUSER=postgres PGPASSWORD=postgres \
---     lua5.1 eval/personalization_run.lua --embedder hash
+--   MEMO_DB=bench luajit eval/personalization_run.lua --embedder hash
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
-local cjson  = require("cjson.safe")
+local cjson  = require("luamemo.json")
 
 -- --- args ----------------------------------------------------------------
-local args = { embedder = "hash", backend = "auto",
+local args = { embedder = "hash",
                corpus = "eval/personalization/corpus.jsonl",
                queries = "eval/personalization/queries.jsonl", out = nil }
 do
@@ -33,7 +32,6 @@ do
     while i <= #arg do
         local a = arg[i]
         if     a == "--embedder" then args.embedder = arg[i + 1]; i = i + 2
-        elseif a == "--backend"  then args.backend  = arg[i + 1]; i = i + 2
         elseif a == "--out"      then args.out      = arg[i + 1]; i = i + 2
         elseif a == "--corpus"   then args.corpus   = arg[i + 1]; i = i + 2
         elseif a == "--queries"  then args.queries  = arg[i + 1]; i = i + 2
@@ -64,14 +62,8 @@ local memory = require("luamemo")
 local db     = require("luamemo.db")
 
 local setup_opts = {
-    db_table         = "lm_memories",
-    backend          = args.backend or "auto",
-    auth_fn          = function() return true end,
     skip_embed_probe = true,
 }
-if os.getenv("MEMO_DB_URL") and os.getenv("MEMO_DB_URL") ~= "" then
-    setup_opts.db_url = os.getenv("MEMO_DB_URL")
-end
 if args.embedder == "hash" then
     setup_opts.embedder_local = "hash"; setup_opts.embed_dim = 384
 elseif args.embedder == "ollama" then
@@ -93,7 +85,7 @@ memory.setup(setup_opts)
 local scope = "perso:" .. args.embedder
 
 -- --- ingest corpus -------------------------------------------------------
-db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(scope))
+assert(db.run("DELETE FROM lm_memories WHERE scope = ?", scope))
 local batch = {}
 for _, m in ipairs(corpus) do
     batch[#batch + 1] = {

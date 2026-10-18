@@ -6,8 +6,8 @@
 --   4. Results are deduplicated (a symbol appears once across legs)
 --   5. all = matched ∪ callers ∪ callees with no duplicate ids
 --
--- Requires MEMO_DB_URL. Builds a fresh index (needs Phase 4 KG facts).
--- Run: lua5.1 eval/tests/test_index_explore.lua
+-- Requires MEMO_DB. Builds a fresh index (needs Phase 4 KG facts).
+-- Run: luajit eval/tests/test_index_explore.lua
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 
@@ -25,9 +25,9 @@ end
 -- ---------------------------------------------------------------------------
 -- Env / setup
 -- ---------------------------------------------------------------------------
-local db_url = os.getenv("MEMO_DB_URL")
-if not db_url or db_url == "" then
-    io.stderr:write("[SKIP] MEMO_DB_URL not set\n")
+local db_name = os.getenv("MEMO_DB")
+if not db_name or db_name == "" then
+    io.stderr:write("[SKIP] MEMO_DB not set\n")
     os.exit(0)
 end
 
@@ -38,7 +38,7 @@ if not ok_lm then
 end
 
 local embedder_url = os.getenv("MEMO_EMBEDDER_URL")
-local cfg = { db_url = db_url, auth_fn = function() return true end }
+local cfg = {}
 if embedder_url and embedder_url ~= "" then
     cfg.embedder_url     = embedder_url
     cfg.embedder_adapter = os.getenv("MEMO_EMBEDDER_ADAPTER") or "generic"
@@ -61,7 +61,7 @@ local st = luamemo.store
 
 -- Clean slate: wipe memory rows + KG facts.
 st.delete_where({ scope = scope })
-db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
+db.run("DELETE FROM lm_kg_facts WHERE scope = ?", scope)
 info("wiped scope " .. scope .. " before test")
 
 -- ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ local ingest, ierr = luamemo.index.ingest(".", {
 if not ingest then
     fail("ingest failed: " .. tostring(ierr))
     st.delete_where({ scope = scope })
-    db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
+    db.run("DELETE FROM lm_kg_facts WHERE scope = ?", scope)
     io.write(("\n=== Phase 6 results: %d passed, %d failed ===\n"):format(PASS, FAIL))
     os.exit(1)
 end
@@ -85,9 +85,7 @@ info(("ingest: files=%d symbols=%d requires=%d"):format(
 pass("index built for explore")
 
 -- Sanity: KG facts exist (required for the traversal legs).
-local kg_n = db.query(("SELECT COUNT(*) AS n FROM lm_kg_facts WHERE scope = %s"):format(
-    db.escape_literal(scope)))
-local n_kg = kg_n and kg_n[1] and tonumber(kg_n[1].n) or 0
+local n_kg = tonumber(db.value("SELECT COUNT(*) FROM lm_kg_facts WHERE scope = ?", scope)) or 0
 assert_ge(n_kg, 10, "KG facts present for traversal")
 
 -- ---------------------------------------------------------------------------
@@ -143,7 +141,7 @@ end
 -- ---------------------------------------------------------------------------
 io.write("\n--- Test: explore connectivity (db) ---\n")
 
-local res2, _ = luamemo.index.explore("escape_literal query database", { scope = scope, limit = 10 })
+local res2, _ = luamemo.index.explore("placeholders query database", { scope = scope, limit = 10 })
 if res2 then
     info(("db explore: matched=%d callers=%d callees=%d"):format(
         #res2.matched, #res2.callers, #res2.callees))
@@ -157,7 +155,7 @@ end
 -- Cleanup
 -- ---------------------------------------------------------------------------
 st.delete_where({ scope = scope })
-db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
+db.run("DELETE FROM lm_kg_facts WHERE scope = ?", scope)
 info("cleaned up scope and KG facts")
 
 -- ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@
 -- test). No DB required.
 --
 -- Usage:
---   MEMO_RERANK_WEIGHTS=/tmp/rrw_test.json lua5.1 eval/tests/test_rerank_learned.lua
+--   luajit eval/tests/run.lua --only rerank_learned   (it sets MEMO_RERANK_WEIGHTS to a scratch path)
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 

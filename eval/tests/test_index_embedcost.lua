@@ -6,11 +6,11 @@
 --   4. Hybrid search finds a NULL-embedding file row at scale (>50 rows) — the
 --      core fix: candidate pool = vector-nearest UNION fts-top
 --   5. Ranking safety: a NULL-embedding row does NOT wrongly dominate an
---      unrelated query (COALESCE gives it a real 0 vector score, not NULL)
---   6. util.cosine is NULL-safe (bruteforce path relies on this)
+--      unrelated query (it gets a real 0 vector score)
+--   6. util.cosine is NULL-safe
 --
--- Requires MEMO_DB_URL.
--- Run: lua5.1 eval/tests/test_index_embedcost.lua
+-- Requires MEMO_DB.
+-- Run: luajit eval/tests/test_index_embedcost.lua
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 
@@ -26,24 +26,22 @@ local util = require("luamemo.util")
 ok(util.cosine(nil, {1,2,3}) == 0, "cosine(nil, vec) = 0")
 ok(util.cosine({1,2,3}, nil) == 0, "cosine(vec, nil) = 0")
 
-local db_url = os.getenv("MEMO_DB_URL")
-if not db_url or db_url == "" then
-    io.stderr:write("[SKIP] MEMO_DB_URL not set — DB tests skipped\n")
+local db_name = os.getenv("MEMO_DB")
+if not db_name or db_name == "" then
+    io.stderr:write("[SKIP] MEMO_DB not set — DB tests skipped\n")
     io.write(("\n=== Phase 10 results: %d passed, %d failed (pure only) ===\n"):format(PASS, FAIL))
     os.exit(FAIL > 0 and 1 or 0)
 end
 
 local luamemo = require("luamemo")
-assert(pcall(luamemo.setup, { db_url = db_url, embedder_local = os.getenv("MEMO_EMBEDDER") or "hash",
-    auth_fn = function() return true end }))
+assert(pcall(luamemo.setup, { embedder_local = os.getenv("MEMO_EMBEDDER") or "hash" }))
 local store, db, index = luamemo.store, require("luamemo.db"), luamemo.index
 
 local function nrows(scope, kind, extra)
-    local q = "SELECT COUNT(*) AS n FROM lm_memories WHERE scope = " .. db.escape_literal(scope)
-    if kind then q = q .. " AND kind = " .. db.escape_literal(kind) end
+    local q, params = "SELECT COUNT(*) FROM lm_memories WHERE scope = ?", { scope }
+    if kind then q = q .. " AND kind = ?"; params[#params + 1] = kind end
     if extra then q = q .. " AND " .. extra end
-    local r = db.query(q)
-    return r and r[1] and tonumber(r[1].n) or 0
+    return tonumber(db.value(q, unpack(params))) or 0
 end
 
 -- ---------------------------------------------------------------------------
@@ -62,9 +60,8 @@ info(("files=%d (null=%d)  symbols=%d (embedded=%d)"):format(files, files_null, 
 ok(files > 0 and files_null == files, "all file rows have NULL embedding by default")
 ok(syms > 0 and syms_embed == syms, "all symbol rows are embedded")
 
-local b = db.query(("SELECT body FROM lm_memories WHERE scope=%s AND kind='file' AND metadata->>'path'='sample.py'")
-    :format(db.escape_literal(scope)))
-local body = b and b[1] and b[1].body or ""
+local body = db.value("SELECT body FROM lm_memories WHERE scope = ? AND kind = 'file' "
+    .. "AND json_extract(metadata, '$.path') = 'sample.py'", scope) or ""
 ok(body:find("defines:", 1, true) ~= nil, "file body lists defined symbols")
 ok(body:find("make_dog", 1, true) ~= nil, "file body includes a symbol name (make_dog)")
 

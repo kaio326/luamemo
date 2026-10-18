@@ -12,7 +12,7 @@
 --   - RecMultiSession excluded
 --
 -- For every question we:
---   1. Wipe scope  `mb:<embedder>:q<id>`
+--   1. Wipe scope  `<prefix>:<embedder>:<qid>`  (prefix default "mb")
 --   2. Write every turn as an individual memory
 --      (metadata.sid = turn_sid_string)
 --   3. Search the question with limit = k_max
@@ -22,22 +22,19 @@
 -- This is retrieval-side only — no generated answers scored.
 -- Primary metric: R@5.
 --
--- Usage:
---   MEMO_DB_URL=postgresql://... \
---     lua5.1 eval/membench_run.lua --embedder hash \
+-- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes):
+--   MEMO_DB=bench luajit eval/membench_run.lua --embedder hash \
 --       --data-dir eval/data/membench --n 850 \
 --       --out eval/results/membench_hash_v032.json
 --
 -- Full 8500-item run:
---   MEMO_DB_URL=postgresql://... \
---     lua5.1 eval/membench_run.lua --embedder hash \
+--   MEMO_DB=bench luajit eval/membench_run.lua --embedder hash \
 --       --data-dir eval/data/membench \
 --       --out eval/results/membench_hash_v032.json
 --
 -- TEI bge-m3:
 --   TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 EMBED_TIMEOUT_MS=120000 \
---   MEMO_DB_URL=postgresql://... \
---     lua5.1 eval/membench_run.lua --embedder tei \
+--   MEMO_DB=bench luajit eval/membench_run.lua --embedder tei \
 --       --out eval/results/membench_tei_bge-m3_v032.json
 --
 -- Flags:
@@ -46,15 +43,16 @@
 --   --k-max N          retrieve top-N per question (default 20)
 --   --cats cat1,cat2   run only these categories (comma-separated)
 --   --topic TOPIC      filter topic-keyed categories (default movie)
+--   --scope-prefix P   memory scopes are P:<embedder>:<qid> (default mb); each run
+--                      wipes those scopes first, so use a distinct prefix for tests
 --   --patterns         enable write-time extraction (ablation only; see comment below)
 --   --with-observations include observation tier in search results
 --
 -- See eval/datasets/membench.lua for schema notes.
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;eval/datasets/?.lua;" .. package.path
-package.preload["resty.http"] = function() return require("helpers") end
 
-local cjson = require("cjson.safe")
+local cjson = require("luamemo.json")
 
 -- ---------------------------------------------------------------------------
 -- Argument parsing
@@ -66,6 +64,7 @@ local args = {
     out               = nil,
     data_dir          = "eval/data/membench",
     topic             = "movie",    -- filter for topic-keyed categories
+    scope_prefix      = "mb",       -- scopes are <prefix>:<embedder>:<qid>
     skip_observations = true,
     patterns          = false,      -- enable write-time pattern extraction (real-usage default)
 }
@@ -81,6 +80,7 @@ do
         elseif a == "--data-dir"          then args.data_dir = arg[i + 1]; i = i + 2
         elseif a == "--topic"             then args.topic = arg[i + 1]; i = i + 2
         elseif a == "--cats"              then args.cats = arg[i + 1]; i = i + 2
+        elseif a == "--scope-prefix"      then args.scope_prefix = arg[i + 1]; i = i + 2
         elseif a == "--with-observations" then args.skip_observations = false; i = i + 1
         elseif a == "--patterns"          then args.patterns = true; i = i + 1
         else io.stderr:write("unknown arg: " .. tostring(a) .. "\n"); os.exit(2) end
@@ -112,9 +112,6 @@ local db       = require("luamemo.db")
 local membench = require("membench")
 
 local setup_opts = {
-    db_table         = "lm_memories",
-    backend          = "bruteforce",
-    auth_fn          = function() return true end,
     skip_embed_probe = true,
     -- patterns_enabled: false keeps the haystack clean for this benchmark.
     -- Write-time extraction (patterns_enabled=true) inserts companion memories that
@@ -125,7 +122,7 @@ local setup_opts = {
     -- Pass --patterns to include write-time extraction (useful for ablation studies).
     patterns_enabled = args.patterns and true or false,
     dedup_enabled    = false,     -- each turn is unique; skip O(n²) dedup scan
-    default_scope    = "mb:" .. args.embedder .. (args.patterns and ":p" or ""),
+    default_scope    = args.scope_prefix .. ":" .. args.embedder .. (args.patterns and ":p" or ""),
 }
 
 if args.embedder == "hash" then
@@ -196,10 +193,10 @@ local per_q    = {}
 local t_start  = os.time()
 
 for _, q in ipairs(data) do
-    local scope = "mb:" .. args.embedder .. ":" .. tostring(q.id)
+    local scope = args.scope_prefix .. ":" .. args.embedder .. ":" .. tostring(q.id)
 
     -- Wipe previous run for this scope.
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(scope))
+    assert(db.run("DELETE FROM lm_memories WHERE scope = ?", scope))
 
     -- Ingest haystack turns (one memory per turn, sid stored in metadata).
     for _, turn in ipairs(q.turns or {}) do

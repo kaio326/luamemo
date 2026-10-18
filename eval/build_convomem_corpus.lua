@@ -26,14 +26,14 @@
 -- containing the evidence text becomes part of the gold set.
 --
 -- Usage:
---   lua5.1 eval/build_convomem_corpus.lua \
+--   luajit eval/build_convomem_corpus.lua \
 --     --in eval/data/convomem_raw \
 --     --out eval/data/convomem.json
 --
--- The script is intentionally pure-Lua (cjson only) so it can run
--- inside the same OpenResty/luarocks environment as the bench.
+-- The script is intentionally pure Lua (luamemo.json: lua-cjson when installed, else
+-- the bundled dkjson) so it can run in the same environment as the bench.
 
-local cjson = require("cjson")
+local cjson = require("luamemo.json")
 
 -- ----- args ---------------------------------------------------------
 local in_dir  = "eval/data/convomem_raw"

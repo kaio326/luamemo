@@ -4,8 +4,7 @@
 -- (luamemo.sensing.generate). Both need to locate + load the same .so; this
 -- centralises that so they don't each re-implement path resolution and caching.
 --
--- Pure at require-time (ffi is required lazily inside load()), so this module is
--- safe to require under PUC lua5.1 — only load() needs LuaJIT.
+-- Pure at require-time: the library is only loaded by load().
 
 local M = {}
 
@@ -17,10 +16,10 @@ function M.exists(p)
 end
 
 --- Resolve the gguf_shim.so path. Honours an explicit override
---- (cfg.gguf_shim_path / gemma_shim_path / gen_shim_path, or MEMO_GGUF_SHIM /
---- MEMO_GEMMA_SHIM); otherwise resolves it next to this module (native/).
+--- (cfg.gguf_shim_path, or MEMO_GGUF_SHIM / MEMO_GEMMA_SHIM); otherwise resolves
+--- it next to this module (native/).
 function M.shim_path(cfg)
-    local p = cfg and (cfg.gguf_shim_path or cfg.gemma_shim_path or cfg.gen_shim_path)
+    local p = cfg and cfg.gguf_shim_path
     if not (p and p ~= "") then p = os.getenv("MEMO_GGUF_SHIM") end
     if not (p and p ~= "") then p = os.getenv("MEMO_GEMMA_SHIM") end
     if p and p ~= "" then return p end
@@ -32,7 +31,7 @@ end
 local _lib
 function M.load(cfg)
     if _lib then return _lib end
-    _lib = require("ffi").load(M.shim_path(cfg))
+    _lib = require("luamemo.native.loader").ffi.load(M.shim_path(cfg))
     return _lib
 end
 

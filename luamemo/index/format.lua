@@ -13,6 +13,13 @@ local M = {}
 
 local DOC_CLIP = 100   -- max chars of docstring shown per symbol line
 
+-- Integral numbers as plain integers (tostring writes a large one as 1e+15).
+local function num(v)
+    if type(v) == "number" and v == math.floor(v) then return string.format("%d", v) end
+    return tostring(v)
+end
+M.num = num
+
 -- Safe metadata accessor (JSONB usually decodes to a table; guard otherwise).
 local function meta(row)
     return (type(row.metadata) == "table") and row.metadata or {}
@@ -36,7 +43,9 @@ local function _doc_of(row)
         if cut then body = body:sub(1, cut - 1) end
     end
     body = body:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    if #body > DOC_CLIP then body = body:sub(1, DOC_CLIP):gsub("%s+%S*$", "") .. "…" end
+    if #body > DOC_CLIP then
+        body = require("luamemo.util").cut_utf8(body, DOC_CLIP):gsub("%s+%S*$", "") .. "…"
+    end
     return body
 end
 
@@ -44,7 +53,7 @@ end
 -- Falls back gracefully when fields are missing.
 function M.symbol_line(row)
     local m    = meta(row)
-    local loc  = m.path and (m.path .. (m.line and (":" .. tostring(m.line)) or "")) or "?"
+    local loc  = m.path and (m.path .. (m.line and (":" .. num(m.line)) or "")) or "?"
     local name = row.title or m.source_name or "?"
     local typ  = m.symbol_type and (" (" .. m.symbol_type .. ")") or ""
     local doc  = _doc_of(row)
@@ -57,7 +66,7 @@ end
 function M.file_line(row)
     local m = meta(row)
     local loc = m.path or row.title or "?"
-    local n   = m.lines and (" (" .. tostring(m.lines) .. " lines)") or ""
+    local n   = m.lines and (" (" .. num(m.lines) .. " lines)") or ""
     return loc .. n
 end
 
@@ -90,7 +99,7 @@ function M.outline(file_row, symbol_rows)
     if file_row then
         local m = meta(file_row)
         header = (m.path or file_row.title or "?")
-            .. (m.lines and (" — " .. tostring(m.lines) .. " lines") or "")
+            .. (m.lines and (" — " .. num(m.lines) .. " lines") or "")
             .. (", " .. #symbol_rows .. " symbols")
     else
         header = "(file not indexed)"

@@ -4,13 +4,9 @@
 -- M.corpus_health_check() the boot WARN uses, then prints a structured
 -- OK/WARN/FAIL report with concrete recommendations.
 --
--- Bootstraps from the MEMO_* environment the same way every other CLI
--- subcommand does (write/search/etc. via cli.api's ensure_setup), so it
--- works out of the box from .luamemorc/env vars alone. `--setup PATH`
--- remains available to dofile() a custom setup() call instead (e.g. when
--- your app configures luamemo with logic beyond plain env vars).
+-- Reads the same settings as every other memo command (.luamemorc / MEMO_*).
 --
--- Exit codes: 0 = OK / WARN, 1 = FAIL (truncation > 10% or DB error).
+-- Exit codes: 0 = OK / WARN, 1 = FAIL (truncation > 10%, DB error, settings).
 
 local M = {}
 
@@ -21,17 +17,13 @@ local function fmt_int(n)
 end
 
 local function parse_flags(argv)
-    local f = { setup = nil, json = false }
-    local i = 1
-    while i <= #argv do
-        local a = argv[i]
-        if     a == "--setup" then f.setup = argv[i + 1]; i = i + 1
-        elseif a == "--json"  then f.json = true
+    local f = { json = false }
+    for _, a in ipairs(argv) do
+        if a == "--json" then f.json = true
         else
             io.stderr:write("memo doctor: unknown flag: " .. a .. "\n")
             os.exit(2)
         end
-        i = i + 1
     end
     return f
 end
@@ -39,31 +31,11 @@ end
 function M.run(argv)
     local flags = parse_flags(argv or {})
 
-    -- If --setup PATH given, dofile() it so the user's setup() call runs.
-    if flags.setup then
-        local ok, err = pcall(dofile, flags.setup)
-        if not ok then
-            io.stderr:write("memo doctor: failed to load setup file " ..
-                flags.setup .. ":\n  " .. tostring(err) .. "\n")
-            os.exit(1)
-        end
-    end
-
     local lm = require("luamemo")
-    -- lm.config.db_table always has a default value, so it cannot distinguish
-    -- "setup() was called" from "module loaded with defaults".  The reliable
-    -- signal is lm.store.backend(): it returns nil until store.configure()
-    -- completes successfully inside setup().
-    if not lm.store.backend() and not flags.setup then
-        -- No --setup file given: bootstrap from the environment (MEMO_DB_URL /
-        -- MEMO_EMBEDDER / .luamemorc), exactly like every other subcommand.
-        local cfg = require("luamemo.cli._common").config_from_env({ secrets = true })
-        pcall(lm.setup, cfg)
-    end
-    if not lm.store.backend() then
-        io.stderr:write("memo doctor: luamemo.setup() has not been called (or failed).\n" ..
-            "  Set MEMO_DB_URL / MEMO_EMBEDDER (or .luamemorc), pass --setup PATH/TO/setup.lua\n" ..
-            "  for a custom setup() call, or invoke from a host app where setup() has run.\n")
+    local ok, err = pcall(lm.setup, require("luamemo.cli._common").config_from_env())
+    if not ok then
+        io.stderr:write("memo doctor: luamemo can't start — " .. tostring(err) .. "\n"
+            .. "  Check the settings (memo config check), or run memo calibrate.\n")
         os.exit(1)
     end
 
@@ -75,8 +47,8 @@ function M.run(argv)
 
     io.write("memo doctor — corpus health\n")
     io.write("===========================\n")
-    io.write(string.format("  table:        %s\n", lm.config.db_table))
-    io.write(string.format("  backend:      %s\n", lm.store.backend() or "?"))
+    io.write(string.format("  database:     %s\n", tostring(require("luamemo.db").path())))
+    io.write(string.format("  storage:      SQLite %s\n", require("luamemo.native.sqlite").version()))
     io.write(string.format("  embedder:     %s (dim=%d)\n",
         lm.config.embedder_local or lm.config.embedder_adapter or "?",
         lm.config.embed_dim or 0))
@@ -88,6 +60,13 @@ function M.run(argv)
     io.write(string.format("  p95 chars:    %s\n", fmt_int(stats.p95_chars)))
     io.write(string.format("  max chars:    %s\n", fmt_int(stats.max_chars)))
     io.write(string.format("  truncated:    %s\n", fmt_int(stats.truncated)))
+    io.write("\n")
+
+    -- The MCP clients that started luamemo here, and what an old one loses (luamemo.clients).
+    local client_lines, clients_ok = require("luamemo.clients").report()
+    for _, l in ipairs(client_lines) do
+        io.write((clients_ok and "[INFO] " or "[WARN] ") .. l .. "\n")
+    end
     io.write("\n")
 
     local exit_code = 0
@@ -103,7 +82,7 @@ function M.run(argv)
                 io.write("\n[FAIL] Truncation ratio " ..
                     string.format("%.1f%%", ratio * 100) ..
                     " exceeds 10% — recall is materially degraded. " ..
-                    "Re-run `memo init` and switch embedder.\n")
+                    "Re-run `memo calibrate` and switch embedder.\n")
                 exit_code = 1
             end
         end

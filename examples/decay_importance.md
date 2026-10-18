@@ -1,120 +1,73 @@
 # Importance & decay scoring
 
-`luamemo` weights search results by a per-row `importance` and an
-optional `decay_rate`. This makes recent, important memories outrank stale
-or low-value ones automatically — without any client-side filtering.
+luamemo weights search results by each memory's `importance` and an optional
+`decay_rate`, so recent, important memories outrank stale or low-value ones —
+without any filtering on the client's side.
 
 ## The math
 
-For every candidate row at search time:
+For every candidate at search time:
 
 ```
-weight = importance * exp(-decay_rate * days_since_updated)
-score  = (vector_weight * vec_score + fts_weight * fts_score) * weight
+weight = importance × exp(−decay_rate × days_since_updated)
+score  = (vector_weight × vector_score + fts_weight × text_score) × weight
 ```
 
 | Field | Range | Default | Notes |
 |---|---|---|---|
-| `importance` | 0..10 | 1.0 | Static multiplier; higher = more pull. |
-| `decay_rate` | 0..1 per day | 0.0 | Exponential decay; 0 disables it. |
+| `importance` | 0–10 | 1.0 | A static multiplier; higher = more pull. It also sets the tier: `< 0.3` → 0 (ephemeral, hidden from search by default), `< 5` → 1, `< 9` → 2, `≥ 9` → 3 |
+| `decay_rate` | 0–1 per day | 0.0 | Exponential decay; 0 turns it off |
 
-`days_since_updated` is computed from `updated_at`, so editing a memory
-also resets its decay clock.
+`days_since_updated` counts from `updated_at`, so editing a memory restarts its
+decay clock. The defaults for new memories are settings:
+`MEMO_DEFAULT_IMPORTANCE`, `MEMO_DEFAULT_DECAY_RATE`.
 
 ## Picking a decay rate
 
-Pick by half-life:
+By half-life (`half_life_days = ln(2) / decay_rate`):
 
-| Decay rate | Half-life | Use case |
+| Decay rate | Half-life | Use |
 |---|---|---|
-| 0.005 | ~138 days | "Big architectural decisions" — slow forgetting |
-| 0.05  | ~14 days  | "This sprint's facts" |
-| 0.1   | ~7 days   | "Last week's working state" |
-| 0.5   | ~1.4 days | "Today's scratchpad" |
-| 1.0   | ~17 hours | "Aggressive — drops out within a day" |
+| 0.005 | ~138 days | Big architectural decisions — slow forgetting |
+| 0.05  | ~14 days  | This sprint's facts |
+| 0.1   | ~7 days   | Last week's working state |
+| 0.5   | ~1.4 days | Today's scratchpad |
+| 1.0   | ~17 hours | Gone from the top within a day |
 
-Math: `half_life_days = ln(2) / decay_rate`.
-
-## End-to-end recipe (HTTP)
-
-Assumes you've completed the 5-minute setup in the project root README and
-have an embedder configured.
+## End-to-end (CLI)
 
 ```bash
-export MEMO_URL=http://localhost:8080/api/memory
-export MEMO_TOKEN=your-token
+memo write --scope demo --title low  --body "how to deploy"         --importance 1
+memo write --scope demo --title med  --body "how to deploy the app" --importance 5
+memo write --scope demo --title high --body "how to deploy it"      --importance 10 --decay-rate 0.1
 
-# 1. Three memories, same body, different weights
-curl -sS -X POST "$MEMO_URL/write" \
-  -H "Authorization: Bearer $MEMO_TOKEN" -H "Content-Type: application/json" \
-  -d '{"scope":"demo","title":"low",  "body":"how to deploy", "importance":1}'
+memo search deploy --scope demo | jq -c '.results[] | {title, weight, score, tier}'
+# {"title":"high","weight":9.99…,"score":9.67…,"tier":3}
+# {"title":"med","weight":5,"score":4.45…,"tier":2}
+# {"title":"low","weight":1,"score":1,"tier":1}
 
-curl -sS -X POST "$MEMO_URL/write" \
-  -H "Authorization: Bearer $MEMO_TOKEN" -H "Content-Type: application/json" \
-  -d '{"scope":"demo","title":"med",  "body":"how to deploy", "importance":5}'
-
-curl -sS -X POST "$MEMO_URL/write" \
-  -H "Authorization: Bearer $MEMO_TOKEN" -H "Content-Type: application/json" \
-  -d '{"scope":"demo","title":"high", "body":"how to deploy", "importance":10}'
-
-# 2. Search returns them ordered high → med → low
-curl -sS "$MEMO_URL/search?q=deploy&scope=demo" \
-  -H "Authorization: Bearer $MEMO_TOKEN" | jq '.results[] | {title, importance, weight, score}'
-
-# 3. Same query with decay disabled returns them by raw similarity (≈ tied)
-curl -sS "$MEMO_URL/search?q=deploy&scope=demo&ignore_decay=1" \
-  -H "Authorization: Bearer $MEMO_TOKEN" | jq '.results[] | {title, score}'
+memo search deploy --scope demo --ignore-decay 1     # raw hybrid scores, for debugging
 ```
 
-## End-to-end recipe (CLI)
+Each result carries its `weight`, so you can check the math: in a month the
+`high` memory weighs `10 × e^(−0.1 × 30) ≈ 0.50` and falls below `low`.
 
-```bash
-export MEMO_URL=http://localhost:8080/api/memory
-export MEMO_TOKEN=your-token
+## End-to-end (MCP)
 
-memo write --scope demo --title low  --body "how to deploy" --importance 1
-memo write --scope demo --title med  --body "how to deploy" --importance 5
-memo write --scope demo --title high --body "how to deploy" --importance 10
-
-memo search "deploy" --scope demo
-```
-
-> Note: `memo write` may need the `--importance` / `--decay-rate` flags
-> wired up in your `cli/memo` script depending on its version. The HTTP
-> API always accepts them.
-
-## End-to-end recipe (MCP / Claude Desktop)
-
-The `memory_write` and `memory_update` tools accept optional `importance`
-and `decay_rate` params; `memory_search` accepts `ignore_decay`. Just ask
-the agent in plain English:
+`memory_write` and `memory_update` take `importance` and `decay_rate`;
+`memory_search` takes `ignore_decay`. Just ask the agent:
 
 > "Save this as an important architectural decision (importance 8) that
 > shouldn't decay much."
 
-The model will pass the right arguments.
+The model passes the right arguments.
 
-## Verifying the math
+## Expected weights
 
-The weight expression evaluated by Postgres is:
+- `importance = 5, decay_rate = 0`, any age → 5
+- `importance = 5, decay_rate = 0.1`, 30 days → ≈ 0.249 (5·e⁻³)
+- `importance = 5, decay_rate = 0.5`, 10 days → ≈ 0.034 (5·e⁻⁵)
 
-```sql
-importance * exp(-decay_rate * (EXTRACT(EPOCH FROM (now() - updated_at)) / 86400.0))
-```
-
-Quick sanity check:
-
-```sql
-SELECT title, importance, decay_rate,
-       ROUND((importance * exp(-decay_rate *
-              (EXTRACT(EPOCH FROM (now() - updated_at))/86400.0)))::numeric, 4) AS weight
-FROM lm_memories
-ORDER BY weight DESC
-LIMIT 20;
-```
-
-Expected behaviour:
-
-- `importance=5, decay_rate=0,   any age`     → weight = 5.0000
-- `importance=5, decay_rate=0.1, age=30 days` → weight ≈ 0.2489 (= 5·e⁻³)
-- `importance=5, decay_rate=0.5, age=10 days` → weight ≈ 0.0337 (= 5·e⁻⁵)
+Faded memories aren't deleted by decay alone: maintenance (`memo consolidate`,
+`memory_consolidate`) expires the ones whose weight has fallen below its
+threshold, and the summarizer can fold old, light ones into summaries.

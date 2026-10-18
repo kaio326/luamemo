@@ -2,9 +2,8 @@
 -- Phase 9 — signal capture. Section 1: heuristic detector (pure, no DB).
 -- (Section 2 — the orchestrator — is DB-backed and appended below.)
 --
--- Usage:
---   MEMO_DB_URL=postgresql://postgres:postgres@127.0.0.1:5432/luamemo_dev \
---     lua5.1 eval/tests/test_sensing.lua
+-- Usage (the test runner sets a new MEMO_DB per file):
+--   MEMO_DB=/tmp/test_sensing.db luajit eval/tests/test_sensing.lua
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
@@ -70,17 +69,15 @@ local db      = require("luamemo.db")
 local memory  = require("luamemo")
 local sensing = require("luamemo.sensing")
 
-memory.setup({ embedder_local = "hash", embed_dim = 384, backend = "auto",
-    auth_fn = function() return true end, skip_embed_probe = true })
+memory.setup({ embedder_local = "hash", embed_dim = 384, skip_embed_probe = true })
 
 local SCOPE = "sensingtest"
 local function wipe()
-    db.query("DELETE FROM lm_reinforcements WHERE scope = " .. db.escape_literal(SCOPE))
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(SCOPE))
+    db.run("DELETE FROM lm_reinforcements WHERE scope = ?", SCOPE)
+    db.run("DELETE FROM lm_memories WHERE scope = ?", SCOPE)
 end
 local function reinf_count()
-    local r = db.query("SELECT count(*) AS n FROM lm_reinforcements WHERE scope = " .. db.escape_literal(SCOPE))
-    return r and tonumber(r[1].n) or -1
+    return tonumber((db.value("SELECT count(*) FROM lm_reinforcements WHERE scope = ?", SCOPE))) or -1
 end
 wipe()
 
@@ -103,8 +100,7 @@ local convo = {
 local res = sensing.process(SCOPE, convo, {})
 check("orchestrator recorded a reinforcement", res.recorded >= 1,
     string.format("recorded=%d skipped=%d signals=%d", res.recorded, res.skipped, res.signals))
-local rf = db.query("SELECT memory_id, event_type FROM lm_reinforcements WHERE scope = "
-    .. db.escape_literal(SCOPE) .. " ORDER BY id")
+local rf = db.query("SELECT memory_id, event_type FROM lm_reinforcements WHERE scope = ? ORDER BY id", SCOPE)
 check("reinforcement landed on the CORRECT memory (db client)",
     rf and rf[1] and tonumber(rf[1].memory_id) == ids["db client"],
     rf and rf[1] and tostring(rf[1].memory_id) or "none")
@@ -120,8 +116,8 @@ check("no duplicate reinforcement after re-run", reinf_count() == before, tostri
 -- A directive lands as direct_command on the resolved memory.
 local n0 = reinf_count()
 sensing.process(SCOPE, { { role = "user", text = "Always use pgmoon for Postgres going forward." } }, {})
-local cmd = db.query("SELECT event_type FROM lm_reinforcements WHERE scope = " .. db.escape_literal(SCOPE)
-    .. " AND event_type = 'direct_command' LIMIT 1")
+local cmd = db.query("SELECT event_type FROM lm_reinforcements WHERE scope = ? "
+    .. "AND event_type = 'direct_command' LIMIT 1", SCOPE)
 check("a directive is recorded as direct_command", cmd and #cmd > 0 and reinf_count() > n0)
 
 -- Misattribution guard: a correction about something NOT in the store records nothing.
@@ -131,9 +127,9 @@ local off = sensing.process(SCOPE,
 check("unrelated correction does not misattribute", off.recorded == 0, tostring(off.recorded))
 
 -- Uses the single canonical writer: all rows have valid event_types.
-local bad = db.query("SELECT count(*) AS n FROM lm_reinforcements WHERE scope = " .. db.escape_literal(SCOPE)
-    .. " AND event_type NOT IN ('mistake','reversal','direct_command','praise')")
-check("all reinforcements have valid event_types (single writer path)", bad and tonumber(bad[1].n) == 0)
+local bad = db.value("SELECT count(*) FROM lm_reinforcements WHERE scope = ? "
+    .. "AND event_type NOT IN ('mistake','reversal','direct_command','praise')", SCOPE)
+check("all reinforcements have valid event_types (single writer path)", tonumber(bad) == 0)
 
 -- =========================================================================
 header("Section 3 — generative extractor: parse + label mapping (pure, no model)")

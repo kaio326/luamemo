@@ -1,12 +1,12 @@
 -- eval/tests/test_gguf_ffi.lua
 -- Phase 7 — in-process EmbeddingGemma FFI embedder.
---   * loads cleanly under BOTH VMs; under PUC lua5.1 returns a graceful error
---   * under LuaJIT with the shim + a GGUF model present: 768-d L2-normalised
---     vectors, Matryoshka truncation renormalised. (Skips those live checks if
---     the shim/model are absent — they are built/downloaded locally, gitignored.)
+--   * loads cleanly
+--   * with the shim + a GGUF model present: 768-d L2-normalised vectors,
+--     Matryoshka truncation renormalised. (Skips those live checks if the
+--     shim/model are absent — they are built/downloaded locally, gitignored.)
 --
 -- Usage:
---   MEMO_GGUF_MODEL=~/models/embeddinggemma-300M-Q8_0.gguf luajit eval/tests/test_gguf_ffi.lua
+--   MEMO_GGUF_MODEL=~/models/embeddinggemma-300M-Q8_0.gguf luajit eval/tests/run.lua --only gguf_ffi
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
@@ -18,18 +18,7 @@ local ok_req, g = pcall(require, "luamemo.embedders.gguf_ffi")
 check("module loads without error", ok_req, tostring(g))
 if not ok_req then io.write("\n0 passed, 1 failed\n"); os.exit(1) end
 
-local has_ffi = pcall(require, "ffi")
-
-if not has_ffi then
-    local v, err = g.embed("x", {})
-    check("under lua5.1: embed returns graceful error (no crash)",
-        v == nil and tostring(err):find("LuaJIT", 1, true) ~= nil, tostring(err))
-    io.write(string.format("\n%d passed, %d failed  (lua5.1: FFI path skipped)\n", pass, fail))
-    if fail > 0 then os.exit(1) end
-    return
-end
-
--- LuaJIT path: need the shim + a model to exercise the real embed.
+-- The shim + a model are needed to exercise the real embed.
 local model = os.getenv("MEMO_GGUF_MODEL")
 if not model or model == "" then model = (os.getenv("HOME") or "") .. "/models/embeddinggemma-300M-Q8_0.gguf" end
 local shim = "luamemo/embedders/native/gguf_shim.so"
@@ -58,6 +47,14 @@ if type(v2) == "table" then
         string.format("dim=%d L2=%.4f", #v2, math.sqrt(ss2)))
 end
 check("selftest passes", (g.selftest(cfg)))
+
+-- Longer than the context (default 2048 tokens): embedded from its start, reported
+-- truncated — it used to fail outright (the token buffer was never filled).
+local _, _, t_short = g.embed("a short text", cfg)
+check("a text that fits is not reported truncated", t_short == false, tostring(t_short))
+local vl, el, tl = g.embed(("deploy pipeline notes "):rep(1200), cfg)
+check("a text past the context still embeds", type(vl) == "table" and #vl == 768, tostring(el))
+check("… and is reported truncated", tl == true, tostring(tl))
 
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 if fail > 0 then os.exit(1) end

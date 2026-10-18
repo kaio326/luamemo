@@ -14,6 +14,11 @@ local ctags    = require("luamemo.index.ctags")
 
 local M = {}
 
+-- Walk excludes used when the caller passes none. The CLI's --exclude adds to
+-- these; a library caller's opts.exclude_patterns replaces them. Credential
+-- files are skipped by the walker regardless (see walker.is_secret).
+M.DEFAULT_EXCLUDES = { ".git", "vendor/", "node_modules/" }
+
 local cfg = nil  -- set by configure()
 
 -- Lazy store reference to avoid circular dep at load time.
@@ -37,10 +42,25 @@ end
 -- Internal helpers
 -- ---------------------------------------------------------------------------
 
--- Build the scope string for a project.
-local function _scope(opts)
-    return opts.scope or ("codeindex:" .. (opts.project or "default"))
+--- A memory scope's project: "repo:luamemo" → "luamemo" (none → "default").
+function M.project_of(scope)
+    local p = type(scope) == "string" and scope:gsub("^%a+:", "") or ""
+    return p ~= "" and p or "default"
 end
+
+--- The code map's scope: opts.scope, else codeindex:<project> — opts.project, else the
+--- project's own scope (MEMO_SCOPE) without its prefix. One rule for memo index, the MCP
+--- index_* tools, the brief and org proposals: each had its own, and `memo index ingest`
+--- built codeindex:default while the brief and the tools looked in codeindex:<project> —
+--- following the brief's "build with: memo index ingest" changed nothing.
+function M.scope_for(opts)
+    opts = opts or {}
+    if type(opts.scope) == "string" and opts.scope ~= "" then return opts.scope end
+    local project = opts.project
+    if type(project) ~= "string" or project == "" then project = M.project_of(os.getenv("MEMO_SCOPE")) end
+    return "codeindex:" .. project
+end
+local _scope = M.scope_for
 
 -- Dotted module name for a symbol, derived from its file path.
 -- "luamemo/store.lua" → "luamemo.store". Falls back to project, then "?".
@@ -67,8 +87,9 @@ local function _symbol_body(sym, qualified)
 end
 
 -- Build the searchable body string for a file row.
--- Enriched so lexical search actually hits: Postgres FTS tokenises a path like
--- "src/payments/refund.lua" as ONE token, so we also emit the split path words
+-- Enriched so lexical search actually hits: besides the path (Postgres FTS took
+-- "src/payments/refund.lua" as ONE token; FTS5 splits it, and the extra words keep
+-- the ranking the benchmarks measured), we also emit the split path words
 -- ("src payments refund") and the names of the symbols the file defines
 -- ("defines: processRefund, issueChargeback") as separate tokens. This is what
 -- lets a query like "refund payments" or "the file that defines write_many"
@@ -108,10 +129,10 @@ end
 
 -- Extract the first meaningful line from source (skip blank + comment lines).
 local function _first_meaningful_line(src)
-    for line in (src .. "\n"):gmatch("([^\n]*)\n") do
-        line = line:match("^%s*(.-)%s*$")
+    for raw_line in (src .. "\n"):gmatch("([^\n]*)\n") do
+        local line = raw_line:match("^%s*(.-)%s*$")
         if line ~= "" and not line:match("^%-%-") then
-            return line:sub(1, 120)
+            return require("luamemo.util").cut_utf8(line, 120)
         end
     end
     return nil
@@ -146,12 +167,8 @@ end
 -- Removes both "requires" (subject=from_module) and "required_by" (object=from_module).
 local function _kg_invalidate_file(scope, from_module)
     local db = require("luamemo.db")
-    db.query(
-        ("DELETE FROM lm_kg_facts WHERE scope = %s AND predicate = 'requires' AND subject = %s"):format(
-            db.escape_literal(scope), db.escape_literal(from_module)))
-    db.query(
-        ("DELETE FROM lm_kg_facts WHERE scope = %s AND predicate = 'required_by' AND object = %s"):format(
-            db.escape_literal(scope), db.escape_literal(from_module)))
+    db.run("DELETE FROM lm_kg_facts WHERE scope = ? AND predicate = 'requires' AND subject = ?", scope, from_module)
+    db.run("DELETE FROM lm_kg_facts WHERE scope = ? AND predicate = 'required_by' AND object = ?", scope, from_module)
 end
 
 -- Ingest one file: delete old rows, write new rows, write KG dependency facts.
@@ -159,7 +176,8 @@ end
 -- want_symbols: when false, write only the file row (whole-repo file index mode).
 --   Symbols are also skipped when no language parser handles the extension.
 -- preloaded: optional { src, cksum } already read by the caller (update path),
---   reused to avoid a second full read + rehash of the same file.
+--   reused to avoid a second full read + rehash of the same file; and/or { ctags }
+--   — the file's ctags result, which ingest gets for many files at once.
 -- embed_file_rows: when true, file rows get a vector too (default: FTS-only).
 -- use_ctags: when not false, use universal-ctags (if available) for non-native
 --   code languages. Default enabled; ctags absence is a silent no-op.
@@ -209,7 +227,7 @@ local function _ingest_file(file_entry, scope, project, root, want_symbols, prel
             parse_result = parser.parse_source(src, rel)
             do_symbols = true
         elseif use_ctags ~= false and ctags.handles(rel) then
-            parse_result = ctags.parse_file(path, rel)
+            parse_result = (preloaded and preloaded.ctags) or ctags.parse_file(path, rel)
             do_symbols = true
         end
     end
@@ -297,7 +315,8 @@ end
 --   extensions          = { lua=true, ... } | "*" (default "*" — whole-repo)
 --   symbols             = bool  (default true; false = file-level index only)
 --   file_row_embeddings = bool  (default false; true = embed file rows too)
---   exclude_patterns    = { ".git", "vendor/", ... }
+--   exclude_patterns    = { ".git", "vendor/", ... }  (replaces M.DEFAULT_EXCLUDES)
+--   respect_gitignore   = bool  (default true; skip gitignored files in a git work tree)
 --   max_file_bytes   = number
 --   dry_run          = bool  (walk + parse but do not write)
 --   progress_fn      = function(rel, syms_written, files_done, files_total)
@@ -315,19 +334,32 @@ function M.ingest(root, opts)
     -- Walk. Default to every text file (whole-repo index); callers may narrow
     -- with opts.extensions = { lua=true, ... }.
     local files, werr = walker.walk(root, {
-        extensions       = opts.extensions or "*",
-        exclude_patterns = opts.exclude_patterns or { ".git", "vendor/", "node_modules/" },
-        max_file_bytes   = opts.max_file_bytes,
-        warn_fn          = opts.warn_fn,
+        extensions        = opts.extensions or "*",
+        exclude_patterns  = opts.exclude_patterns or M.DEFAULT_EXCLUDES,
+        respect_gitignore = opts.respect_gitignore,
+        max_file_bytes    = opts.max_file_bytes,
+        warn_fn           = opts.warn_fn,
     })
     if not files then return nil, "ingest: walker failed: " .. tostring(werr) end
 
     local total_syms, total_reqs, total_files = 0, 0, #files
     local errors = {}
 
+    -- ctags (code languages without a native parser) runs once per batch of files, not
+    -- once per file.
+    local by_ctags = {}
+    if not opts.dry_run and want_symbols and use_ctags then
+        local todo = {}
+        for _, fe in ipairs(files) do
+            if not parser.has_parser(fe.rel) and ctags.handles(fe.rel) then todo[#todo + 1] = fe end
+        end
+        if #todo > 0 then by_ctags = ctags.parse_files(todo) end
+    end
+
     for i, file_entry in ipairs(files) do
         if not opts.dry_run then
-            local syms, reqs, ferr = _ingest_file(file_entry, scope, project, root, want_symbols, nil, embed_file_rows, use_ctags)
+            local pre = by_ctags[file_entry.path] and { ctags = by_ctags[file_entry.path] } or nil
+            local syms, reqs, ferr = _ingest_file(file_entry, scope, project, root, want_symbols, pre, embed_file_rows, use_ctags)
             if ferr then
                 errors[#errors + 1] = file_entry.rel .. ": " .. ferr
             else
@@ -371,10 +403,8 @@ function M.update(root, opts)
 
     -- Step 1: Batch-fetch all stored file checksums in one SQL query.
     local stored = {}  -- rel_path → checksum string
-    local q = ("SELECT metadata->>'path' AS path, metadata->>'checksum' AS cksum "
-             .. "FROM lm_memories WHERE scope = %s AND kind = 'file'"):format(
-                 db.escape_literal(scope))
-    local rows, qerr = db.query(q)
+    local rows, qerr = db.query("SELECT json_extract(metadata, '$.path') AS path, "
+        .. "json_extract(metadata, '$.checksum') AS cksum FROM lm_memories WHERE scope = ? AND kind = 'file'", scope)
     if rows then
         for _, row in ipairs(rows) do
             if row.path then stored[row.path] = row.cksum or false end
@@ -385,10 +415,11 @@ function M.update(root, opts)
 
     -- Step 2: Walk the filesystem (whole-repo by default; see ingest()).
     local files, werr = walker.walk(root, {
-        extensions       = opts.extensions or "*",
-        exclude_patterns = opts.exclude_patterns or { ".git", "vendor/", "node_modules/" },
-        max_file_bytes   = opts.max_file_bytes,
-        warn_fn          = opts.warn_fn,
+        extensions        = opts.extensions or "*",
+        exclude_patterns  = opts.exclude_patterns or M.DEFAULT_EXCLUDES,
+        respect_gitignore = opts.respect_gitignore,
+        max_file_bytes    = opts.max_file_bytes,
+        warn_fn           = opts.warn_fn,
     })
     if not files then return nil, "update: walker failed: " .. tostring(werr) end
 
@@ -491,11 +522,10 @@ end
 -- Returns a list of { id, title, body, metadata } with metadata decoded.
 local function _symbols_for_path(scope, path, limit)
     local db = require("luamemo.db")
-    local q = ("SELECT id, title, body, kind, metadata FROM lm_memories "
-            .. "WHERE scope = %s AND kind = 'symbol' AND metadata->>'path' = %s "
-            .. "ORDER BY CAST(metadata->>'line' AS INTEGER) ASC LIMIT %d"):format(
-                db.escape_literal(scope), db.escape_literal(path), limit or 200)
-    local rows = db.query(q)
+    local rows = db.query("SELECT id, title, body, kind, metadata FROM lm_memories "
+        .. "WHERE scope = ? AND kind = 'symbol' AND json_extract(metadata, '$.path') = ? "
+        .. "ORDER BY CAST(json_extract(metadata, '$.line') AS INTEGER) ASC LIMIT ?",
+        scope, path, math.floor(tonumber(limit) or 200))
     return rows or {}
 end
 
@@ -503,9 +533,8 @@ end
 -- This is the join key between KG facts (dotted names) and symbol rows (paths).
 local function _module_path_map(scope)
     local db = require("luamemo.db")
-    local rows = db.query(
-        ("SELECT metadata->>'path' AS path FROM lm_memories WHERE scope = %s AND kind = 'file'"):format(
-            db.escape_literal(scope)))
+    local rows = db.query("SELECT json_extract(metadata, '$.path') AS path FROM lm_memories "
+        .. "WHERE scope = ? AND kind = 'file'", scope)
     local map = {}
     for _, r in ipairs(rows or {}) do
         if r.path then
@@ -630,11 +659,9 @@ function M.status(opts)
     local counts = {}
     for _, kind in ipairs(kinds) do
         -- Use a cheap FTS-free count query.
-        local res, qerr = db.query(
-            ("SELECT COUNT(*) AS n FROM lm_memories WHERE scope = %s AND kind = %s"):format(
-                db.escape_literal(scope), db.escape_literal(kind)))
-        if res and res[1] then
-            counts[kind] = tonumber(res[1].n) or 0
+        local n, qerr = db.value("SELECT COUNT(*) FROM lm_memories WHERE scope = ? AND kind = ?", scope, kind)
+        if n then
+            counts[kind] = tonumber(n) or 0
         else
             counts[kind] = 0
             if qerr and opts.warn_fn then opts.warn_fn("status: " .. tostring(qerr)) end
@@ -659,11 +686,8 @@ function M.outline(path, opts)
     local scope = _scope(opts)
     local db = require("luamemo.db")
 
-    local frows = db.query(
-        ("SELECT id, title, body, kind, metadata FROM %s "
-      .. "WHERE scope = %s AND kind = 'file' AND metadata->>'path' = %s LIMIT 1"):format(
-            "lm_memories", db.escape_literal(scope), db.escape_literal(path)))
-    local file_row = frows and frows[1] or nil
+    local file_row = db.first("SELECT id, title, body, kind, metadata FROM lm_memories "
+        .. "WHERE scope = ? AND kind = 'file' AND json_extract(metadata, '$.path') = ? LIMIT 1", scope, path)
 
     local symbols = _symbols_for_path(scope, path, opts.per_file or 200)
 
@@ -716,20 +740,19 @@ function M.ingest_diff(diff_text_or_opts, opts)
     local db = require("luamemo.db")
     local syms_by_path = {}   -- path -> { {title=, line=}, ... }
     do
-        local seen, path_lits = {}, {}
+        local seen, paths = {}, {}
         for _, h in ipairs(hunks) do
             if not seen[h.file_path] then
                 seen[h.file_path] = true
-                path_lits[#path_lits + 1] = db.escape_literal(h.file_path)
+                paths[#paths + 1] = h.file_path
             end
         end
-        if #path_lits > 0 then
-            local q = ("SELECT title, metadata->>'path' AS path, "
-                    .. "CAST(metadata->>'line' AS INTEGER) AS line "
-                    .. "FROM lm_memories WHERE scope = %s AND kind = 'symbol' "
-                    .. "AND metadata->>'path' IN (%s)"):format(
-                        db.escape_literal(scope), table.concat(path_lits, ","))
-            local srows = db.query(q)
+        if #paths > 0 then
+            local in_paths, paths_json = db.in_list(paths)   -- a large commit touches thousands of files
+            local srows = db.query("SELECT title, json_extract(metadata, '$.path') AS path, "
+                .. "CAST(json_extract(metadata, '$.line') AS INTEGER) AS line "
+                .. "FROM lm_memories WHERE scope = ? AND kind = 'symbol' "
+                .. "AND json_extract(metadata, '$.path') IN " .. in_paths, scope, paths_json)
             for _, r in ipairs(srows or {}) do
                 if r.path then
                     local lst = syms_by_path[r.path]
@@ -748,7 +771,7 @@ function M.ingest_diff(diff_text_or_opts, opts)
         -- Clip body: commit message + raw hunk.
         local body_prefix = commit_msg ~= "" and (commit_msg .. "\n---\n") or ""
         local body = body_prefix .. hunk.raw_hunk
-        if #body > 3000 then body = body:sub(1, 3000) .. "…" end
+        if #body > 3000 then body = require("luamemo.util").cut_utf8(body, 3000) .. "…" end
 
         -- Symbol attribution: match pre-fetched symbols by line range (≤10),
         -- preserving the original BETWEEN [from_line, from_line+from_count+added].
@@ -811,8 +834,7 @@ function M.invalidate(path_or_scope, opts)
     if path_or_scope:match("^codeindex:") then
         -- Full scope wipe: memory rows + all KG facts for the scope.
         local n = st.delete_where({ scope = path_or_scope })
-        db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(
-            db.escape_literal(path_or_scope)))
+        db.run("DELETE FROM lm_kg_facts WHERE scope = ?", path_or_scope)
         return n
     else
         -- File-level wipe: memory rows for the file + that file's KG facts.

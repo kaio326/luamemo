@@ -10,7 +10,7 @@
 --   MEMO_GGUF_MODEL=~/models/embeddinggemma-300M-Q8_0.gguf
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
-local cjson = require("cjson.safe")
+local cjson = require("luamemo.json")
 
 local EMB = "hash"
 do local i=1 while i<=#arg do if arg[i]=="--embedder" then EMB=arg[i+1]; i=i+2 else i=i+1 end end end

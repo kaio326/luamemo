@@ -86,6 +86,8 @@ function M.rerank(query, hits, opts)
         -- Scope for per-scope learned weights (Phase 11); nil = global/unscoped.
         rerank_scope      = opts.rerank_scope,
         rerank_weights    = opts.rerank_weights,
+        rerank_epsilon    = tonumber(opts.rerank_epsilon)
+                            or (cfg and cfg.rerank_epsilon) or 0,
     }
 
     -- Trim the candidate pool the LLM sees to keep token cost predictable.
@@ -108,7 +110,8 @@ function M.rerank(query, hits, opts)
     for _, s in ipairs(scored) do
         s.index = tonumber(s.index)
         s.score = tonumber(s.score) or 0
-        if not s.index or s.index < 1 or s.index > pool_size then
+        -- (a whole number: a model answering index 2.5 crashed the search below)
+        if not s.index or s.index < 1 or s.index > pool_size or s.index ~= math.floor(s.index) then
             return nil, "rerank: adapter returned invalid index "
                 .. tostring(s.index)
         end

@@ -1,36 +1,70 @@
 #!/usr/bin/env bash
 # memo — luamemo CLI: persistent semantic memory for AI agents.
 #
-# Stores and retrieves memories in PostgreSQL using hybrid vector + full-text
-# search. Supports pluggable embedders (Ollama, OpenAI, TEI, built-in hash),
-# knowledge graphs, encrypted secrets, memory tiers (0–3), a whole-repo codebase
-# index (memo index), and an MCP stdio server so AI agents can read/write memory
-# and query the code map directly. Works with plain PostgreSQL + Lua 5.1 — no
-# OpenResty required.
+# Stores and retrieves memories in a local SQLite database (one file per
+# project, in ~/.local/share/luamemo) using hybrid vector + full-text search.
+# Supports pluggable embedders (in-process GGUF, Ollama, OpenAI, TEI, built-in
+# hash), knowledge graphs, encrypted secrets, memory tiers (0–3), a whole-repo
+# codebase index (memo index), and an MCP stdio server so AI agents can read/write
+# memory and query the code map directly. Needs LuaJIT, libsqlite3 and libsodium —
+# no database server.
 #
-# Configuration (env vars or ~/.memorc):
-#   MEMO_DB_URL   PostgreSQL connection URL, e.g.
-#                 postgresql://user:pass@localhost:5432/luamemo
-#                 (Individual PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD also work)
+# Configuration: MEMO_* settings (`memo config list` shows every one), from the
+# environment, ~/.luamemorc (every project) and the project's .luamemorc (written by
+# `memo calibrate` and `memo config set`) — a later one wins:
+#   MEMO_DB       The database: a name (a file in $XDG_DATA_HOME/luamemo, default
+#                 ~/.local/share/luamemo) or a path. calibrate gives each project
+#                 its own.
+#   MEMO_LUA      The LuaJIT interpreter to run (name or path). Default: luajit.
+#   MEMO_PROJECT  The project directory whose .luamemorc memo reads and writes
+#                 (calibrate --root / mcp --project win over it). Default (unset or
+#                 empty): the nearest directory from here up that holds a
+#                 .luamemorc, else the current one.
 #
 # Commands:
 #   memo write      --scope SCOPE --kind KIND --title T --body B [--tags a,b,c]
-#                   [--importance F]
+#                   [--metadata JSON] [--importance F] [--decay-rate F]
+#                   [--dedup-strategy update|skip|append] [--created-at ISO|EPOCH] [--tier 0-3]
 #
-#   memo search     QUERY [--scope SCOPE] [--kind KIND] [--limit N]
+#   memo search     QUERY [--scope SCOPE | --scopes a,b] [--kind KIND] [--limit N]
 #                         [--since ISO|EPOCH] [--until ISO|EPOCH]
-#                         [--tier-min N] [--tier-max N]
+#                         [--tier-min N] [--tier-max N] [--ignore-decay 1]
+#                         [--metadata-filter JSON] [--min-score F] [--rerank on|off]
+#                         [--hybrid-weights '{"vector":F,"fts":F}'] [--project P]
 #
-#   memo recent     [--scope SCOPE] [--limit N]
+#   memo recent     [--scope SCOPE] [--kind KIND] [--limit N] [--offset N]
 #
 #   memo get        ID
 #
 #   memo update     ID [--title T] [--body B] [--scope S] [--kind K] [--tags a,b]
+#                   [--metadata JSON] [--importance F] [--decay-rate F]
 #
-#   memo delete     ID
+#   memo delete     ID | --scope SCOPE [--kind KIND] [--meta JSON] [--yes]
+#                   (by filter: how many match and a few titles; --yes deletes them —
+#                    an org replica / org directives are never matched)
 #
 #   memo context    QUERY [--scope SCOPE] [--limit N] [--no-kg] [--format text|json]
 #                   (search + KG facts in one call, formatted for agent consumption)
+#
+#   memo embed      TEXT [--compare-to TEXT] [--json]
+#                   (the configured embedder's model and vector size for a text; how
+#                    similar two texts are; --json adds the vector)
+#
+#   memo tune-weights [--scope SCOPE] [--samples N] [--metric r_at_1|r_at_3|r_at_5|r_at_10|mrr]
+#                   [--json]
+#                   (which MEMO_HYBRID_WEIGHTS blend finds this scope's memories best:
+#                    each sampled memory is searched for by its own title at every
+#                    blend; prints the memo config set command that applies the best)
+#
+#   memo kg         assert --subject S --predicate P --object O [--valid-from T]
+#                          [--source-memory ID] [--supersede]
+#                   | query [--subject S] [--predicate P] [--object O] [--at T]
+#                          [--include-invalidated] [--limit N]
+#                   | invalidate --subject S --predicate P [--object O] [--at T]
+#                   | timeline --subject S --predicate P
+#                   [--scope SCOPE]   (default: $MEMO_SCOPE)
+#                   (knowledge graph: facts that hold over a time window — the history
+#                    of a value that changes; --supersede ends the current value first)
 #
 #   memo brief      [--scope SCOPE]
 #                   (tiny session-start digest: memory count + codebase-map size +
@@ -47,11 +81,27 @@
 #                   (stdin: JSON array of {role,text} turns → record reinforcements)
 #
 #   memo learn      <scope> [--dry-run] [--min-samples N] [--margin F]
-#                   (per-scope promotion harness: harvest → train → gated-promote reranker)
+#                   | <scope> --status | <scope> --rollback
+#                   (per-scope promotion harness: harvest → train → gated-promote reranker;
+#                    --status: its versions and last runs; --rollback: back to the previous
+#                    version — every run and rollback is recorded)
 #
-#   memo reembed    --scope SCOPE [--batch N] [--dry-run]
-#                   (re-embed every memory in a scope with the current embedder —
-#                    needed after switching embedders; old vectors aren't comparable)
+#   memo reembed    --scope SCOPE | --all [--batch N] [--dry-run]
+#                   (re-embed every memory in a scope — or every scope — with the
+#                    current embedder; needed after switching embedders: old vectors
+#                    aren't comparable, and a new vector size needs --all)
+#
+#   memo backup     [PATH] [--force] [--db NAME|PATH]
+#                   (a consistent copy of the database, safe while luamemo is in
+#                    use; default ~/.local/share/luamemo/backups/<name>-<time>.db)
+#
+#   memo export     [--scope SCOPE]... [--no-vectors] [--out FILE] [--db NAME|PATH]
+#   memo import     FILE|- [--dedup append|skip|update] [--scope SCOPE] [--dry-run]
+#                   [--db NAME|PATH]
+#                   (memories + facts as JSON Lines, between databases or embedders:
+#                    vectors are reused when the embedder is the same, else re-embedded;
+#                    importing the same export twice adds nothing.
+#                    --db: another database than the project's)
 #
 #   memo promote    --from FROM_SCOPE --to TO_SCOPE [--delete-source] [--dry-run]
 #                   [--limit N]
@@ -59,9 +109,30 @@
 #   memo summarize  [--scope S] [--dry-run] [--weight-threshold F]
 #                   [--retention-days N]
 #
+#   memo org        pair | status | pull [--full] | push | sync
+#                   | proposals [list|candidates [--explain]|withdraw ID|private ID|public ID]
+#                   | adopt [--dry-run] [--no-switch] | leave
+#                   (dev: read-only org replica, feedback push + filtered knowledge
+#                   proposals — needs MEMO_ORG_URL, MEMO_ORG_FINGERPRINT; also refreshed
+#                   on session start / org search)
+#   memo org        status | devs [pending|list|approve CODE|remove REF]
+#                   | review [list|show ID|approve ID [--supersedes ORGID]|approve --top N
+#                   |reject ID [--reason T]|remove ORGID]
+#                   | directives <path> [--source N] [--project P] [--dry-run] [--no-prune]
+#                   | aggregate [--dry-run] [--min-samples N]
+#                   (org central: device pairing; devs' knowledge proposals; Markdown
+#                   standards → protected core tier; digest + directives-gated
+#                   promotion — MEMO_ROLE=org)
+#
+#   memo serve      [--host 127.0.0.1] [--port 8765] [--prefix /federation]
+#                   (org central: federation API on the local network / VPN only;
+#                   encrypted, key-authenticated — needs MEMO_ROLE=org, MEMO_ORG_NAME)
+#
 #   memo index      ingest [--root .] [--scope codeindex:proj] [--extensions csv|*]
-#                          [--no-symbols] [--embed-file-rows] [--exclude a,b] [--dry-run]
-#                   update [--root .] [--scope codeindex:proj]
+#                          [--no-symbols] [--embed-file-rows] [--exclude a,b] [--no-gitignore]
+#                          [--dry-run]   (--exclude adds to .git,vendor/,node_modules/;
+#                          gitignored + credential files are skipped)
+#                   update [--root .] [--scope codeindex:proj]  (same scan flags as ingest)
 #                   search  <query>  [--scope codeindex:proj] [--kind symbol] [--limit N]
 #                   explore <query>  [--scope codeindex:proj] [--limit N]
 #                   status           [--scope codeindex:proj]
@@ -70,28 +141,50 @@
 #                   (index a repo into codeindex:<project> — files/symbols/deps/diffs;
 #                    Lua/Python/JS-TS parsers + universal-ctags for other languages)
 #
-#   memo calibrate  [--scope SCOPE] [--root DIR] [--no-git] [--no-comments]
-#                   [--probe-only] [--multilingual] [--long] [--hosted]
-#                   [--allow-hash] [--write PATH] [--no-migrate] [--no-mcp]
-#                   [--no-plugin] [--docker-compose FILE] [--dry-run]
-#                   [--keep-embedder] [-h|--help]
-#                   (probe host + recommend embedder + ingest codebase)
+#   memo calibrate  [--scope SCOPE] [--root DIR] [--db NAME|PATH] [--no-git]
+#                   [--no-comments] [--probe-only] [--multilingual] [--long]
+#                   [--allow-hash] [--write PATH] [--no-mcp]
+#                   [--no-plugin] [--dry-run] [--keep-embedder] [--no-gguf]
+#                   [-h|--help]
+#                   (probe host + recommend embedder + the project's database +
+#                    ingest codebase)
+#                   --db: use this database (default: the project's own)
 #                   --keep-embedder: skip probe-and-persist, preserve existing
 #                   embedder config in .luamemorc
+#                   --no-gguf: never pick / suggest the in-process GGUF embedder
+#                   (gguf_ffi is only picked once a live test embedding succeeds)
 #                   --no-plugin: skip VS Code agent plugin install
 #                   -h, --help: show calibrate flag reference and exit
 #
-#   memo ping       [--db] [--table] [--embedder]   Connectivity check (exit 0/1)
+#   memo config     [list [--json | --markdown] | get KEY | set KEY VALUE [--user]
+#                   | unset KEY [--user] | check | trust]
+#                   (the settings: values and where each comes from; set / unset write the
+#                    project's .luamemorc — or ~/.luamemorc with --user — after checking
+#                    the value; a credential in a header is written {secret:NAME};
+#                    trust: use a .luamemorc committed to git, after reviewing it;
+#                    --markdown: the reference of every setting, as in SETTINGS.md)
+#
+#   memo mcp        [--project PATH] [--print-config]
+#                   (the MCP stdio server — what an MCP client starts; the settings are
+#                    the project's, found as for every command, so the client's config
+#                    needs no MEMO_* environment; --print-config: that client entry)
+#
+#   memo gguf       [status | install]
+#                   (the in-process GGUF embedder's runtime: what is in use and whether it
+#                    loads; install downloads this release's prebuilt one for this machine,
+#                    checked against the checksum the install ships)
+#
+#   memo ping       [--db] [--table] [--embedder]   Health check: SQLite + libsodium
+#                   (versions, which copy), the database file, memories, embedder
+#                   (exit 0/1)
 #
 #   memo setup      [--root DIR] [--force]
 #                   Create SETUP_CHECK in the project root with first-run
 #                   verification instructions for an AI agent. The file is
 #                   deleted automatically when `memo calibrate` succeeds.
 #
-#   memo doctor     [--setup PATH] [--json]
-#                   (corpus health: truncation counts, p95 row size, scale warnings)
-#
-#   memo migrate    Print all luamemo migration SQL to stdout (pipe to psql)
+#   memo doctor     [--json]
+#                   (corpus health: truncation counts, p95 row size)
 #
 #   memo secret-store   NAME [--desc DESCRIPTION] [--file PATH]
 #   memo secret-list
@@ -104,23 +197,186 @@
 
 set -euo pipefail
 
-# Load ~/.memorc if present (global defaults, for backward compatibility).
-# set -a / set +a ensures every KEY=VALUE line is automatically exported so
-# child Lua processes (api.lua, mcp/server.lua) inherit the vars without the
-# caller needing to prefix each line with "export".
-_MEMO_CONFIG_SOURCE=""
-if [[ -f "$HOME/.memorc" ]]; then
-    # shellcheck disable=SC1091
-    set -a; source "$HOME/.memorc"; set +a
-    [[ -n "${MEMO_DB_URL:-}" ]] && _MEMO_CONFIG_SOURCE="global"
+# The luamemo modules next to this script (a checkout, or a plugin's clone of the
+# repository) come first on the Lua path — as mcp/server.lua does it — so memo runs
+# the code it ships with from any directory, never another installed copy. A
+# LuaRocks install keeps memo in <tree>/bin and the modules in <tree>/share/lua/5.1
+# (C modules, e.g. luasocket, in <tree>/lib/lua/5.1): that tree comes first — a
+# `luarocks --local` (~/.luarocks) or any other tree works without `luarocks path`.
+_MEMO_SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+_MEMO_ROOT=$(cd "$(dirname "$_MEMO_SELF")/.." 2>/dev/null && pwd -P || true)
+if [[ -n "$_MEMO_ROOT" && -f "$_MEMO_ROOT/luamemo/init.lua" ]]; then
+    export LUA_PATH="$_MEMO_ROOT/?.lua;$_MEMO_ROOT/?/init.lua;${LUA_PATH:-;}"
+elif [[ -n "$_MEMO_ROOT" && -f "$_MEMO_ROOT/share/lua/5.1/luamemo/init.lua" ]]; then
+    export LUA_PATH="$_MEMO_ROOT/share/lua/5.1/?.lua;$_MEMO_ROOT/share/lua/5.1/?/init.lua;${LUA_PATH:-;}"
+    export LUA_CPATH="$_MEMO_ROOT/lib/lua/5.1/?.so;${LUA_CPATH:-;}"
 fi
-# Load .luamemorc from the current directory — project-local config overrides
-# the global ~/.memorc.  This allows multiple projects on the same machine to
-# each have their own database without interfering with one another.
-if [[ -f "$PWD/.luamemorc" ]]; then
-    # shellcheck disable=SC1091
-    set -a; source "$PWD/.luamemorc"; set +a
-    [[ -n "${MEMO_DB_URL:-}" ]] && _MEMO_CONFIG_SOURCE="local"
+# Every Lua snippet memo runs starts with this: the module paths keep absolute entries
+# only. LuaJIT's defaults begin with ./?.lua and ./?.so — the working directory — so in
+# a project holding a luamemo/init.lua (or a cjson.lua, a socket/…), that file would run
+# in luamemo's place, e.g. from the session-start hook when the project is opened.
+_LUA_PATH_GUARD='for _, k in ipairs({ "path", "cpath" }) do local kept = {}
+for e in package[k]:gmatch("[^;]+") do if e:sub(1, 1) == "/" then kept[#kept + 1] = e end end
+package[k] = table.concat(kept, ";") end'
+
+# ---------------------------------------------------------------------------
+# Settings files — ~/.memorc, ~/.luamemorc, the project's .luamemorc — are DATA:
+# MEMO_KEY=value lines, read without running anything ('single-quoted' as is, '\''
+# for a quote; "double-quoted" or bare with $NAME / ${NAME} / a leading ~/ expanded;
+# a bare value ends at " #"). luamemo.settings.read_file reads them the same way.
+# A project's .luamemorc committed to git came with the repository — content you
+# didn't write, which could point the embedder or the database elsewhere — so it is
+# used only once you trusted it as it is (memo config trust; a changed file needs
+# trusting again). One memo wrote (gitignored) is yours.
+# ---------------------------------------------------------------------------
+_RC_LINE_RE='^[[:space:]]*(export[[:space:]]+)?(MEMO_[A-Za-z0-9_]+)=(.*)$'
+_RC_VAR_RE='^([^$]*)\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?(.*)$'
+_rc_expand() {
+    local rest="$1" out="" name
+    [[ "$rest" == "~/"* ]] && rest="$HOME/${rest#\~/}"
+    while [[ "$rest" =~ $_RC_VAR_RE ]]; do
+        out+="${BASH_REMATCH[1]}"; name="${BASH_REMATCH[2]}"; rest="${BASH_REMATCH[3]}"
+        out+="${!name:-}"
+    done
+    printf '%s' "$out$rest"
+}
+_rc_value() {
+    local v="$1"
+    if [[ "$v" == \'* ]]; then
+        v="${v#\'}"; v="${v%"${v##*[![:space:]]}"}"; v="${v%\'}"
+        printf '%s' "${v//\'\\\'\'/\'}"
+    elif [[ "$v" == \"* ]]; then
+        v="${v#\"}"; v="${v%"${v##*[![:space:]]}"}"; v="${v%\"}"
+        v=$(_rc_expand "$v")
+        v="${v//\\\"/\"}"; v="${v//\\\$/\$}"; v="${v//\\\`/\`}"; v="${v//\\\\/\\}"
+        printf '%s' "$v"
+    else
+        v="${v%%[[:space:]]#*}"; v="${v%"${v##*[![:space:]]}"}"
+        _rc_expand "$v"
+    fi
+}
+# Settings that name code memo runs or loads (the interpreter, the native libraries, the
+# GGUF shim): never taken from a project's .luamemorc, which a downloaded folder could
+# bring — only from the environment and ~/.luamemorc (luamemo.settings.USER_ONLY).
+_RC_USER_ONLY=" MEMO_LUA MEMO_LIB_SQLITE3 MEMO_LIB_SODIUM MEMO_GGUF_SHIM MEMO_GEMMA_SHIM "
+# _load_rc FILE [project] — export the MEMO_ settings FILE holds (a project's: but the
+# _RC_USER_ONLY ones).
+_load_rc() {
+    local line key raw
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ $_RC_LINE_RE ]] || continue
+        key="${BASH_REMATCH[2]}"; raw="${BASH_REMATCH[3]}"
+        if [[ "${2:-}" == project && "$_RC_USER_ONLY" == *" $key "* ]]; then
+            echo "memo: ignoring $key in $1 — a project's settings never name code to run; set it in" \
+                "~/.luamemorc or the environment" >&2
+            continue
+        fi
+        export "$key=$(_rc_value "$raw")"
+    done < "$1"
+}
+_trust_file() {
+    printf '%s/trusted_rc' "${MEMO_FEDERATION_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/luamemo}"
+}
+_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum < "$1" | cut -d' ' -f1
+    else shasum -a 256 < "$1" | cut -d' ' -f1; fi
+}
+_rc_abs() { printf '%s/%s' "$(cd "$(dirname -- "$1")" && pwd -P)" "$(basename -- "$1")"; }
+_rc_committed() {
+    git -C "$(dirname -- "$1")" ls-files --error-unmatch -- "$(basename -- "$1")" >/dev/null 2>&1
+}
+# _rc_usable FILE → 0 when memo may use a project's FILE: memo wrote it or you trusted it,
+# as it is now — its checksum is in the trust list (luamemo.settings.trusted).
+_rc_usable() {
+    grep -qxF "$(_sha256 "$1") $(_rc_abs "$1")" "$(_trust_file)" 2>/dev/null
+}
+_rc_untrusted_why() {
+    if _rc_committed "$1"; then echo "it is committed to the repository (not written on this machine)"
+    else echo "memo didn't write it as it is now (it may have come with the project, or been edited)"; fi
+}
+_rc_untrusted_note() {
+    echo "memo: ignoring $1 — $(_rc_untrusted_why "$1") and you haven't trusted it. Review it; if it's" \
+        "fine: memo config trust" >&2
+}
+
+# Load the user's settings — ~/.luamemorc, for every project; exported, so the Lua
+# processes memo starts inherit them. (~/.memorc, the older name, is no longer read:
+# memo calibrate moves its settings into ~/.luamemorc.)
+_MEMO_CONFIG_SOURCE=""
+if [[ -f "$HOME/.luamemorc" ]]; then
+    _memo_env_db="${MEMO_DB:-}"
+    _load_rc "$HOME/.luamemorc"
+    # "global" only when the user file itself named the database (not the environment).
+    if [[ -n "${MEMO_DB:-}" && "${MEMO_DB:-}" != "$_memo_env_db" ]]; then
+        _MEMO_CONFIG_SOURCE="global"; _MEMO_USER_DB_FILE="~/.luamemorc"
+    fi
+fi
+if [[ -f "$HOME/.memorc" && "${1:-}" != "calibrate" ]]; then
+    echo "memo: ~/.memorc is no longer read — run memo calibrate (it moves its settings into ~/.luamemorc)" >&2
+fi
+# The project — whose .luamemorc overrides the user's, so each project on this machine
+# keeps its own database: for `memo calibrate --root DIR` / `memo mcp --project DIR`,
+# DIR; else MEMO_PROJECT when set (the test runner uses it to keep a checkout's own
+# .luamemorc out of the tests); else the nearest directory from here up that holds a
+# .luamemorc (a subfolder of a project is that project — not the home directory's own
+# file, which is the user's); else the current directory.
+# luamemo.settings.project_dir finds it the same way.
+_find_project() {
+    local d="$1"
+    while :; do
+        if [[ -f "$d/.luamemorc" ]] && ! [[ -f "$HOME/.luamemorc" && "$d/.luamemorc" -ef "$HOME/.luamemorc" ]]; then
+            printf '%s' "$d"; return 0
+        fi
+        [[ "$d" == "/" || "$d" == "$HOME" ]] && return 1
+        d=$(dirname -- "$d")
+    done
+}
+_memo_root_arg="" _memo_root_flag="" _memo_project_from="the working directory"
+case "${1:-}" in
+    calibrate) _memo_root_flag="--root" ;;
+    mcp)       _memo_root_flag="--project" ;;
+esac
+if [[ -n "$_memo_root_flag" ]]; then
+    _memo_prev=""
+    for _memo_a in "$@"; do
+        [[ "$_memo_prev" == "$_memo_root_flag" ]] && _memo_root_arg="$_memo_a"
+        _memo_prev="$_memo_a"
+    done
+fi
+if [[ -n "$_memo_root_arg" ]]; then
+    _memo_project_from="$_memo_root_flag"
+    _MEMO_PROJECT_DIR=$(cd "$_memo_root_arg" 2>/dev/null && pwd) || _MEMO_PROJECT_DIR="$_memo_root_arg"
+elif [[ -n "${MEMO_PROJECT:-}" ]]; then
+    _memo_project_from="MEMO_PROJECT"
+    _MEMO_PROJECT_DIR="$MEMO_PROJECT"
+else
+    _MEMO_PROJECT_DIR=$(_find_project "$PWD") || _MEMO_PROJECT_DIR="$PWD"
+fi
+if [[ ! -d "$_MEMO_PROJECT_DIR" ]]; then
+    echo "memo: $_memo_project_from is not a directory: $_MEMO_PROJECT_DIR" >&2
+    exit 2
+fi
+# The Lua side reads the same project (luamemo.settings.files, memo org link / adopt / leave).
+export MEMO__PROJECT_DIR="$_MEMO_PROJECT_DIR"
+_MEMO_RC_UNTRUSTED=""
+# Re-read the project's .luamemorc (after memo changed it) — when memo may use it.
+_load_project_rc() {
+    local f="$_MEMO_PROJECT_DIR/.luamemorc"
+    [[ -f "$f" ]] || return 0
+    [[ -f "$HOME/.luamemorc" && "$f" -ef "$HOME/.luamemorc" ]] && return 0   # read above
+    if _rc_usable "$f"; then
+        _load_rc "$f" project
+    else
+        _MEMO_RC_UNTRUSTED=1
+        return 1
+    fi
+}
+if [[ -f "$_MEMO_PROJECT_DIR/.luamemorc" ]]; then
+    if _load_project_rc; then
+        grep -q '^MEMO_DB=' "$_MEMO_PROJECT_DIR/.luamemorc" 2>/dev/null && _MEMO_CONFIG_SOURCE="local"
+    else
+        _rc_untrusted_note "$_MEMO_PROJECT_DIR/.luamemorc"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -135,18 +391,22 @@ require_jq() {
 }
 
 find_lua() {
-    # The in-process GGUF embedder (MEMO_EMBEDDER=gguf_ffi) needs LuaJIT's FFI, so
-    # prefer luajit when it is the selected embedder; otherwise the standard
-    # lua5.1-first order. (.luamemorc is sourced with `set -a`, so MEMO_EMBEDDER is
-    # in the environment here.) Mirrors the MCP config writer's luajit selection.
-    local order="lua5.1 luajit lua5.3 lua5.4 lua"
-    if [[ "${MEMO_EMBEDDER:-}" == "gguf_ffi" ]]; then
-        order="luajit lua5.1 lua5.3 lua5.4 lua"
-    fi
-    for cand in $order; do
-        if command -v "$cand" >/dev/null; then echo "$cand"; return 0; fi
-    done
+    # luamemo runs on LuaJIT only: its FFI reaches SQLite and libsodium (and the
+    # in-process GGUF embedder). MEMO_LUA names another LuaJIT binary (name or path).
+    local cand="${MEMO_LUA:-luajit}"
+    if command -v "$cand" >/dev/null; then echo "$cand"; return 0; fi
     return 1
+}
+
+# For callers that can't go on without Lua: lua=$(find_lua) || _no_lua
+_no_lua() {
+    if [[ -n "${MEMO_LUA:-}" ]]; then
+        echo "memo: MEMO_LUA=$MEMO_LUA not found — it must name a LuaJIT interpreter" >&2
+    else
+        echo "memo: LuaJIT not found — install it (Debian / Ubuntu / WSL: sudo apt install luajit;" \
+            "macOS: brew install luajit) or set MEMO_LUA to its path" >&2
+    fi
+    exit 1
 }
 
 # Run a single luamemo.cli.api command.
@@ -155,30 +415,51 @@ find_lua() {
 # stdout = JSON result
 api_call() {
     local cmd="$1"
-    local lua; lua=$(find_lua) || {
-        echo "memo: no Lua interpreter found (tried lua5.1, luajit, lua5.3, lua5.4, lua)" >&2
-        exit 1
-    }
-    "$lua" -e "package.path='./?/init.lua;'..package.path; require('luamemo.cli.api').dispatch('${cmd}')"
+    local lua; lua=$(find_lua) || _no_lua
+    "$lua" -e "$_LUA_PATH_GUARD
+require('luamemo.cli.api').dispatch('${cmd}')"
 }
 
-# Build a JSON object from --key value pairs passed as arguments.
-# --tags is split on commas into an array.
+# Run luamemo.cli.<module>.run(argv) WITHOUT putting the arguments in Lua code:
+# each one travels hex-encoded in MEMO__ARGV and is decoded on the Lua side, so
+# any value — a search query, a crafted directory name — stays data.
+#   _lua_run <lua> <module> [args…]      (cmd_local_lua execs the same program)
+_lua_argv() {
+    local out="" a
+    for a in "$@"; do
+        out+="x$(printf '%s' "$a" | od -An -v -tx1 | tr -d ' \n') "
+    done
+    printf '%s' "$out"
+}
+_LUA_RUN="$_LUA_PATH_GUARD"'
+local argv = {}
+for h in (os.getenv("MEMO__ARGV") or ""):gmatch("x(%x*)") do
+    argv[#argv + 1] = (h:gsub("%x%x", function(b) return string.char(tonumber(b, 16)) end))
+end
+require("luamemo.cli." .. os.getenv("MEMO__MODULE")).run(argv)'
+_lua_run() {
+    local lua="$1" module="$2"; shift 2
+    MEMO__ARGV="$(_lua_argv "$@")" MEMO__MODULE="$module" "$lua" -e "$_LUA_RUN"
+}
+
+# Build a JSON object from --key value pairs passed as arguments, in one jq call.
+# --tags is split on commas into an array. --body - reads the body from stdin (the
+# session hooks: a chat's text never goes on a command line, where ps shows it).
 build_json() {
     require_jq
-    local json='{}'
+    local args=()
     while [[ $# -gt 0 ]]; do
-        local key="${1#--}"
-        local val="$2"
-        if [[ "$key" == "tags" ]]; then
-            local arr; arr=$(printf '%s' "$val" | jq -R 'split(",")|map(gsub("^\\s+|\\s+$";""))')
-            json=$(printf '%s' "$json" | jq --argjson v "$arr" '. + {tags: $v}')
+        [[ $# -ge 2 ]] || { echo "memo: $1 needs a value" >&2; return 2; }
+        local key="${1#--}"; key="${key//-/_}"   # --decay-rate → decay_rate
+        if [[ "$key" == "body" && "$2" == "-" ]]; then
+            args+=(--rawfile body /dev/stdin)
         else
-            json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+            args+=(--arg "$key" "$2")
         fi
         shift 2
     done
-    printf '%s' "$json"
+    jq -nc ${args[@]+"${args[@]}"} \
+        '$ARGS.named | if has("tags") then .tags |= (split(",") | map(gsub("^\\s+|\\s+$"; ""))) else . end'
 }
 
 # ---------------------------------------------------------------------------
@@ -187,30 +468,20 @@ build_json() {
 
 cmd_write() {
     require_jq
-    local body; body=$(build_json "$@")
+    local body; body=$(build_json "$@") || exit 2
     printf '%s' "$body" | api_call write | jq .
 }
 
 cmd_search() {
     require_jq
     local q="$1"; shift
-    local json; json=$(jq -n --arg q "$q" '{q: $q}')
-    while [[ $# -gt 0 ]]; do
-        local key="${1#--}"; local val="$2"
-        json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
-        shift 2
-    done
+    local json; json=$(build_json --q "$q" "$@") || exit 2
     printf '%s' "$json" | api_call search | jq .
 }
 
 cmd_recent() {
     require_jq
-    local json='{}'
-    while [[ $# -gt 0 ]]; do
-        local key="${1#--}"; local val="$2"
-        json=$(printf '%s' "$json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
-        shift 2
-    done
+    local json; json=$(build_json "$@") || exit 2
     printf '%s' "$json" | api_call recent | jq .
 }
 
@@ -222,14 +493,37 @@ cmd_get() {
 cmd_update() {
     require_jq
     local id="$1"; shift
-    local body; body=$(build_json "$@")
+    local body; body=$(build_json "$@") || exit 2
     body=$(printf '%s' "$body" | jq --argjson id "$id" '. + {id: $id}')
     printf '%s' "$body" | api_call update | jq .
 }
 
+# memo delete ID | --scope S [--kind K] [--meta JSON] [--yes] — by filter, it only
+# previews (how many, a few titles) unless --yes is given.
 cmd_delete() {
     require_jq
-    jq -n --argjson id "$1" '{id: $id}' | api_call delete | jq .
+    if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+        jq -n --argjson id "$1" '{id: $id}' | api_call delete | jq .
+        return
+    fi
+    local json='{}' meta
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scope|--kind)
+                [[ $# -ge 2 ]] || { echo "memo delete: $1 needs a value" >&2; exit 2; }
+                json=$(jq --arg k "${1#--}" --arg v "$2" '. + {($k): $v}' <<<"$json"); shift 2 ;;
+            --meta|--metadata-filter)
+                [[ $# -ge 2 ]] || { echo "memo delete: $1 needs a JSON object" >&2; exit 2; }
+                meta=$(jq -c 'if type == "object" then . else error("not an object") end' <<<"$2" 2>/dev/null) \
+                    || { echo "memo delete: $1 must be a JSON object, e.g. '{\"source\":\"import\"}'" >&2; exit 2; }
+                json=$(jq --argjson v "$meta" '. + {metadata_filter: $v}' <<<"$json"); shift 2 ;;
+            --yes) json=$(jq '. + {yes: true}' <<<"$json"); shift ;;
+            *) echo "usage: memo delete ID | --scope SCOPE [--kind KIND] [--meta JSON] [--yes]" >&2; exit 2 ;;
+        esac
+    done
+    local out; out=$(printf '%s' "$json" | api_call delete-where)
+    jq . <<<"$out"
+    jq -e '.ok == true' <<<"$out" >/dev/null
 }
 
 cmd_summarize() {
@@ -282,20 +576,23 @@ cmd_secret_store() {
         echo "memo secret-store: value cannot be empty" >&2
         exit 1
     fi
-    local body; body=$(jq -n \
+    # The value goes to jq on stdin (printf is a builtin: no process carries it), never as an
+    # argument — a command line is readable by any local user (ps, /proc/<pid>/cmdline).
+    local body; body=$(printf '%s' "$value" | jq -Rs \
         --arg n "$name" \
-        --arg v "$value" \
         --arg d "$desc" \
-        '{name: $n, value: $v, description: (if $d == "" then null else $d end)}')
+        '{name: $n, value: ., description: (if $d == "" then null else $d end)}')
     value=""
-    printf '%s' "$body" | api_call secret-store \
-        | jq '{ok, secret: {id: .secret.id, name: .secret.name, description: .secret.description}}'
+    local out; out=$(printf '%s' "$body" | api_call secret-store)
+    body=""
+    jq 'if .ok then {ok, secret: {name: .secret.name, description: .secret.description}} else . end' <<<"$out"
+    jq -e '.ok == true' <<<"$out" >/dev/null
 }
 
 cmd_secret_list() {
     require_jq
     printf '{}' | api_call secret-list \
-        | jq '[.secrets[] | {id, name, description, used_count, last_used_at, updated_at}]'
+        | jq 'if .ok then [.secrets[] | {name, description, used_count, last_used_at, updated_at}] else . end'
 }
 
 cmd_secret_delete() {
@@ -359,411 +656,10 @@ cmd_secret_execute() {
     printf '%s' "$payload" | api_call secret-execute | jq .
 }
 
-# ---------------------------------------------------------------------------
-# memo migrate
-# ---------------------------------------------------------------------------
-
-# Required lm_memories columns shared by _cmd_migrate_check and _cmd_doctor_check.
-# Add new column names here when a migration introduces them.
-_MEMO_REQUIRED_COLS=(
-    id scope kind title body tags metadata embedding importance
-    decay_rate was_truncated fts created_at updated_at
-    tier consolidated_at
-)
-
-# Redact password from a postgresql:// URL for safe display in error messages.
+# Mask the password of a URL's user:password@ part for display (the org central's
+# address is given by people — it should carry none, but never echo one).
 _redact_url() {
     echo "$1" | sed 's|://\([^:]*\):[^@]*@|://\1:***@|'
-}
-
-# Assemble a postgresql:// URL from components, validating structural fields
-# for URL-unsafe characters (@  /  #  ?) that would silently mis-parse the
-# authority section.  The password is percent-encoded so those characters in
-# credentials don't break the URL.  Prints the URL to stdout on success;
-# prints an error to stderr and returns 1 when a component is invalid.
-# Usage: _build_pg_url <user> <pass> <host> <port> <dbname>
-_build_pg_url() {
-    local _u="$1" _p="$2" _h="$3" _pt="$4" _db="$5"
-    if [[ "$_u" =~ [@/#?] ]]; then
-        echo "  \u2717 DB user contains URL-unsafe characters (@ / # ?) — enter MEMO_DB_URL manually." >&2
-        return 1
-    fi
-    if [[ "$_h" =~ [@#?] ]]; then
-        echo "  \u2717 DB host contains URL-unsafe characters (@ # ?) — enter MEMO_DB_URL manually." >&2
-        return 1
-    fi
-    if [[ -n "$_pt" ]] && ! [[ "$_pt" =~ ^[0-9]+$ ]]; then
-        echo "  \u2717 DB port '$_pt' is not numeric — enter MEMO_DB_URL manually." >&2
-        return 1
-    fi
-    if [[ "$_db" =~ [/@#?] ]]; then
-        echo "  \u2717 DB name contains URL-unsafe characters (/ @ # ?) — enter MEMO_DB_URL manually." >&2
-        return 1
-    fi
-    # Percent-encode password characters that would break URL parsing.
-    # Encode % first to avoid double-encoding subsequent replacements.
-    local _p_enc
-    _p_enc=$(printf '%s' "$_p" | sed 's/%/%25/g; s/@/%40/g; s/#/%23/g; s|/|%2F|g; s/?/%3F/g')
-    printf 'postgresql://%s:%s@%s:%s/%s' "$_u" "$_p_enc" "$_h" "$_pt" "$_db"
-}
-
-# ---------------------------------------------------------------------------
-# _cmd_migrate_sql: emit full idempotent schema SQL (migrations 001–011).
-# Outputs vector(384) — callers pipe through sed to substitute embed_dim.
-# ---------------------------------------------------------------------------
-_cmd_migrate_sql() {
-    cat <<'MIGRATE_EOF'
--- ==========================================================================
--- luamemo: full schema + migrations (generated by `memo migrate`)
--- All statements are idempotent -- safe to run on a fresh or existing DB.
--- ==========================================================================
-
--- migration 001 / schema ---------------------------------------------------
-
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE IF NOT EXISTS lm_memories (
-    id              BIGSERIAL   PRIMARY KEY,
-    scope           TEXT        NOT NULL,
-    kind            TEXT        NOT NULL,
-    title           TEXT        NOT NULL,
-    body            TEXT        NOT NULL,
-    tags            TEXT[]      NOT NULL DEFAULT '{}',
-    metadata        JSONB       NOT NULL DEFAULT '{}'::jsonb,
-    embedding       vector(384),
-    importance      REAL        NOT NULL DEFAULT 1.0
-                        CHECK (importance >= 0.0 AND importance <= 10.0),
-    decay_rate      REAL        NOT NULL DEFAULT 0.0
-                        CHECK (decay_rate >= 0.0 AND decay_rate <= 1.0),
-    was_truncated   BOOLEAN     NOT NULL DEFAULT FALSE,
-    tier            SMALLINT    NOT NULL DEFAULT 1,
-    consolidated_at TIMESTAMPTZ,
-    fts             tsvector GENERATED ALWAYS AS
-                        (to_tsvector('english',
-                            coalesce(title, '') || ' ' || coalesce(body, '')))
-                    STORED,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS lm_memories_scope_idx ON lm_memories (scope);
-CREATE INDEX IF NOT EXISTS lm_memories_kind_idx  ON lm_memories (kind);
-CREATE INDEX IF NOT EXISTS lm_memories_tags_idx  ON lm_memories USING GIN (tags);
-CREATE INDEX IF NOT EXISTS lm_memories_fts_idx   ON lm_memories USING GIN (fts);
-
--- Detect real[] embedding column (happens when the table was created before
--- the pgvector extension was installed — PostgreSQL silently used real[] as
--- a fallback).  Abort with a clear remediation command rather than crashing
--- on the HNSW CREATE INDEX below.
-DO $luamemo_col_check$
-DECLARE
-    col_udt text;
-BEGIN
-    SELECT udt_name INTO col_udt
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-      AND table_name   = 'lm_memories'
-      AND column_name  = 'embedding';
-    IF col_udt = '_float4' THEN
-        RAISE EXCEPTION
-            'lm_memories.embedding is typed real[] instead of vector. '
-            'The pgvector extension was not installed when the table was first created. '
-            'Fix with (replace N with your embed_dim, e.g. 384 or 1024): '
-            'ALTER TABLE lm_memories ALTER COLUMN embedding TYPE vector(N) USING NULL; '
-            'Then re-run: memo migrate | psql "$MEMO_DB_URL"';
-    END IF;
-END $luamemo_col_check$;
-
-CREATE INDEX IF NOT EXISTS lm_memories_embedding_hnsw_idx
-    ON lm_memories USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX IF NOT EXISTS lm_memories_was_truncated_idx
-    ON lm_memories (was_truncated) WHERE lm_memories.was_truncated = TRUE;
-
-CREATE OR REPLACE FUNCTION lm_memories_touch_updated_at()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = now();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS lm_memories_touch_updated_at_trg ON lm_memories;
-CREATE TRIGGER lm_memories_touch_updated_at_trg
-    BEFORE UPDATE ON lm_memories
-    FOR EACH ROW
-    EXECUTE FUNCTION lm_memories_touch_updated_at();
-
--- migration 002 / importance + decay ---------------------------------------
-
-ALTER TABLE lm_memories ADD COLUMN IF NOT EXISTS importance  REAL NOT NULL DEFAULT 1.0;
-ALTER TABLE lm_memories ADD COLUMN IF NOT EXISTS decay_rate  REAL NOT NULL DEFAULT 0.0;
-
-ALTER TABLE lm_memories DROP CONSTRAINT IF EXISTS lm_memories_importance_range;
-ALTER TABLE lm_memories ADD  CONSTRAINT lm_memories_importance_range
-    CHECK (importance >= 0.0 AND importance <= 10.0);
-
-ALTER TABLE lm_memories DROP CONSTRAINT IF EXISTS lm_memories_decay_rate_range;
-ALTER TABLE lm_memories ADD  CONSTRAINT lm_memories_decay_rate_range
-    CHECK (decay_rate >= 0.0 AND decay_rate <= 1.0);
-
--- migration 003 / knowledge-graph layer ------------------------------------
-
-CREATE TABLE IF NOT EXISTS lm_kg_facts (
-    id               BIGSERIAL PRIMARY KEY,
-    scope            TEXT        NOT NULL,
-    subject          TEXT        NOT NULL,
-    predicate        TEXT        NOT NULL,
-    object           TEXT        NOT NULL,
-    valid_from       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    valid_until      TIMESTAMPTZ,
-    source_memory_id BIGINT      REFERENCES lm_memories(id) ON DELETE SET NULL,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS lm_kg_facts_scope_idx   ON lm_kg_facts (scope);
-CREATE INDEX IF NOT EXISTS lm_kg_facts_sp_idx       ON lm_kg_facts (subject, predicate);
-CREATE INDEX IF NOT EXISTS lm_kg_facts_current_idx  ON lm_kg_facts (subject, predicate)
-    WHERE valid_until IS NULL;
-
-ALTER TABLE lm_kg_facts DROP CONSTRAINT IF EXISTS lm_kg_facts_validity_window;
-ALTER TABLE lm_kg_facts ADD  CONSTRAINT lm_kg_facts_validity_window
-    CHECK (valid_until IS NULL OR valid_until >= valid_from);
-
--- migration 004 / was_truncated flag ---------------------------------------
-
-ALTER TABLE lm_memories ADD COLUMN IF NOT EXISTS was_truncated BOOLEAN NOT NULL DEFAULT FALSE;
-
--- migration 005 / composite index (scope, kind) ----------------------------
-
-CREATE INDEX IF NOT EXISTS lm_memories_scope_kind_idx
-    ON lm_memories (scope, kind);
-
--- migration 006 / temporal retrieval index ---------------------------------
-
-CREATE INDEX IF NOT EXISTS lm_memories_created_at_scope_idx
-    ON lm_memories (scope, created_at DESC);
-
--- migration 007 / observation consolidation --------------------------------
-
-ALTER TABLE lm_memories ADD COLUMN IF NOT EXISTS consolidated_at TIMESTAMPTZ;
-
-CREATE INDEX IF NOT EXISTS lm_memories_consolidated_at_idx
-    ON lm_memories (scope, consolidated_at)
-    WHERE consolidated_at IS NULL;
-
-CREATE TABLE IF NOT EXISTS lm_observations (
-    id              BIGSERIAL PRIMARY KEY,
-    scope           TEXT    NOT NULL,
-    body            TEXT    NOT NULL,
-    proof_count     INTEGER NOT NULL DEFAULT 1
-                        CHECK (proof_count >= 1),
-    evidence_ids    BIGINT[] NOT NULL DEFAULT '{}',
-    evidence_quotes TEXT[]  NOT NULL DEFAULT '{}',
-    freshness_trend TEXT    NOT NULL DEFAULT 'new'
-                        CHECK (freshness_trend IN
-                            ('new', 'strengthening', 'stable', 'weakening', 'stale')),
-    last_reinforced TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    importance      REAL    NOT NULL DEFAULT 0.5
-                        CHECK (importance >= 0.0 AND importance <= 10.0),
-    embedding       REAL[]
-);
-
-CREATE INDEX IF NOT EXISTS lm_observations_scope_idx
-    ON lm_observations (scope);
-CREATE INDEX IF NOT EXISTS lm_observations_reinforced_idx
-    ON lm_observations (scope, last_reinforced DESC);
-
--- migration 008 / memory tiers ---------------------------------------------
-
--- Note: consolidated_at was already added in migration 007.
-ALTER TABLE lm_memories ADD COLUMN IF NOT EXISTS tier SMALLINT NOT NULL DEFAULT 1;
-
-UPDATE lm_memories SET tier = CASE
-    WHEN importance < 0.3  THEN 0
-    WHEN importance < 0.6  THEN 1
-    WHEN importance < 0.85 THEN 2
-    ELSE 3
-END
-WHERE tier = 1;
-
-CREATE INDEX IF NOT EXISTS lm_memories_tier_scope_idx
-    ON lm_memories (scope, tier);
-
--- migration 009 / reinforcement event log ----------------------------------
-
-CREATE TABLE IF NOT EXISTS lm_reinforcements (
-    id          BIGSERIAL PRIMARY KEY,
-    memory_id   BIGINT NOT NULL REFERENCES lm_memories(id) ON DELETE CASCADE,
-    scope       TEXT NOT NULL,
-    event_type  TEXT NOT NULL CHECK (event_type IN
-                    ('direct_command','mistake','reversal','praise','miss')),
-    delta       REAL NOT NULL,
-    note        TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS lm_reinforcements_memory_idx
-    ON lm_reinforcements (memory_id);
-CREATE INDEX IF NOT EXISTS lm_reinforcements_scope_type_idx
-    ON lm_reinforcements (scope, event_type);
-
--- migration 010 / retrieval feedback event log -----------------------------
-
-CREATE TABLE IF NOT EXISTS lm_retrieval_feedback (
-    id            BIGSERIAL   PRIMARY KEY,
-    scope         TEXT        NOT NULL,
-    query         TEXT        NOT NULL,
-    candidate_ids BIGINT[]    NOT NULL,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS lm_retrieval_feedback_scope_idx
-    ON lm_retrieval_feedback (scope, created_at DESC);
-CREATE INDEX IF NOT EXISTS lm_retrieval_feedback_candidates_idx
-    ON lm_retrieval_feedback USING GIN (candidate_ids);
-
--- migration 011 / 'miss' reinforcement event type (retrieval-miss signal) -----
--- A miss = retrieval failed to surface a memory that was needed (opposite of a
--- content mistake). Upgrades an existing DB by swapping the CHECK. Idempotent.
-ALTER TABLE lm_reinforcements DROP CONSTRAINT IF EXISTS lm_reinforcements_event_type_check;
-ALTER TABLE lm_reinforcements ADD CONSTRAINT lm_reinforcements_event_type_check
-    CHECK (event_type IN ('direct_command','mistake','reversal','praise','miss'));
-
--- migration 012 / persisted per-scope digest cursor (lazy auto-trigger) -------
-CREATE TABLE IF NOT EXISTS lm_digest_state (
-    scope            TEXT PRIMARY KEY,
-    last_digested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- migration 013 / per-scope learner weights + promotion audit -----------------
-CREATE TABLE IF NOT EXISTS lm_learner_weights (
-    id          BIGSERIAL   PRIMARY KEY,
-    scope       TEXT        NOT NULL,
-    kind        TEXT        NOT NULL,
-    version     INTEGER     NOT NULL,
-    weights     JSONB       NOT NULL,
-    score       REAL,
-    note        TEXT,
-    is_current  BOOLEAN     NOT NULL DEFAULT false,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (scope, kind, version)
-);
-CREATE INDEX IF NOT EXISTS lm_learner_weights_current_idx
-    ON lm_learner_weights (scope, kind, is_current);
-CREATE TABLE IF NOT EXISTS lm_promotion_runs (
-    id              BIGSERIAL   PRIMARY KEY,
-    scope           TEXT        NOT NULL,
-    kind            TEXT        NOT NULL,
-    decision        TEXT        NOT NULL,
-    new_score       REAL,
-    incumbent_score REAL,
-    n_train         INTEGER,
-    n_gate          INTEGER,
-    version         INTEGER,
-    note            TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS lm_promotion_runs_scope_idx
-    ON lm_promotion_runs (scope, kind, created_at DESC);
-MIGRATE_EOF
-}
-
-# ---------------------------------------------------------------------------
-# _check_col_list <newline-separated-column-list>
-# Shared inner loop: given a newline-separated string of present column names,
-# prints ✓/✗ for each name in _MEMO_REQUIRED_COLS[@].
-# Returns 0 if all present, 1 if any missing.
-# ---------------------------------------------------------------------------
-_check_col_list() {
-    local _list="$1"
-    local _ok=true
-    for _col in "${_MEMO_REQUIRED_COLS[@]}"; do
-        if printf '%s\n' "$_list" | grep -qx "$_col"; then
-            printf "  ✓ %s\n" "$_col"
-        else
-            printf "  ✗ %s — MISSING\n" "$_col"
-            _ok=false
-        fi
-    done
-    [[ "$_ok" == "true" ]]
-}
-
-# ---------------------------------------------------------------------------
-# _check_mem_columns <psql_url>
-# Shared helper: queries lm_memories columns and prints ✓/✗ per required
-# column from _MEMO_REQUIRED_COLS.
-# Return codes:
-#   0 — all columns present
-#   1 — one or more columns missing
-#   2 — table not found / DB unreachable (present_cols was empty)
-# Does NOT call exit — the caller decides how to handle each code.
-# ---------------------------------------------------------------------------
-_check_mem_columns() {
-    local _db="$1"
-    local _present
-    _present=$(PGPASSWORD="${PGPASSWORD:-}" psql "$_db" -tAc \
-        "SELECT column_name FROM information_schema.columns \
-         WHERE table_schema='public' AND table_name='lm_memories'" 2>/dev/null || true)
-    if [[ -z "$_present" ]]; then
-        return 2
-    fi
-    _check_col_list "$_present"
-}
-
-# ---------------------------------------------------------------------------
-# _cmd_migrate_check: diff required columns vs live DB via psql.
-# Exits 0 if schema is complete, 1 if anything is missing.
-# ---------------------------------------------------------------------------
-_cmd_migrate_check() {
-    local embed_dim="${1:-384}"
-    if [[ -z "${MEMO_DB_URL:-}" ]]; then
-        echo "memo migrate --check: MEMO_DB_URL is not set." >&2
-        exit 1
-    fi
-    if ! command -v psql &>/dev/null; then
-        echo "memo migrate --check: psql not found in PATH." >&2
-        exit 1
-    fi
-    local _rc
-    _check_mem_columns "$MEMO_DB_URL"; _rc=$?
-    if [[ "$_rc" -eq 2 ]]; then
-        echo "  ✗ lm_memories — table not found or DB unreachable"
-        echo "    Is MEMO_DB_URL correct? Run: memo migrate | psql \"\$MEMO_DB_URL\""
-        exit 1
-    fi
-    echo ""
-    if [[ "$_rc" -eq 0 ]]; then
-        echo "Schema is complete."
-    else
-        echo "Run: memo migrate | psql \"\$MEMO_DB_URL\"  to apply missing columns."
-        exit 1
-    fi
-}
-
-
-# memo migrate [--embed-dim N] [--check]
-cmd_migrate() {
-    local embed_dim=384
-    local check_mode=false
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --embed-dim) embed_dim="$2"; shift 2 ;;
-            --check)     check_mode=true; shift ;;
-            *) echo "memo migrate: unknown arg: $1" >&2; exit 1 ;;
-        esac
-    done
-    if [[ "$check_mode" == "true" ]]; then
-        _cmd_migrate_check "$embed_dim"
-        return $?
-    fi
-    if [[ "$embed_dim" -eq 384 ]]; then
-        echo "-- [warn] embed_dim defaults to 384."
-        echo "--        If your embedder outputs a different dimension (e.g. bge-m3 = 1024),"
-        echo "--        re-run with: memo migrate --embed-dim N"
-        echo "--"
-    fi
-    _cmd_migrate_sql | sed "s/vector(384)/vector(${embed_dim})/g"
 }
 
 cmd_promote() {
@@ -833,6 +729,103 @@ cmd_context() {
     fi
 }
 
+# memo embed TEXT [--compare-to TEXT] [--json] — what the configured embedder makes of
+# a text: its model and vector size (and, with --compare-to, how similar two texts
+# are); --json adds the vector itself.
+cmd_embed() {
+    require_jq
+    local text="${1:-}"
+    [[ -n "$text" && "$text" != --* ]] || {
+        echo "usage: memo embed TEXT [--compare-to TEXT] [--json]" >&2; exit 2; }
+    shift
+    local json full=false
+    json=$(jq -n --arg t "$text" '{text: $t}')
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --compare-to)
+                [[ $# -ge 2 ]] || { echo "memo embed: --compare-to needs a text" >&2; exit 2; }
+                json=$(jq --arg v "$2" '. + {compare_to: $v}' <<<"$json"); shift 2 ;;
+            --json) full=true; json=$(jq '. + {vector: true}' <<<"$json"); shift ;;
+            *) echo "usage: memo embed TEXT [--compare-to TEXT] [--json]" >&2; exit 2 ;;
+        esac
+    done
+    local out; out=$(printf '%s' "$json" | api_call embed)
+    if [[ "$full" == true ]] || ! jq -e '.ok == true' <<<"$out" >/dev/null; then
+        jq . <<<"$out"
+    else
+        jq -r '"embedder: \(.embedder)\(if .model then " (" + .model + ")" else "" end)\ndimension: \(.dim)"
+               + (if .truncated then "\ntruncated: the text was cut to fit the embedder" else "" end)
+               + (if .cosine then "\ncosine similarity: \(.cosine * 10000 | round / 10000)" else "" end)' <<<"$out"
+    fi
+    jq -e '.ok == true' <<<"$out" >/dev/null
+}
+
+# memo tune-weights [--scope S] [--samples N] [--metric M] [--json] — which
+# MEMO_HYBRID_WEIGHTS blend finds this scope's memories best: each sampled memory is
+# searched for by its own title at every blend (luamemo.tune_weights). It reports;
+# applying the result is `memo config set` (the command it prints).
+cmd_tune_weights() {
+    require_jq
+    local json full=false
+    local usage="usage: memo tune-weights [--scope SCOPE] [--samples N] [--metric r_at_1|r_at_3|r_at_5|r_at_10|mrr] [--json]"
+    json=$(jq -n --arg s "${MEMO_SCOPE:-}" 'if $s == "" then {} else {scope: $s} end')
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scope|--samples|--metric)
+                [[ $# -ge 2 ]] || { echo "memo tune-weights: $1 needs a value" >&2; exit 2; }
+                json=$(jq --arg k "${1#--}" --arg v "$2" '. + {($k): $v}' <<<"$json"); shift 2 ;;
+            --json) full=true; shift ;;
+            -h|--help) echo "$usage"; return 0 ;;
+            *) echo "$usage" >&2; exit 2 ;;
+        esac
+    done
+    local out; out=$(printf '%s' "$json" | api_call tune-weights)
+    if [[ "$full" == true ]] || ! jq -e '.ok == true' <<<"$out" >/dev/null; then
+        jq 'del(.text)' <<<"$out"
+    else
+        jq -r '.text' <<<"$out"
+    fi
+    jq -e '.ok == true' <<<"$out" >/dev/null
+}
+
+# memo kg assert|query|invalidate|timeline — the knowledge graph: facts
+# (subject, predicate, object) that hold from valid_from until invalidated, one
+# scope at a time (default $MEMO_SCOPE). The flags mirror luamemo.kg; timestamps
+# are ISO 8601 or epoch seconds.
+cmd_kg() {
+    require_jq
+    local action="${1:-}"
+    case "$action" in
+        assert|query|invalidate|timeline) shift ;;
+        *)
+            echo "usage: memo kg assert     --subject S --predicate P --object O [--valid-from T]" >&2
+            echo "                          [--source-memory ID] [--supersede] [--scope SCOPE]" >&2
+            echo "       memo kg query      [--subject S] [--predicate P] [--object O] [--at T]" >&2
+            echo "                          [--include-invalidated] [--limit N] [--scope SCOPE]" >&2
+            echo "       memo kg invalidate --subject S --predicate P [--object O] [--at T] [--scope SCOPE]" >&2
+            echo "       memo kg timeline   --subject S --predicate P [--scope SCOPE]" >&2
+            exit 2 ;;
+    esac
+    local json key
+    json=$(jq -n --arg s "${MEMO_SCOPE:-}" 'if $s == "" then {} else {scope: $s} end')
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scope|--subject|--predicate|--object|--valid-from|--at|--limit|--source-memory)
+                [[ $# -ge 2 ]] || { echo "memo kg: $1 needs a value" >&2; exit 2; }
+                key="${1#--}"; key="${key//-/_}"
+                [[ "$key" == "source_memory" ]] && key="source_memory_id"
+                json=$(jq --arg k "$key" --arg v "$2" '. + {($k): $v}' <<<"$json"); shift 2 ;;
+            --supersede|--include-invalidated)
+                key="${1#--}"; key="${key//-/_}"
+                json=$(jq --arg k "$key" '. + {($k): true}' <<<"$json"); shift ;;
+            *) echo "memo kg: unknown flag: $1" >&2; exit 2 ;;
+        esac
+    done
+    local out; out=$(printf '%s' "$json" | api_call "kg-${action}")
+    jq . <<<"$out"
+    jq -e '.ok == true' <<<"$out" >/dev/null
+}
+
 # memo brief [--scope SCOPE]
 # Print a tiny session-start digest (memory + codebase-map status + tool hints).
 # No query required. Defaults --scope to $MEMO_SCOPE. Never fails the caller —
@@ -859,7 +852,8 @@ cmd_brief() {
     local runner=""
     command -v timeout >/dev/null 2>&1 && runner="timeout -k 2 ${MEMO_BRIEF_TIMEOUT:-5}"
     local result; result=$(printf '%s' "$json" | $runner "$lua" -e \
-        "package.path='./?/init.lua;'..package.path; require('luamemo.cli.api').dispatch('brief')" \
+        "$_LUA_PATH_GUARD
+require('luamemo.cli.api').dispatch('brief')" \
         2>/dev/null) || true
     local text; text=$(printf '%s' "$result" | jq -r '.text // empty' 2>/dev/null) || true
     [[ -n "$text" ]] && printf '%s\n' "$text"
@@ -947,26 +941,33 @@ cmd_learn() {
             --dry-run)     json=$(printf '%s' "$json" | jq '. + {dry_run: true}'); shift ;;
             --min-samples) json=$(printf '%s' "$json" | jq --argjson v "$2" '. + {min_samples: $v}'); shift 2 ;;
             --margin)      json=$(printf '%s' "$json" | jq --argjson v "$2" '. + {margin: $v}'); shift 2 ;;
+            --status)      json=$(printf '%s' "$json" | jq '. + {action: "status"}'); shift ;;
+            --rollback)    json=$(printf '%s' "$json" | jq '. + {action: "rollback"}'); shift ;;
             --*)           echo "memo learn: unknown arg: $1" >&2; exit 1 ;;
             *)             json=$(printf '%s' "$json" | jq --arg v "$1" '. + {scope: $v}'); shift ;;
         esac
     done
-    printf '%s' "$json" | api_call learn | jq .
+    local out; out=$(printf '%s' "$json" | api_call learn)
+    jq . <<<"$out"
+    jq -e '.ok == true' <<<"$out" >/dev/null
 }
 
-# memo reembed --scope SCOPE [--batch N] [--dry-run]
-# Re-embeds every memory in a scope with the CURRENTLY configured embedder.
-# Needed after switching embedders (calibrate re-picking a different one on a
-# new host, or manually changing MEMO_EMBEDDER*) — two different models'
-# vector spaces are never comparable even at the same embed_dim, so existing
-# rows silently lose vector-search relevance until re-embedded (FTS still
-# works, which is exactly why this is easy to miss).
+# memo reembed --scope SCOPE | --all [--batch N] [--dry-run]
+# Re-embeds every memory in a scope (--all: every scope but an org replica, which
+# re-embeds on sync) with the CURRENTLY configured embedder. Needed after
+# switching embedders (calibrate re-picking a different one on a new host, or
+# manually changing MEMO_EMBEDDER*) — two different models' vector spaces are
+# never comparable even at the same embed_dim, so existing rows silently lose
+# vector-search relevance until re-embedded (FTS still works, which is exactly
+# why this is easy to miss). A database moves to a new vector size once every
+# scope is re-embedded.
 cmd_reembed() {
     require_jq
     local json='{}'
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --scope)   json=$(printf '%s' "$json" | jq --arg v "$2" '. + {scope: $v}'); shift 2 ;;
+            --all)     json=$(printf '%s' "$json" | jq '. + {all: true}'); shift ;;
             --batch)   json=$(printf '%s' "$json" | jq --argjson v "$2" '. + {batch: $v}'); shift 2 ;;
             --dry-run) json=$(printf '%s' "$json" | jq '. + {dry_run: true}'); shift ;;
             *)         echo "memo reembed: unknown arg: $1" >&2; exit 1 ;;
@@ -974,102 +975,57 @@ cmd_reembed() {
     done
     printf '%s' "$json" | api_call reembed | jq .
 }
-# Used by --docker-compose FILE flag in cmd_calibrate.
-# Parses a docker-compose.yml for Postgres credentials and host port,
-# then exports MEMO_DB_URL.
+
 # ---------------------------------------------------------------------------
-_parse_compose_pg() {
-    local file="$1"
-    if [[ ! -f "$file" ]]; then
-        echo "memo calibrate: --docker-compose: file not found: $file" >&2
-        return 1
-    fi
-
-    local pg_user="" pg_pass="" pg_db="" pg_port=""
-    local in_pg_service=false in_environment=false
-
-    while IFS= read -r line; do
-        # Detect a service whose image contains "postgres"
-        if [[ "$line" =~ ^[[:space:]]+image:[[:space:]].*postgres ]]; then
-            in_pg_service=true
-            in_environment=false
-        fi
-        # Detect a new 2-indent service name line (reset if leaving pg service)
-        if [[ "$in_pg_service" == true ]] && \
-           [[ "$line" =~ ^[[:space:]]{2}[a-zA-Z][a-zA-Z0-9_-]*:[[:space:]]*$ ]]; then
-            # Only reset if we've already entered the pg service block
-            # (any new 2-space service after the pg one ends its scope)
-            in_pg_service=false
-            in_environment=false
-        fi
-        if [[ "$in_pg_service" == true ]]; then
-            # Begin of environment: block
-            if [[ "$line" =~ ^[[:space:]]+environment:[[:space:]]*$ ]]; then
-                in_environment=true
-                continue
-            fi
-            # End of environment: section when another key at the same indent level appears
-            if [[ "$in_environment" == true ]] && \
-               [[ "$line" =~ ^[[:space:]]{4}[a-zA-Z] ]] && \
-               ! [[ "$line" =~ POSTGRES_ ]]; then
-                in_environment=false
-            fi
-            if [[ "$in_environment" == true ]]; then
-                # Support both "  - KEY=VALUE" list form and "KEY: VALUE" map form
-                local stripped="${line#"${line%%[! ]*}"}"   # ltrim
-                if [[ "$stripped" =~ ^-[[:space:]]POSTGRES_USER=(.*)$ ]]; then
-                    pg_user="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^POSTGRES_USER:[[:space:]]*(.*)$ ]]; then
-                    pg_user="${BASH_REMATCH[1]}"
-                fi
-                if [[ "$stripped" =~ ^-[[:space:]]POSTGRES_PASSWORD=(.*)$ ]]; then
-                    pg_pass="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^POSTGRES_PASSWORD:[[:space:]]*(.*)$ ]]; then
-                    pg_pass="${BASH_REMATCH[1]}"
-                fi
-                if [[ "$stripped" =~ ^-[[:space:]]POSTGRES_DB=(.*)$ ]]; then
-                    pg_db="${BASH_REMATCH[1]}"
-                elif [[ "$stripped" =~ ^POSTGRES_DB:[[:space:]]*(.*)$ ]]; then
-                    pg_db="${BASH_REMATCH[1]}"
-                fi
-            fi
-            # ports: "HOST_PORT:5432"
-            if [[ "$line" =~ ([0-9]+):5432 ]]; then
-                pg_port="${BASH_REMATCH[1]}"
-            fi
-        fi
-    done < "$file"
-
-    pg_user="${pg_user:-postgres}"
-    pg_db="${pg_db:-luamemo}"
-    pg_port="${pg_port:-5432}"
-
-    if [[ -z "$pg_pass" ]]; then
-        echo "memo calibrate: --docker-compose: POSTGRES_PASSWORD not found in $file" >&2
-        echo "  Set MEMO_DB_URL manually or add POSTGRES_PASSWORD to the Compose file." >&2
-        return 1
-    fi
-
-    export MEMO_DB_URL="postgresql://${pg_user}:${pg_pass}@localhost:${pg_port}/${pg_db}"
-    echo "  Docker Compose: detected Postgres → MEMO_DB_URL=${MEMO_DB_URL//:${pg_pass}@/:***@}"
+# Settings files. _save_rc_key FILE KEY VALUE writes or replaces one KEY=VALUE line
+# with luamemo's own writer (luamemo.cli._common.rc_set, as memo config set does): the
+# value single-quoted (read back literally — _load_rc reads the file as data), a
+# newline refused; a project's file only one memo wrote or you trusted, never through
+# a symlink, 0600 and atomic, and trusted as written.
+# _rc_get FILE KEY reads one value back as _load_rc reads it (_rc_value: any quoting;
+# the last line for KEY wins); nothing when FILE or KEY is missing.
+# ---------------------------------------------------------------------------
+_rc_get() {
+    local line raw=""
+    [[ -f "$1" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $_RC_LINE_RE && "${BASH_REMATCH[2]}" == "$2" ]]; then raw="${BASH_REMATCH[3]}"; fi
+    done < "$1"
+    if [[ -n "$raw" ]]; then _rc_value "$raw"; fi
 }
 
-# ---------------------------------------------------------------------------
-# Write or replace a KEY=VALUE line in a config file.
-# Creates the file if it does not exist.  If the key already exists it is
-# replaced in-place so the file never accumulates duplicate entries.
-# ---------------------------------------------------------------------------
 _save_rc_key() {
-    local file="$1" key="$2" value="$3"
-    if [[ -f "$file" ]] && grep -q "^${key}=" "$file"; then
-        local tmp; tmp=$(mktemp "${file}.XXXXXX")
-        grep -v "^${key}=" "$file" > "$tmp" || true
-        printf '%s=%s\n' "$key" "$value" >> "$tmp"
-        mv "$tmp" "$file"
-    else
-        [[ ! -f "$file" ]] && (umask 177 && touch "$file")
-        printf '%s=%s\n' "$key" "$value" >> "$file"
+    local lua; lua=$(find_lua) || _no_lua
+    MEMO__RC_FILE="$1" MEMO__RC_KEY="$2" MEMO__RC_VALUE="$3" "$lua" -e "$_LUA_PATH_GUARD
+local ok, err = require('luamemo.cli._common').rc_set(os.getenv('MEMO__RC_FILE'), os.getenv('MEMO__RC_KEY'),
+    os.getenv('MEMO__RC_VALUE'))
+if not ok then io.stderr:write('memo: ', tostring(err), '\n'); os.exit(1) end"
+}
+
+# ~/.memorc (the older name of the user's settings file) → ~/.luamemorc: each setting it
+# has that ~/.luamemorc doesn't is moved over (a setting already there is kept), then
+# ~/.memorc is removed and the user file read again (the project's still wins).
+_migrate_memorc() {
+    local old="$HOME/.memorc" new="$HOME/.luamemorc" line key raw moved=0 kept=0
+    [[ -f "$old" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ $_RC_LINE_RE ]] || continue
+        key="${BASH_REMATCH[2]}"; raw="${BASH_REMATCH[3]}"
+        if [[ -f "$new" ]] && grep -q "^\(export \)\?${key}=" "$new"; then
+            kept=$((kept + 1))
+        else
+            _save_rc_key "$new" "$key" "$(_rc_value "$raw")" && moved=$((moved + 1))
+        fi
+    done < "$old"
+    rm -f "$old"
+    echo "Moved ~/.memorc into ~/.luamemorc: $moved setting(s) moved, $kept already set there (kept);" \
+        "~/.memorc removed."
+    local before="${MEMO_DB:-}"
+    [[ -f "$new" ]] && _load_rc "$new"
+    if [[ -n "${MEMO_DB:-}" && "${MEMO_DB:-}" != "$before" ]]; then
+        _MEMO_CONFIG_SOURCE="global"; _MEMO_USER_DB_FILE="~/.luamemorc"
     fi
+    _load_project_rc || true
 }
 
 # Write key=value only when the key is not already present in the file.
@@ -1078,22 +1034,234 @@ _save_rc_key() {
 _save_rc_key_if_absent() {
     local file="$1" key="$2" value="$3"
     [[ -f "$file" ]] && grep -q "^${key}=" "$file" && return 0
-    [[ ! -f "$file" ]] && (umask 177 && touch "$file")
-    printf '%s=%s\n' "$key" "$value" >> "$file"
+    _save_rc_key "$file" "$key" "$value"
 }
 
-# Save MEMO_DB_URL to .luamemorc and print the standard credential tip.
-_save_db_url_rc() {
-    _save_rc_key "$PWD/.luamemorc" "MEMO_DB_URL" "$1"
-    echo "  Saved to .luamemorc — future runs in this directory use this database."
-    echo "  Tip: add .luamemorc to .gitignore if the URL contains credentials."
+# Save MEMO_DB (the project's database: a name, or a path) to .luamemorc.
+_save_db_rc() {
+    _save_rc_key "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_DB" "$1"
+    _gitignore_local "$_MEMO_PROJECT_DIR" ".luamemorc"
+}
+
+# .luamemorc holds this machine's settings (its database, its embedder and model
+# paths): in a git work tree, append it to the .gitignore next to it unless it's
+# ignored already. A file git already TRACKS can't be ignored — then say how to
+# untrack it.
+_gitignore_local() {
+    local dir="$1" rel="$2"
+    git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+    if git -C "$dir" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+        echo "  Note: $rel is tracked by git, but it holds this machine's settings (database,"
+        echo "        embedder) — untrack it (git rm --cached $rel) unless every machine shares them"
+        echo "        (each machine then runs memo config trust once it has reviewed the file)."
+        return 0
+    fi
+    git -C "$dir" check-ignore -q -- "$rel" 2>/dev/null && return 0
+    local gi="$dir/.gitignore"
+    [[ -s "$gi" && -n "$(tail -c1 "$gi")" ]] && printf '\n' >> "$gi"
+    printf '%s\n' "$rel" >> "$gi"
+    echo "  Added $rel to .gitignore (it holds this machine's settings)."
+}
+
+# The name of the project's own database: the directory's name (letters, digits,
+# '.', '_', '-') and a checksum of its full path, so two projects that share a
+# directory name never share a database. e.g. myapp-1c0d4e8f
+_project_db_name() {
+    local dir; dir=$(cd "$1" 2>/dev/null && pwd -P) || dir="$1"
+    local base; base=$(printf '%s' "${dir##*/}" | tr -c 'A-Za-z0-9._-' '-' | tr -s '-' | sed 's/^[^A-Za-z0-9]*//' | cut -c1-40)
+    [[ -n "$base" ]] || base="project"
+    printf '%s-%08x' "$base" "$(printf '%s' "$dir" | cksum | cut -d' ' -f1)"
+}
+
+# ---------------------------------------------------------------------------
+# Federation setup (called from cmd_calibrate phase 2.6). No secret is ever
+# typed, printed or stored in the project: each side has an Ed25519 identity
+# key in the per-user keyring (~/.config/luamemo), and only PUBLIC values —
+# the central's address and key fingerprint, pairing codes — appear here.
+# ---------------------------------------------------------------------------
+
+# Canonical fingerprint for comparisons (case, dashes, spaces, O→0, I/L→1).
+_norm_fp() { printf '%s' "$1" | tr 'a-z' 'A-Z' | tr -d ' -' | tr 'OIL' '011'; }
+
+# The database this machine already uses for the org with this central key
+# (per-user registry). Empty when none.
+_org_db_for_fp() {
+    local lua="$1" fp="$2"
+    [[ -n "$fp" ]] || return 0
+    MEMO__ORG_FP="$fp" "$lua" -e "$_LUA_PATH_GUARD
+local e = require('luamemo.federation.registry').get(os.getenv('MEMO__ORG_FP'))
+if e and e.db then io.write(e.db) end" 2>/dev/null || true
+}
+
+# Re-read .luamemorc after `memo org link|adopt` pointed it at the org database
+# and its embedder (keys it removed must not linger in this shell).
+_reload_db_rc() {
+    unset MEMO_DB MEMO_EMBEDDER MEMO_EMBEDDER_URL MEMO_EMBEDDER_ADAPTER MEMO_EMBEDDER_MODEL \
+          MEMO_GGUF_MODEL MEMO_EMBED_DIM MEMO_EMBED_MAX_CHARS
+    _load_project_rc || true
+    _gitignore_local "$_MEMO_PROJECT_DIR" ".luamemorc"   # it now names the org database
+}
+
+# Leaving the org (calibrate --role solo): last push, replica cleanup, keys removed.
+_calibrate_org_leave() {
+    local lua="$1"
+    grep -q '^MEMO_ORG_URL=' "$_MEMO_PROJECT_DIR/.luamemorc" 2>/dev/null || return 0
+    echo ""
+    echo "Federation: leaving the org (this project goes back to solo)"
+    _run_org "$lua" leave --project "$_MEMO_PROJECT_DIR" 2>&1 | sed 's/^/    /'
+    unset MEMO_ORG_URL MEMO_ORG_FINGERPRINT
+}
+
+# _run_org <lua> <subcommand…> — `memo org …` without exec (cmd_local_lua execs).
+_run_org() {
+    local lua="$1"; shift
+    _lua_run "$lua" org "$@"
+}
+
+# Dev: pin the central (URL + fingerprint), create this device's key, ask to
+# pair, and sync once approved. Only public values are ever shown or stored.
+_calibrate_org_dev() {
+    local lua="$1" url="$2" fingerprint="$3"
+    echo ""
+    echo "Federation: joining org central $(_redact_url "$url") as a dev"
+    [[ -z "$fingerprint" ]] && fingerprint="${MEMO_ORG_FINGERPRINT:-}"
+    if [[ -z "$fingerprint" ]]; then
+        if [[ ! -t 0 ]]; then
+            echo "  No central fingerprint given — ask your org admin for it (\`memo org status\` on"
+            echo "  the central shows it) and re-run with --org-fingerprint XXXX-XXXX-XXXX-XXXX-XXXX."
+            return 1
+        fi
+        # Interactive: show what the central presents; the PERSON compares it
+        # with the fingerprint the org admin gave them. Never pinned blindly.
+        local probe fp org
+        if ! probe=$( export MEMO_ORG_URL="$url"; _run_org "$lua" probe 2>&1 ); then
+            printf '%s\n' "$probe" | sed 's/^/    /'
+            echo "  Cannot read the central's identity — check the address (local network / VPN only)."
+            return 1
+        fi
+        fp=$(printf '%s\n' "$probe" | awk '/^fingerprint:/{print $2}')
+        org=$(printf '%s\n' "$probe" | sed -n 's/^org: *//p')
+        echo "  The central at $(_redact_url "$url") presents:"
+        echo "    fingerprint  $fp"
+        echo "    org          $org"
+        echo "  Compare the fingerprint with the one your org admin gave you, character by character."
+        if ! _confirm_yn "Does it match exactly?"; then
+            echo "  Not pinned — nothing configured. If it doesn't match, tell your org admin."
+            return 1
+        fi
+        fingerprint="$fp"
+    fi
+    # A different central key = a different org: leave the old one first (last
+    # push; its replica goes when no other project here still uses it). The same
+    # key at a new address is just an address update.
+    local old_fp
+    old_fp=$(_rc_get "$_MEMO_PROJECT_DIR/.luamemorc" MEMO_ORG_FINGERPRINT)
+    if [[ -n "$old_fp" && "$(_norm_fp "$old_fp")" != "$(_norm_fp "$fingerprint")" ]]; then
+        echo "  This project was federated with another org (central ${old_fp}) — leaving it first:"
+        _run_org "$lua" leave --project "$_MEMO_PROJECT_DIR" 2>&1 | sed 's/^/    /'
+    fi
+    export MEMO_ORG_URL="$url" MEMO_ORG_FINGERPRINT="$fingerprint"
+    _save_rc_key "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_ORG_URL" "$url"
+    _save_rc_key "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_ORG_FINGERPRINT" "$fingerprint"
+    echo "  Saved MEMO_ORG_URL + MEMO_ORG_FINGERPRINT to .luamemorc (public values)"
+    # One local database per org: the first project's database becomes the org
+    # database on this machine, later projects join it (or copy into it).
+    local pscope="${scope:-${MEMO_SCOPE:-repo:$(basename "$_MEMO_PROJECT_DIR")}}" link_out link_action
+    link_out=$(_run_org "$lua" link --project "$_MEMO_PROJECT_DIR" --scope "$pscope" 2>&1) || true
+    printf '%s\n' "$link_out" | grep -v '^LINK=' | sed 's/^/    /'
+    link_action=$(printf '%s\n' "$link_out" | sed -n 's/^LINK=//p')
+    case "$link_action" in
+        conflict)
+            unset MEMO_ORG_URL MEMO_ORG_FINGERPRINT   # link removed them from .luamemorc
+            echo "  Not joined (one org per database)."
+            return 1 ;;
+        switched|same)
+            _reload_db_rc ;;
+        adopt*)
+            if [[ -t 0 ]] && _confirm_yn "Copy this project's ${link_action#adopt } memories into the org database and switch to it (the current database is left as is)?"; then
+                _run_org "$lua" adopt --project "$_MEMO_PROJECT_DIR" --scope "$pscope" 2>&1 | sed 's/^/    /'
+                _reload_db_rc
+            else
+                echo "  Kept this project's own database (still federated). To move it later: memo org adopt"
+            fi ;;
+    esac
+    echo "  Pairing this device:"
+    local out rc
+    out=$(_run_org "$lua" pair 2>&1); rc=$?
+    printf '%s\n' "$out" | sed 's/^/    /'
+    if [[ $rc -ne 0 ]]; then
+        echo "  Pairing failed — the config is kept; retry with: memo org pair"
+        return 1
+    fi
+    local approved=false
+    if printf '%s\n' "$out" | grep -q '^status: *approved'; then
+        approved=true
+    elif [[ -t 0 ]] && _confirm_yn "Wait here while your org admin approves the code (up to 3 minutes)?"; then
+        _run_org "$lua" pair --wait 180 2>&1 | sed 's/^/    /'
+        [[ "${PIPESTATUS[0]}" -eq 0 ]] && approved=true
+    fi
+    if [[ "$approved" == true ]]; then
+        echo "  First sync (read-only org replica + promoted weights):"
+        _run_org "$lua" sync 2>&1 | sed 's/^/    /'
+        [[ "${PIPESTATUS[0]}" -eq 0 ]] \
+            || echo "  First sync failed — it retries on the next session start, org search, or: memo org sync"
+    else
+        echo "  Once your org admin approves the code: memo org sync (sessions also sync on their own)"
+    fi
+}
+
+# Org central: persist the role, create the central identity key, print the
+# public fingerprint devs pin and the operating recipe.
+_calibrate_org_central() {
+    local lua="$1" name="$2"
+    echo ""
+    echo "Federation: configuring this instance as the org central for org:${name}"
+    _save_rc_key "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_ROLE" "org"
+    _save_rc_key "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_ORG_NAME" "$name"
+    export MEMO_ROLE=org MEMO_ORG_NAME="$name"
+    echo "  Saved MEMO_ROLE + MEMO_ORG_NAME to .luamemorc"
+    local fp
+    fp=$("$lua" -e "$_LUA_PATH_GUARD
+        local k = require('luamemo.federation.keys')
+        local pk = assert(k.ensure_identity('central'))
+        io.write(k.fingerprint(pk))" 2>&1) || {
+        echo "  ERROR: could not create the central identity key: $fp" >&2
+        return 1
+    }
+    echo "  Central identity key ready (per-user keyring, encrypted) — fingerprint: $fp"
+    echo ""
+    _run_org "$lua" status 2>&1 | sed 's/^/    /'
+    [[ "${PIPESTATUS[0]}" -eq 0 ]] || return 1
+    # Suggest an address devs can reach: the Tailscale IPv4 when present, else a
+    # typical LAN address (192.168.*, then 10.* — Docker bridges usually sit in
+    # 172.17–19.*), else whatever comes first.
+    local host=""
+    command -v tailscale >/dev/null 2>&1 && host=$(tailscale ip -4 2>/dev/null | head -1)
+    [[ -z "$host" ]] && host=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '
+        /^192\.168\./ { if (!a) a = $0 } /^10\./ { if (!b) b = $0 } NF { if (!c) c = $0 }
+        END { print (a ? a : (b ? b : c)) }')
+    [[ -z "$host" ]] && host="<this machine's LAN / Tailscale IP>"
+    cat <<EOF
+
+  Next:
+    memo serve --host ${host} --port 8765
+                                      # local network only; encrypted, key-authenticated
+    memo org directives ./standards   # Markdown standards → protected core tier (re-run on change)
+    memo org devs pending             # pairing requests; approve with the code the dev reads you:
+    memo org devs approve <CODE>
+    memo org devs clear-pending       # junk in the queue: drop every pending request
+    memo org review                   # devs' knowledge proposals — approve / reject (your decision)
+    memo org aggregate                # digest + directives-gated promotion (schedule it, e.g. hourly)
+  Devs join with (all public values — safe to share in chat or docs):
+    memo calibrate --org-url http://${host}:8765 --org-fingerprint ${fp}
+EOF
 }
 
 # ---------------------------------------------------------------------------
 # memo setup — create SETUP_CHECK for first-run agent-guided verification.
 # ---------------------------------------------------------------------------
 cmd_setup() {
-    local root="." force=false
+    local root="$_MEMO_PROJECT_DIR" force=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --root)  root="$2"; shift 2 ;;
@@ -1120,30 +1288,25 @@ when `memo calibrate` completes successfully. Do not commit this file.
 
 If you are an AI agent, complete these steps in order:
 
-  1. Verify database connectivity and table presence:
-
-         memo ping
-
-     Expected output: three green checks (DB, table, embedder).
-     If the embedder check fails, that is non-fatal — DB and table are required.
-
-  2. Apply schema migrations if the table is missing (idempotent):
-
-         memo migrate | psql "$MEMO_DB_URL"
-
-     Skip this step if `memo ping` reported the table as present.
-     `memo calibrate` will also offer to run migrations automatically.
-
-  3. Run the full setup (host probe, schema validation, codebase ingest,
-     IDE/MCP config detection):
+  1. Run the full setup (host probe, this project's database, codebase
+     ingest, IDE/MCP config detection):
 
          memo calibrate --scope <your-project-scope>
 
      Replace <your-project-scope> with a short identifier for this project
      (e.g. "myapp" or "repo:myproject"). All ingested memories are tagged
      with this scope so they do not pollute unrelated projects.
+     The database is a local file calibrate creates for this project (in
+     ~/.local/share/luamemo) — there is no database server to set up.
 
-  4. Confirm success:
+  2. Verify:
+
+         memo ping
+
+     Expected: [PASS] for SQLite, libsodium, Database and Memories. An
+     Embedder failure means the embedder isn't reachable — writes need it.
+
+  3. Confirm success:
      `memo calibrate` will print "First-run complete: SETUP_CHECK removed."
      and delete this file. If the file is still present, calibrate did not
      finish cleanly — check the output for errors and re-run.
@@ -1167,9 +1330,10 @@ SETUP_EOF
 # memo calibrate — three-phase host probe, corpus health check, codebase ingest.
 # ---------------------------------------------------------------------------
 cmd_calibrate() {
-    local root="." scope="" dry_run=false no_git=false no_comments=false probe_only=false
-    local no_migrate=false no_mcp=false no_plugin=false dc_file="" keep_embedder=false
-    local lua_extra_flags=""
+    local root="$_MEMO_PROJECT_DIR" scope="" dry_run=false no_git=false no_comments=false probe_only=false
+    local no_mcp=false no_plugin=false keep_embedder=false db_flag=""
+    local lua_extra_args=()
+    local role="" org_url="" org_fingerprint="" org_name=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1177,26 +1341,47 @@ cmd_calibrate() {
                 cat <<'EOF'
 Usage: memo calibrate [OPTIONS]
 
-Probe the environment, configure luamemo, and write .vscode/mcp.json.
+Probe the environment, set up this project's database, configure luamemo, and
+write .vscode/mcp.json.
 
 Options:
   --scope SCOPE         Memory scope for calibration (default: repo:<basename>)
-  --root DIR            Project root directory (default: .)
+  --root DIR            The project's directory (default: the nearest folder from
+                        here up with a .luamemorc, else the current one) — DIR
+                        becomes a project of its own
+  --db NAME|PATH        The database to use (default: this project's own, a file
+                        in ~/.local/share/luamemo named after the project)
   --no-mcp              Skip writing .vscode/mcp.json
   --no-plugin           Skip installing the VS Code agent plugin
   --keep-embedder       Do not overwrite existing embedder config in .luamemorc
-  --probe-only          Run host probe only; skip codebase ingest
-  --no-migrate          Skip applying DB migrations
+  --probe-only          Run host probe only; skip the database and codebase ingest
   --no-git              Skip git-history scan
   --no-comments         Skip code comment extraction
-  --docker-compose FILE Parse DB credentials from a docker-compose file
   --dry-run             Show what would be written without writing
   --multilingual        Include non-Lua source files in scan
   --long                Allow longer memory bodies
-  --hosted              Optimise for hosted (non-local) embedder
   --allow-hash          Allow hash embedder (normally skipped in calibrate)
+  --no-gguf             Never pick / suggest the in-process GGUF embedder
   --write PATH          Write scan output to a file instead of DB
   -h, --help            Show this help and exit
+
+Federation (optional — see README "Federation"):
+  --org-url URL         Join an org central as a dev (local network / VPN only):
+                        read-only org replica + feedback push. Creates this
+                        device's key and asks the central to pair it — the org
+                        admin approves the code it shows. Nothing secret is typed.
+  --org-fingerprint FP  The central's key fingerprint (public — from the org admin)
+                        All of one org's projects on this machine share one
+                        database; a project with its own memories is offered a
+                        copy into it (memo org adopt). A different central =
+                        a different org: the old one is left first.
+  --role solo           Leave the org this project was federated with (last push;
+                        the replica goes when no other project here uses it)
+  --role org            Configure THIS instance as the org central (with
+  --org-name NAME       --org-name): persists the role, creates the central's
+                        identity key, prints its fingerprint + the serve /
+                        pairing / directives / aggregate recipe; skips the
+                        per-dev phases (ingest, MCP, plugin)
 EOF
                 exit 0
                 ;;
@@ -1206,77 +1391,164 @@ EOF
             --no-git)      no_git=true;      shift   ;;
             --no-comments) no_comments=true; shift   ;;
             --probe-only)  probe_only=true;  shift   ;;
-            --no-migrate)  no_migrate=true;  shift   ;;
+            --db)          db_flag="$2";     shift 2 ;;
             --no-mcp)      no_mcp=true;      shift   ;;
             --no-plugin)   no_plugin=true;   shift   ;;
             --keep-embedder) keep_embedder=true; shift ;;
-            --docker-compose) dc_file="$2";  shift 2 ;;
-            --non-interactive|--multilingual|--long|--hosted|--allow-hash)
-                lua_extra_flags+="[==[${1}]==],"; shift ;;
+            --non-interactive|--multilingual|--long|--allow-hash|--no-gguf)
+                lua_extra_args+=("$1"); shift ;;
             --write)
-                lua_extra_flags+="[==[--write]==],[==[${2}]==],"; shift 2 ;;
+                lua_extra_args+=(--write "$2"); shift 2 ;;
+            --role)        role="$2";        shift 2 ;;
+            --org-url)     org_url="$2";     shift 2 ;;
+            --org-fingerprint) org_fingerprint="$2"; shift 2 ;;
+            --org-name)    org_name="$2";    shift 2 ;;
             *) echo "memo calibrate: unknown arg: $1" >&2; exit 1 ;;
         esac
     done
 
-    local lua; lua=$(find_lua) || {
-        echo "memo: no Lua interpreter found (tried lua5.1, luajit, lua5.3, lua5.4, lua)" >&2
-        exit 1
-    }
+    # Federation flags are validated up front — before anything is written.
+    case "$role" in
+        ""|solo|dev) ;;
+        org)
+            if [[ -n "$org_url" ]]; then
+                echo "memo calibrate: --role org is the central itself; --org-url is for devs" >&2; exit 1
+            fi
+            if ! [[ "$org_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || (( ${#org_name} > 64 )); then
+                echo "memo calibrate: --role org needs --org-name NAME (letters, digits, . _ -; at most 64)" >&2
+                exit 1
+            fi ;;
+        *) echo "memo calibrate: --role must be solo, dev or org" >&2; exit 1 ;;
+    esac
+    if [[ "$role" == "dev" && -z "$org_url" ]]; then
+        echo "memo calibrate: --role dev needs --org-url URL" >&2; exit 1
+    fi
+    if [[ -n "$org_url" ]] && ! [[ "$org_url" =~ ^https?://[^[:space:]]+$ ]]; then
+        echo "memo calibrate: --org-url must be an http(s):// URL" >&2; exit 1
+    fi
+    if [[ -n "$org_fingerprint" && -z "$org_url" ]]; then
+        echo "memo calibrate: --org-fingerprint needs --org-url" >&2; exit 1
+    fi
+    if [[ -n "$db_flag" && "$db_flag" != */* ]] && ! [[ "$db_flag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo "memo calibrate: --db NAME is letters, digits, '.', '_' or '-' (or a path with a '/')" >&2; exit 1
+    fi
+
+    local lua; lua=$(find_lua) || _no_lua
+
+    # A .luamemorc memo didn't write (it came with the repository or a download, or was
+    # edited): calibrate would build on it.
+    if [[ -n "$_MEMO_RC_UNTRUSTED" ]]; then
+        echo "memo calibrate: this project's .luamemorc — $(_rc_untrusted_why "$_MEMO_PROJECT_DIR/.luamemorc")" >&2
+        echo "  — and you haven't trusted it. Review it, then either trust it (memo config trust) or remove it" >&2
+        echo "  (calibrate writes this machine's own)." >&2
+        return 1
+    fi
+
+    # ~/.memorc is no longer read: its settings move into ~/.luamemorc first.
+    [[ "$dry_run" != true && "$probe_only" != true ]] && _migrate_memorc
+    [[ "$_MEMO_PROJECT_DIR" != "$PWD" ]] && echo "Project: $_MEMO_PROJECT_DIR"
+
+    # The settings, checked once for the whole run (the Lua steps below stay quiet):
+    # a value that doesn't parse, a MEMO_ name luamemo doesn't read.
+    local _cfg_check
+    _cfg_check=$(MEMO__PROJECT_DIR="$_MEMO_PROJECT_DIR" _lua_run "$lua" config check 2>&1) \
+        || { echo "Settings:"; printf '%s\n' "$_cfg_check" | sed 's/^/  /'; }
+    export MEMO__SETTINGS_CHECKED=1
+
+    # ── Phase 0: the in-process GGUF runtime, prebuilt — when this release ships one
+    # for this machine and the shim isn't there yet: offered, so the probe below can
+    # find the GGUF embedder ready (no compiler needed). The model stays the user's step.
+    if [[ "$probe_only" != true && "$dry_run" != true && "${keep_embedder:-false}" != true \
+          && " ${lua_extra_args[*]+${lua_extra_args[*]}} " != *" --no-gguf "* ]]; then
+        _calibrate_gguf_runtime "$lua"
+    fi
 
     # ── Phase 1: host probe + embedder recommendation (no DB required) ──────
-    # Apply --docker-compose credentials before probe so they're visible in output.
-    if [[ -n "$dc_file" ]]; then
-        _parse_compose_pg "$dc_file" || true
-        if [[ -n "${MEMO_DB_URL:-}" ]]; then
-            _save_db_url_rc "$MEMO_DB_URL"
+    # The probe writes its recommendation as MEMO_*='value' lines to a temp file;
+    # the embedder settings are read back from it.
+    local _probe_tmp; _probe_tmp=$(mktemp /tmp/luamemo_probe_XXXXXX)
+    _lua_run "$lua" calibrate --root "$root" ${lua_extra_args[@]+"${lua_extra_args[@]}"} --write "$_probe_tmp"
+    local _probe_embed_dim _probe_eloc _probe_eadp _probe_eurl _probe_emdl _probe_emxc
+    _probe_embed_dim=$(_rc_get "$_probe_tmp" MEMO_EMBED_DIM)
+    _probe_eloc=$(_rc_get "$_probe_tmp" MEMO_EMBEDDER)
+    _probe_eadp=$(_rc_get "$_probe_tmp" MEMO_EMBEDDER_ADAPTER)
+    _probe_eurl=$(_rc_get "$_probe_tmp" MEMO_EMBEDDER_URL)
+    _probe_emdl=$(_rc_get "$_probe_tmp" MEMO_EMBEDDER_MODEL)
+    [[ -n "$_probe_emdl" ]] || _probe_emdl=$(_rc_get "$_probe_tmp" MEMO_GGUF_MODEL)
+    _probe_emxc=$(_rc_get "$_probe_tmp" MEMO_EMBED_MAX_CHARS)
+    [[ -n "$_probe_embed_dim" ]] || _probe_embed_dim=384
+    rm -f "$_probe_tmp"
+    [[ "$probe_only" == true ]] && return 0
+
+    # ── Phase 2: the project's database ─────────────────────────────────────
+    # A SQLite file — no server to set up: it is created, with its schema, on
+    # first open. Which one (first match wins):
+    #   1. --db NAME|PATH
+    #   2. the one the project's .luamemorc names (the project is configured)
+    #   3. MEMO_DB exported in this shell — not one from ~/.memorc / ~/.luamemorc:
+    #      that one is every project's, and a project never takes it over silently
+    #   4. joining an org this machine already belongs to → that org's database
+    #      (one database per org, shared by its projects)
+    #   5. the project's own, named after it: <directory>-<checksum>
+    local _rc_db=""
+    [[ -f "$_MEMO_PROJECT_DIR/.luamemorc" ]] && _rc_db=$(_rc_get "$_MEMO_PROJECT_DIR/.luamemorc" MEMO_DB)
+    echo ""
+    if [[ -n "$db_flag" ]]; then
+        export MEMO_DB="$db_flag"
+        echo "Database: ${MEMO_DB} (--db)"
+    elif [[ -n "$_rc_db" ]]; then
+        export MEMO_DB="$_rc_db"
+        echo "Database: ${MEMO_DB} (this project's, from .luamemorc)"
+    else
+        if [[ "${_MEMO_CONFIG_SOURCE:-}" == "global" ]]; then
+            echo "Note: ${_MEMO_USER_DB_FILE:-~/.luamemorc} sets MEMO_DB=${MEMO_DB:-} for every project — this project gets its own"
+            echo "      database; to use that one instead: memo calibrate --db ${MEMO_DB:-}"
+            unset MEMO_DB
+        fi
+        if [[ -n "${MEMO_DB:-}" ]]; then
+            echo "Database: ${MEMO_DB} (MEMO_DB)"
+        else
+            local _odb; _odb=$(_org_db_for_fp "$lua" "${org_fingerprint:-${MEMO_ORG_FINGERPRINT:-}}")
+            if [[ -n "$_odb" ]]; then
+                export MEMO_DB="$_odb"
+                echo "Database: ${MEMO_DB} (this org's database on this machine, shared by its projects)"
+            else
+                MEMO_DB=$(_project_db_name "$_MEMO_PROJECT_DIR")
+                export MEMO_DB
+                echo "Database: ${MEMO_DB} (this project's own)"
+            fi
         fi
     fi
-
-    # Run probe. Write config snippet to a temp file so we can extract embed_dim
-    # and pass it to cmd_migrate later (avoids vector(384) hardcode mismatch).
-    local _probe_tmp; _probe_tmp=$(mktemp /tmp/luamemo_probe_XXXXXX.lua)
-    "$lua" -e "require('luamemo.cli.calibrate').run({[==[--root]==],[==[${root}]==],${lua_extra_flags}[==[--write]==],[==[${_probe_tmp}]==]})"
-    local _probe_embed_dim=384
-    local _probe_eadp="" _probe_eurl="" _probe_emdl="" _probe_emxc=""
-    if [[ -s "$_probe_tmp" ]]; then
-        local _awk_out
-        _awk_out=$(awk '
-            /embed_dim[[:space:]]*=[[:space:]]*[0-9]/{match($0,/[0-9]+/);dim=substr($0,RSTART,RLENGTH)}
-            /embedder_local[[:space:]]*=/{match($0,/"[^"]*"/);loc=substr($0,RSTART+1,RLENGTH-2)}
-            /embedder_adapter[[:space:]]*=/{match($0,/"[^"]*"/);adp=substr($0,RSTART+1,RLENGTH-2)}
-            /embedder_url[[:space:]]*=/{match($0,/"[^"]*"/);url=substr($0,RSTART+1,RLENGTH-2)}
-            /embedder_model[[:space:]]*=/{match($0,/"[^"]*"/);mdl=substr($0,RSTART+1,RLENGTH-2)}
-            /embed_max_chars[[:space:]]*=[[:space:]]*[0-9]/{match($0,/[0-9]+/);mxc=substr($0,RSTART,RLENGTH)}
-            END{printf "%s\t%s\t%s\t%s\t%s\t%s\n",dim,loc,adp,url,mdl,mxc}
-        ' "$_probe_tmp")
-        IFS=$'\t' read -r _probe_embed_dim _probe_eloc _probe_eadp _probe_eurl _probe_emdl _probe_emxc <<< "$_awk_out"
-        [[ -n "$_probe_embed_dim" ]] || _probe_embed_dim=384
+    if [[ "$dry_run" != true && "$MEMO_DB" != "$_rc_db" ]]; then
+        _save_db_rc "$MEMO_DB"
+        echo "  Saved MEMO_DB to .luamemorc — memo and the MCP server use this database."
     fi
-    rm -f "$_probe_tmp"
-    # Persist probe-recommended embedder config to .luamemorc if DB is already
-    # set (guard: don't create a partial config before DB is configured).
-    # Use "write if absent" semantics so that existing user-configured values
-    # (e.g. a host-side MEMO_EMBEDDER_URL set by a prior docker-compose detect)
-    # are never clobbered by the probe, which just echoes back whatever URL was
-    # already in the environment.
-    # --keep-embedder skips this block entirely so users can re-run calibrate
-    # without touching their working embedder config.
-    if [[ "$keep_embedder" != true ]] && [[ -n "${MEMO_DB_URL:-}" ]]; then
+    # Open it (created when new) and check what luamemo runs on.
+    local _ping_out _ping_rc=0
+    _ping_out=$(_lua_run "$lua" ping --table 2>&1) || _ping_rc=$?
+    printf '%s\n' "$_ping_out" | sed 's/^/  /'
+    if [[ "$_ping_rc" -ne 0 ]]; then
+        echo "  The database can't be used — fix what FAIL names above, then re-run: memo calibrate" >&2
+        return 1
+    fi
+
+    # ── The embedder: the probe's recommendation, recorded in .luamemorc ────
+    # Write-if-absent: a value the user set (or an earlier run recorded) is kept —
+    # the probe only echoes back what it found in the environment anyway.
+    # --keep-embedder leaves the embedder settings alone entirely.
+    if [[ "$keep_embedder" != true && "$dry_run" != true ]]; then
         # Embedder-switch warning: two different embedders' vectors are NEVER
         # comparable, even at the same embed_dim — existing rows silently lose
         # vector-search relevance until re-embedded (FTS still works, which is
         # exactly why this is easy to miss). Two ways this happens even under
         # write-if-absent semantics below: (a) the embedder actually changed
         # from what .luamemorc already had, or (b) this is a FRESH .luamemorc
-        # (no local prior value to compare) pointed at a database that already
-        # has rows for this scope — e.g. a fresh clone / a different host
-        # connecting to a shared DB. Best-effort: skipped silently if psql
-        # isn't available.
+        # (no local prior value to compare) on a database that already has rows
+        # for this scope — e.g. a project joining a database another one fills.
         local _old_eloc="" _old_emdl=""
-        if [[ -f "$PWD/.luamemorc" ]]; then
-            _old_eloc=$(grep -E '^MEMO_EMBEDDER=' "$PWD/.luamemorc" 2>/dev/null | tail -1 | cut -d= -f2-) || true
-            _old_emdl=$(grep -E '^MEMO_EMBEDDER_MODEL=' "$PWD/.luamemorc" 2>/dev/null | tail -1 | cut -d= -f2-) || true
+        if [[ -f "$_MEMO_PROJECT_DIR/.luamemorc" ]]; then
+            _old_eloc=$(_rc_get "$_MEMO_PROJECT_DIR/.luamemorc" MEMO_EMBEDDER)
+            _old_emdl=$(_rc_get "$_MEMO_PROJECT_DIR/.luamemorc" MEMO_EMBEDDER_MODEL)
         fi
         local _embedder_changed=false
         if [[ -n "$_old_eloc" && -n "$_probe_eloc" && "$_old_eloc" != "$_probe_eloc" ]]; then
@@ -1285,211 +1557,63 @@ EOF
             _embedder_changed=true
         fi
 
-        if command -v psql >/dev/null 2>&1; then
-            local _target_scope="${scope:-repo:$(basename "$(cd "$root" 2>/dev/null && pwd)")}"
-            local _existing_rows
-            _existing_rows=$(PGPASSWORD="${PGPASSWORD:-}" psql "$MEMO_DB_URL" -tA \
-                -v target_scope="$_target_scope" 2>/dev/null <<'SQL' || echo ""
-SELECT count(*) FROM lm_memories WHERE scope = :'target_scope';
-SQL
-)
-            if [[ "$_existing_rows" =~ ^[0-9]+$ ]] && [[ "$_existing_rows" -gt 0 ]]; then
-                if [[ "$_embedder_changed" == true ]]; then
-                    echo ""
-                    echo "  WARNING: embedder is changing (${_old_eloc:-$_old_emdl} -> ${_probe_eloc:-$_probe_emdl})."
-                    echo "  ${_existing_rows} existing memories in scope '${_target_scope}' were embedded with"
-                    echo "  the PREVIOUS model — a different model's vectors are never comparable, even at the"
-                    echo "  same dimension, so vector search relevance will silently degrade on those rows"
-                    echo "  until they are re-embedded. Run:  memo reembed --scope ${_target_scope}"
-                elif [[ -z "$_old_eloc" ]]; then
-                    echo ""
-                    echo "  NOTE: scope '${_target_scope}' already has ${_existing_rows} memories, but no local"
-                    echo "  embedder config was found (e.g. a fresh clone connecting to a shared database)."
-                    echo "  If those rows were embedded with a DIFFERENT model than the one being configured"
-                    echo "  now, vector search relevance will be degraded until they are re-embedded. Run:"
-                    echo "    memo reembed --scope ${_target_scope}"
-                fi
+        local _target_scope="${scope:-repo:$(basename "$(cd "$root" 2>/dev/null && pwd)")}"
+        local _existing_rows=""
+        _existing_rows=$(jq -n --arg s "$_target_scope" '{scope: $s}' | api_call db-info 2>/dev/null \
+            | jq -r '.scope_memories // empty' 2>/dev/null) || _existing_rows=""
+        if [[ "$_existing_rows" =~ ^[0-9]+$ ]] && [[ "$_existing_rows" -gt 0 ]]; then
+            if [[ "$_embedder_changed" == true ]]; then
+                echo ""
+                echo "  WARNING: embedder is changing (${_old_eloc:-$_old_emdl} -> ${_probe_eloc:-$_probe_emdl})."
+                echo "  ${_existing_rows} existing memories in scope '${_target_scope}' were embedded with"
+                echo "  the PREVIOUS model — a different model's vectors are never comparable, even at the"
+                echo "  same dimension, so vector search relevance will silently degrade on those rows"
+                echo "  until they are re-embedded. Run:  memo reembed --all"
+            elif [[ -z "$_old_eloc" ]]; then
+                echo ""
+                echo "  NOTE: scope '${_target_scope}' already has ${_existing_rows} memories, but no local"
+                echo "  embedder config was found (e.g. a project joining a database another one fills)."
+                echo "  If those rows were embedded with a DIFFERENT model than the one being configured"
+                echo "  now, vector search relevance will be degraded until they are re-embedded. Run:"
+                echo "    memo reembed --all"
             fi
         fi
 
         # Local embedder selector (hash / gguf_ffi / …). For gguf_ffi the user
         # also sets MEMO_GGUF_MODEL after downloading the model (see the guide
         # printed by `memo calibrate`).
-        [[ -n "$_probe_eloc" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBEDDER" "$_probe_eloc"
-        [[ -n "$_probe_eadp" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBEDDER_ADAPTER" "$_probe_eadp"
-        [[ -n "$_probe_eurl" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBEDDER_URL"     "$_probe_eurl"
-        [[ -n "$_probe_emdl" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBEDDER_MODEL"   "$_probe_emdl"
-        _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBED_DIM" "$_probe_embed_dim"
-        [[ -n "$_probe_emxc" ]] && _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_EMBED_MAX_CHARS"  "$_probe_emxc"
+        [[ -n "$_probe_eloc" ]] && _save_rc_key_if_absent "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_EMBEDDER" "$_probe_eloc"
+        [[ -n "$_probe_eadp" ]] && _save_rc_key_if_absent "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_EMBEDDER_ADAPTER" "$_probe_eadp"
+        [[ -n "$_probe_eurl" ]] && _save_rc_key_if_absent "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_EMBEDDER_URL"     "$_probe_eurl"
+        if [[ -n "$_probe_emdl" ]]; then
+            # gguf_ffi reads its .gguf path from MEMO_GGUF_MODEL; the env→config
+            # bootstrap maps MEMO_EMBEDDER_MODEL only for HTTP embedders.
+            if [[ "$_probe_eloc" == "gguf_ffi" ]]; then
+                _save_rc_key_if_absent "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_GGUF_MODEL"     "$_probe_emdl"
+            else
+                _save_rc_key_if_absent "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_EMBEDDER_MODEL" "$_probe_emdl"
+            fi
+        fi
+        _save_rc_key_if_absent "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_EMBED_DIM" "$_probe_embed_dim"
+        [[ -n "$_probe_emxc" ]] && _save_rc_key_if_absent "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_EMBED_MAX_CHARS"  "$_probe_emxc"
         # Self-maintaining memory: a debounced digest piggybacks on writes so tier
         # promotion / consolidation / decay run without any agent or scheduler
         # having to call `memo digest`. Write-if-absent, so an explicit 0 is kept.
-        _save_rc_key_if_absent "$PWD/.luamemorc" "MEMO_AUTO_DIGEST" "1"
+        _save_rc_key_if_absent "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_AUTO_DIGEST" "1"
     fi
-    [[ "$probe_only" == true ]] && return 0
-
-    # ── Phase 2: resolve DB connection ──────────────────────────────────────
-    # Resolution order (first match wins):
-    #   1. $PWD/.luamemorc exists → project already configured, use its URL
-    #   2. $MEMO_DB_URL already set by --docker-compose or explicit env export
-    #   3. $DATABASE_URL env var (common 12-factor / Heroku convention)
-    #   4. $POSTGRES_DB + sibling POSTGRES_*/PG* env vars → build MEMO_DB_URL
-    #   5. $PGDATABASE + $PGHOST env vars → build MEMO_DB_URL
-    #   6. Auto-detect docker-compose.yml / docker-compose.yaml in CWD
-    #   7. Prompt once, save to .luamemorc
-
-    # If no project-local .luamemorc exists yet, do not silently reuse a
-    # MEMO_DB_URL that was inherited from another project's global ~/.memorc.
-    if [[ ! -f "$PWD/.luamemorc" && "${_MEMO_CONFIG_SOURCE:-}" == "global" ]]; then
-        echo "  Note: MEMO_DB_URL is currently set from ~/.memorc (may belong to another project)."
-        echo "  Running DB detection for this project..."
-        unset MEMO_DB_URL
+    # Re-read the project config so every later phase runs with what was just
+    # persisted: the codebase scan must embed with the chosen embedder at its
+    # dimension, and the MCP env must carry the model path / MEMO_EMBED_DIM.
+    if [[ -f "$_MEMO_PROJECT_DIR/.luamemorc" ]]; then
+        _load_project_rc || true
+        local _relua; _relua=$(find_lua) && lua="$_relua"
+    fi
+    # An HTTP embedder that wants an API key: say how to give it one (the vault).
+    if [[ -n "${MEMO_EMBEDDER_URL:-}" && "$dry_run" != true ]]; then
+        _calibrate_embedder_auth "$lua"
     fi
 
-    if [[ -z "${MEMO_DB_URL:-}" ]]; then
-        if [[ -n "${DATABASE_URL:-}" ]]; then
-            export MEMO_DB_URL="$DATABASE_URL"
-            echo "  DB: using DATABASE_URL"
-            _save_db_url_rc "$MEMO_DB_URL"
-        elif [[ -n "${POSTGRES_DB:-}" ]]; then
-            local _pg_user="${POSTGRES_USER:-${PGUSER:-postgres}}"
-            local _pg_pass="${POSTGRES_PASSWORD:-${PGPASSWORD:-}}"
-            local _pg_host="${POSTGRES_HOST:-${PGHOST:-127.0.0.1}}"
-            local _pg_port="${POSTGRES_PORT:-${PGPORT:-5432}}"
-            local _url
-            if _url=$(_build_pg_url "$_pg_user" "$_pg_pass" "$_pg_host" "$_pg_port" "${POSTGRES_DB}"); then
-                export MEMO_DB_URL="$_url"
-                echo "  DB: assembled from POSTGRES_* env vars → ${POSTGRES_DB}"
-                _save_db_url_rc "$MEMO_DB_URL"
-            else
-                echo "  Falling back to manual MEMO_DB_URL prompt."
-            fi
-        elif [[ -n "${PGDATABASE:-}" ]]; then
-            local _pg_user="${PGUSER:-postgres}"
-            local _pg_pass="${PGPASSWORD:-}"
-            local _pg_host="${PGHOST:-127.0.0.1}"
-            local _pg_port="${PGPORT:-5432}"
-            local _url
-            if _url=$(_build_pg_url "$_pg_user" "$_pg_pass" "$_pg_host" "$_pg_port" "${PGDATABASE}"); then
-                export MEMO_DB_URL="$_url"
-                echo "  DB: assembled from PG* env vars → ${PGDATABASE}"
-                _save_db_url_rc "$MEMO_DB_URL"
-            else
-                echo "  Falling back to manual MEMO_DB_URL prompt."
-            fi
-        elif [[ -f "docker-compose.yml" ]] || [[ -f "docker-compose.yaml" ]]; then
-            local _dc="docker-compose.yml"
-            [[ -f "docker-compose.yaml" ]] && _dc="docker-compose.yaml"
-            echo "  DB: auto-detected $_dc — probing for Postgres config..."
-            _parse_compose_pg "$_dc" || true
-            if [[ -n "${MEMO_DB_URL:-}" ]]; then
-                _save_db_url_rc "$MEMO_DB_URL"
-            fi
-        fi
-    fi
-
-    if [[ -z "${MEMO_DB_URL:-}" ]]; then
-        echo ""
-        echo "  No database config found."
-        if [[ -t 0 ]]; then
-            echo -n "  Enter MEMO_DB_URL (e.g. postgresql://postgres:@127.0.0.1:5432/luamemo): "
-            read -r MEMO_DB_URL
-        else
-            echo "  (non-interactive: skipping prompt — set MEMO_DB_URL before running calibrate)"
-            MEMO_DB_URL=""
-        fi
-        if [[ -z "$MEMO_DB_URL" ]]; then
-            echo ""
-            echo "  No database configured — memories will NOT be saved."
-            echo "     Re-run: memo calibrate"
-            return 0
-        fi
-        echo ""
-        _save_db_url_rc "$MEMO_DB_URL"
-        export MEMO_DB_URL
-    fi
-
-    # ── Phase 2.5: schema check ─────────────────────────────────────────────
-    # Query information_schema to verify lm_memories and lm_kg_facts exist
-    # and carry all expected columns.  If anything is missing, offer to apply
-    # the full schema automatically (requires psql on PATH).
-    if [[ "${no_migrate:-false}" != "true" ]]; then
-        echo ""
-        echo "Checking schema..."
-
-        local schema_result
-        schema_result=$(printf '{}' | api_call schema-check 2>/dev/null || echo '{"ok":false,"db_error":"api call failed"}')
-
-        local schema_ok
-        schema_ok=$(printf '%s' "$schema_result" | jq -r '.ok // false' 2>/dev/null || echo "false")
-
-        if [[ "$schema_ok" == "true" ]]; then
-            echo "  Schema: OK"
-        else
-            # Collect details: which tables are missing or have missing columns.
-            local mem_present mem_missing kg_present kg_missing
-            mem_present=$(printf '%s' "$schema_result" | jq -r '.tables.lm_memories.present // false' 2>/dev/null || echo "false")
-            mem_missing=$(printf '%s' "$schema_result" | jq -r '(.tables.lm_memories.missing_cols // []) | join(", ")' 2>/dev/null || echo "")
-            kg_present=$(printf '%s' "$schema_result" | jq -r '.tables.lm_kg_facts.present // false' 2>/dev/null || echo "false")
-            kg_missing=$(printf '%s' "$schema_result" | jq -r '(.tables.lm_kg_facts.missing_cols // []) | join(", ")' 2>/dev/null || echo "")
-
-            # Check for a DB connection error — this is distinct from "table missing":
-            # if the Lua process couldn't connect at all, the schema-check result
-            # contains db_error on every table entry.  Treat this as a connectivity
-            # problem, not a missing-schema problem, so we don't confusingly say
-            # "table missing" and then have psql succeed (contradicting the check).
-            local any_db_err
-            any_db_err=$(printf '%s' "$schema_result" | \
-                jq -r '[.tables // {} | to_entries[] | .value.db_error // empty] | first // ""' \
-                2>/dev/null || echo "")
-            if [[ -n "$any_db_err" ]]; then
-                echo "  Schema check: DB connection failed — cannot verify schema."
-                echo "    Error: $any_db_err"
-                echo "    Verify MEMO_DB_URL ($(_redact_url "${MEMO_DB_URL:-}")) is reachable, then re-run."
-                echo "  (If the schema already exists this is harmless once connectivity is restored.)"
-                return 0
-            fi
-
-            echo "  Schema: incomplete"
-            [[ "$mem_present" != "true" ]] && echo "    - lm_memories table: missing"
-            [[ "$mem_present" == "true" ]] && [[ -n "$mem_missing" ]] && echo "    - lm_memories columns missing: $mem_missing"
-            [[ "$kg_present" != "true" ]] && echo "    - lm_kg_facts table: missing"
-            [[ "$kg_present" == "true" ]] && [[ -n "$kg_missing" ]] && echo "    - lm_kg_facts columns missing: $kg_missing"
-            echo ""
-
-            local do_migrate="n"
-            if command -v psql >/dev/null 2>&1; then
-                _confirm_yn "Apply schema now?" && do_migrate="y"
-            else
-                echo "  psql not found — cannot apply schema automatically."
-            fi
-
-            if [[ "$do_migrate" =~ ^[Yy]$ ]]; then
-                echo "  Applying schema (embed_dim=${_probe_embed_dim})..."
-                if cmd_migrate --embed-dim "${_probe_embed_dim}" | PGPASSWORD="${PGPASSWORD:-}" psql "$MEMO_DB_URL" -v ON_ERROR_STOP=1 -q; then
-                    echo "  Schema applied successfully."
-                else
-                    echo ""
-                    echo "  ERROR: psql exited with an error. Check the output above." >&2
-                    echo "  You can apply the schema manually:" >&2
-                    echo "    memo migrate --embed-dim ${_probe_embed_dim} | psql \"\$MEMO_DB_URL\"" >&2
-                    echo "  Codebase ingest will be skipped until the schema is ready." >&2
-                    return 1
-                fi
-            else
-                echo ""
-                echo "  Schema not applied. Memories cannot be stored without it."
-                echo "  To apply manually:"
-                echo "    memo migrate --embed-dim ${_probe_embed_dim} | psql \"$MEMO_DB_URL\""
-                echo ""
-                echo "  Without the schema, codebase ingest will fail."
-                echo "  Re-run memo calibrate once the schema is in place."
-                return 0
-            fi
-        fi
-    fi
-
-    # ── Phase 3: auto-detect scope ──────────────────────────────────────────
+    # ── Scope (auto-detected; the org link below records it too) ────────────
     if [[ -z "$scope" ]]; then
         if [[ -n "${MEMO_SCOPE:-}" ]]; then
             scope="$MEMO_SCOPE"
@@ -1503,6 +1627,25 @@ SQL
         fi
     fi
 
+    # ── Phase 2.6: federation (optional; needs the DB + schema) ─────────────
+    if [[ "$role" == "org" ]]; then
+        if [[ "$dry_run" == true ]]; then
+            echo ""; echo "  [dry-run] Would configure this instance as org central org:${org_name}."
+            return 0
+        fi
+        _calibrate_org_central "$lua" "$org_name"
+        return $?   # a central has no per-dev phases (ingest, MCP, plugin)
+    elif [[ -n "$org_url" ]]; then
+        if [[ "$dry_run" == true ]]; then
+            echo ""; echo "  [dry-run] Would join org central $(_redact_url "$org_url") as a dev."
+        else
+            _calibrate_org_dev "$lua" "$org_url" "$org_fingerprint" || true
+        fi
+    elif [[ "$role" == "solo" && "$dry_run" != true ]]; then
+        _calibrate_org_leave "$lua"
+    fi
+
+    # ── Phase 3: ingest ─────────────────────────────────────────────────────
     echo ""
     echo "Ingesting codebase → scope: $scope"
 
@@ -1517,10 +1660,10 @@ SQL
     [[ -n "$since_sha" ]] && echo "  (incremental: commits since ${since_sha:0:7})"
 
     # Build Lua flags for the scan phase
-    local scan_flags="[==[--scan]==],[==[--scope]==],[==[${scope}]==],[==[--root]==],[==[${root}]==],"
-    [[ -n "$since_sha" ]] && scan_flags+="[==[--since-commit]==],[==[${since_sha}]==],"
-    [[ "$no_git" == true      ]] && scan_flags+="[==[--no-git]==],"
-    [[ "$no_comments" == true ]] && scan_flags+="[==[--no-comments]==],"
+    local scan_args=(--scan --scope "$scope" --root "$root")
+    [[ -n "$since_sha" ]] && scan_args+=(--since-commit "$since_sha")
+    [[ "$no_git" == true      ]] && scan_args+=(--no-git)
+    [[ "$no_comments" == true ]] && scan_args+=(--no-comments)
 
     # ── Phase 4: scan → write (single Lua process handles all writes) ────────
     local count=0 errors=0
@@ -1530,7 +1673,7 @@ SQL
             local title; title=$(printf '%s' "$mem_line" | jq -r '.title // "(no title)"' 2>/dev/null)
             echo "  [dry-run] $title"
             (( count++ )) || true
-        done < <("$lua" -e "require('luamemo.cli.calibrate').run({${scan_flags}})")
+        done < <(_lua_run "$lua" calibrate "${scan_args[@]}")
         echo ""
         echo "  [dry-run] Would write $count memories. Re-run without --dry-run to apply."
     else
@@ -1543,8 +1686,9 @@ SQL
                 (( errors++ )) || true
             fi
         done < <(
-            "$lua" -e "package.path='./?/init.lua;'..package.path; require('luamemo.cli.calibrate').run({${scan_flags}})" \
-            | "$lua" -e "package.path='./?/init.lua;'..package.path; require('luamemo.cli.api').dispatch('write-many')"
+            _lua_run "$lua" calibrate "${scan_args[@]}" \
+            | "$lua" -e "$_LUA_PATH_GUARD
+require('luamemo.cli.api').dispatch('write-many')"
         )
         echo ""
         echo "  Done: $count memories written ($errors errors) to scope=$scope"
@@ -1565,6 +1709,14 @@ SQL
     # ── Phase 5: IDE detection + MCP config ─────────────────────────────────
     if [[ "${no_mcp:-false}" != "true" ]]; then
         _calibrate_mcp_phase "$root" "$scope"
+        # The clients that started luamemo here: one too old for something it needs is named.
+        local _lua_c; _lua_c=$(find_lua) || _lua_c=""
+        if [[ -n "$_lua_c" ]]; then
+            echo ""
+            "$_lua_c" -e "$_LUA_PATH_GUARD
+local lines, ok = require('luamemo.clients').report()
+for _, l in ipairs(lines) do print('  ' .. (ok and '' or 'WARNING: ') .. l) end" 2>/dev/null || true
+        fi
     fi
 
     # ── Phase 6: VS Code agent plugin install ────────────────────────────────
@@ -1678,395 +1830,342 @@ _confirm_yn() {
     [[ "$ans" =~ ^[Yy]$ ]]
 }
 
+# _calibrate_embedder_auth <lua> — the configured HTTP embedder refuses requests
+# (401 / 403): it wants an API key. The key goes into the vault, typed by the person
+# at the terminal, and the header refers to it — it is never written to .luamemorc.
+# Prints how; offers to do it when someone is at the terminal.
+_calibrate_embedder_auth() {
+    local lua="$1" out rc=0
+    out=$(_lua_run "$lua" ping --embedder 2>&1) || rc=$?
+    [[ $rc -ne 0 ]] || return 0
+    local code; code=$(grep -oE 'HTTP 40[13]' <<<"$out" | head -1) || true
+    [[ -n "$code" ]] || return 0
+    local name="embedder-api-key" header
+    header=$(jq -cn --arg n "$name" '{"Authorization": ("Bearer {secret:" + $n + "}")}')
+    echo ""
+    echo "  The embedder refused the request (${code}) — it needs an API key. Keep the key in"
+    echo "  luamemo's vault (encrypted) and point the header at it:"
+    echo "    memo secret-store ${name}"
+    echo "    memo config set MEMO_EMBEDDER_HEADERS '${header}'"
+    echo "  (a provider that wants another header — x-api-key, api-key — takes {secret:${name}} the same way)"
+    _confirm_yn "Store the API key now?" || return 0
+    local sout
+    if ! sout=$(cmd_secret_store "$name" --desc "API key of the embedder at ${MEMO_EMBEDDER_URL:-}"); then
+        echo "  Not stored: $(jq -r '.error // .' <<<"$sout" 2>/dev/null)"
+        return 0
+    fi
+    cmd_config set MEMO_EMBEDDER_HEADERS "$header" >/dev/null || return 0
+    _load_project_rc || true
+    if _lua_run "$lua" ping --embedder >/dev/null 2>&1; then
+        echo "  Stored — the embedder answers now."
+    else
+        echo "  Stored, but the embedder still refuses — check the key (memo secret-store ${name} replaces it)."
+    fi
+}
+
+# An entry that starts mcp/server.lua itself, or passes MEMO_* settings / an envFile —
+# what calibrate wrote before `memo mcp`: replaced with the generic entry.
+_MCP_OLD_STYLE='((.args // []) | any(type == "string" and test("mcp/server\\.lua$")))
+    or ((.env // {}) | keys | any(startswith("MEMO_"))) or (has("envFile"))'
+
+# _mcp_put <file> <root: servers|mcpServers> <key> <entry json> <label> [old key]
+# Writes the luamemo entry into a client's config (asking first). An old-style luamemo
+# entry under <key> or <old key> is replaced; an entry of the user's own is kept.
+_mcp_put() {
+    local file="$1" root="$2" key="$3" entry="$4" label="$5" old_key="${6:-}"
+    if [[ ! -f "$file" ]]; then
+        if _confirm_yn "Create ${label} with the luamemo entry?"; then
+            mkdir -p "$(dirname -- "$file")"
+            jq -n --arg r "$root" --arg k "$key" --argjson e "$entry" '{($r): {($k): $e}}' > "$file"
+            echo "  Created: $file"
+        fi
+        return 0
+    fi
+    local cur old=""
+    cur=$(jq -c --arg r "$root" --arg k "$key" '.[$r][$k] // empty' "$file" 2>/dev/null) || {
+        echo "  ${label}: not valid JSON — left as it is. Add the entry below by hand."
+        return 0
+    }
+    if [[ -n "$old_key" && "$old_key" != "$key" ]]; then
+        old=$(jq -c --arg r "$root" --arg k "$old_key" \
+            ".[\$r][\$k] // empty | select($_MCP_OLD_STYLE)" "$file" 2>/dev/null) || old=""
+    fi
+    if [[ -n "$cur" && -z "$old" && "$(jq -cS . <<<"$cur")" == "$(jq -cS . <<<"$entry")" ]]; then
+        echo "  ${label}: luamemo entry up to date."
+        return 0
+    fi
+    if [[ -n "$cur" ]] && ! jq -e "$_MCP_OLD_STYLE" >/dev/null 2>&1 <<<"$cur"; then
+        echo "  ${label}: a luamemo entry of your own is there — kept."
+        return 0
+    fi
+    local q="Write the luamemo entry to ${label}?"
+    [[ -n "$cur$old" ]] && q="Replace the old-style luamemo entry in ${label} (a server path + MEMO_* settings) with the generic one (memo mcp)?"
+    if _confirm_yn "$q"; then
+        local updated
+        updated=$(jq --arg r "$root" --arg k "$key" --arg o "$old_key" --argjson e "$entry" \
+            '(if $o != "" and $o != $k then .[$r] |= del(.[$o]) else . end) | .[$r][$k] = $e' "$file") || return 1
+        printf '%s\n' "$updated" > "$file"
+        echo "  Updated: $file"
+    fi
+}
+
+# _calibrate_save_shell_settings <lua> — an MCP client starts the server without this
+# shell's environment: a setting the MCP server needs that only the shell sets (the
+# database, embedder, org settings — the registry's mcp_env ones) is offered for the
+# project's .luamemorc.
+_calibrate_save_shell_settings() {
+    local lua="$1" names name
+    names=$(MEMO__PROJECT_DIR="$_MEMO_PROJECT_DIR" "$lua" -e "$_LUA_PATH_GUARD
+local s = require('luamemo.settings')
+local f = s.files()
+for _, e in ipairs(s.LIST) do
+    local v = os.getenv(e.env)
+    if e.mcp_env and v and v ~= '' and not f.project[e.env] and not f.user[e.env] then print(e.env) end
+end" 2>/dev/null) || return 0
+    for name in $names; do
+        if _confirm_yn "${name} is set only in this shell — save it in .luamemorc (MCP clients don't get your shell's settings)?"; then
+            cmd_config set "$name" "${!name}" >/dev/null && echo "  Saved ${name} in ${_MEMO_PROJECT_DIR}/.luamemorc"
+        fi
+    done
+}
+
 # ---------------------------------------------------------------------------
 # IDE detection + MCP config writer (called from cmd_calibrate phase 5)
 # ---------------------------------------------------------------------------
 _calibrate_mcp_phase() {
     local root="$1" scope="$2"
-
-    local lua_bin; lua_bin=$(find_lua) || lua_bin="lua"
-    # The in-process GGUF embedder (embedder_local=gguf_ffi) needs LuaJIT (FFI),
-    # so the MCP server must launch under `luajit`, not lua5.1. Detect the chosen
-    # embedder from the env or the persisted .luamemorc.
-    local _mcp_embedder="${MEMO_EMBEDDER:-}"
-    if [[ -z "$_mcp_embedder" && -f "$PWD/.luamemorc" ]]; then
-        _mcp_embedder=$(grep -E '^MEMO_EMBEDDER=' "$PWD/.luamemorc" 2>/dev/null | tail -1 | cut -d= -f2-)
-    fi
-    if [[ "$_mcp_embedder" == "gguf_ffi" ]]; then
-        if command -v luajit >/dev/null 2>&1; then
-            lua_bin="luajit"
-            echo "  (embedder is gguf_ffi → MCP server will launch under luajit for FFI)"
-        else
-            echo "  WARNING: embedder=gguf_ffi needs luajit but it was not found;" >&2
-            echo "           MCP server will use $lua_bin and in-process embedding will fail." >&2
-        fi
-    fi
-    local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    # Resolve absolute path to mcp/server.lua.
-    # When installed via LuaRocks, this script lands in a bin/ directory and
-    # the naive "${script_dir}/../mcp/server.lua" resolves to a non-existent
-    # path.  We try four strategies in order:
-    #   1. Relative to this script (works in git-repo / dev mode).
-    #   2. luarocks show — asks the installed package manager for the prefix.
-    #   3. find in common LuaRocks tree roots (slow but reliable fallback).
-    #   4. Keep the relative path and warn the user to fix it manually.
-    local mcp_server=""
-    local _rel="${script_dir}/../mcp/server.lua"
-    if [[ -f "$_rel" ]]; then
-        command -v realpath >/dev/null 2>&1 \
-            && mcp_server=$(realpath "$_rel" 2>/dev/null) \
-            || mcp_server="$_rel"
-    fi
-
-    if [[ -z "$mcp_server" ]]; then
-        # Strategy 2: ask luarocks for the install prefix.
-        local _lr_prefix=""
-        for _lr in luarocks-5.1 luarocks; do
-            if command -v "$_lr" >/dev/null 2>&1; then
-                _lr_prefix=$("$_lr" show luamemo 2>/dev/null \
-                    | grep -i "installed in:" | head -1 \
-                    | sed 's/.*[Ii]nstalled in:[[:space:]]*//')
-                [[ -n "$_lr_prefix" ]] && break
-            fi
-        done
-        if [[ -n "$_lr_prefix" ]]; then
-            local _srv
-            _srv=$(find "$_lr_prefix/lib/luarocks" \
-                -path "*/luamemo/*/mcp/server.lua" 2>/dev/null | sort -V | tail -1)
-            [[ -n "$_srv" ]] && mcp_server="$_srv"
-        fi
-    fi
-
-    if [[ -z "$mcp_server" ]]; then
-        # Strategy 3: search common LuaRocks tree roots.
-        local _srv
-        for _prefix in "${HOME}/.luarocks" "/usr/local" "/usr"; do
-            if [[ -d "${_prefix}/lib/luarocks" ]]; then
-                _srv=$(find "${_prefix}/lib/luarocks" -maxdepth 8 \
-                    -path "*/luamemo/*/mcp/server.lua" 2>/dev/null | sort -V | tail -1)
-                if [[ -n "$_srv" ]]; then
-                    mcp_server="$_srv"
-                    break
-                fi
-            fi
-        done
-    fi
-
-    # Strategy 4: fall back to the relative path; warn below if it doesn't exist.
-    [[ -z "$mcp_server" ]] && mcp_server="$_rel"
-
-    # Block if the server file still can't be found — writing a broken path
-    # into the MCP client config causes silent failures that are hard to debug.
-    if [[ ! -f "$mcp_server" ]]; then
-        echo ""
-        echo "  WARNING: mcp/server.lua not found at:"
-        echo "    $mcp_server"
-        if [[ -t 0 ]]; then
-            echo -n "  Enter the correct path to mcp/server.lua (or press Enter to skip MCP config): "
-            local _user_path; read -r _user_path
-            if [[ -z "$_user_path" ]]; then
-                echo "  Skipping MCP config write (no valid server path)."
-                echo "  To configure manually, set 'args' in your MCP client config to"
-                echo "  the path of mcp/server.lua from the luamemo LuaRocks installation."
-                return 0
-            elif [[ -f "$_user_path" ]]; then
-                mcp_server="$_user_path"
-            else
-                echo "  Path does not exist: $_user_path"
-                echo "  Skipping MCP config write."
-                return 0
-            fi
-        else
-            echo "  Non-interactive: skipping MCP config write."
-            echo "  Typical location: <luarocks-prefix>/lib/luarocks/rocks-5.1/luamemo/<ver>/mcp/server.lua"
-            return 0
-        fi
-    fi
-
-    local db_url="${MEMO_DB_URL:-}"
-
-    # Derive a per-project MCP entry name so multiple projects can coexist in
-    # global Cursor / Claude Desktop configs without overwriting each other.
-    # With a scope set (e.g. "myapp") the key becomes "luamemo-myapp"; without
-    # a scope it falls back to plain "luamemo" for backward compatibility.
-    local mcp_key="luamemo"
-    if [[ -n "${scope:-}" ]]; then
-        local _safe; _safe=$(printf '%s' "$scope" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')
-        [[ -n "$_safe" ]] && mcp_key="luamemo-${_safe}"
-    fi
-
-    # Warn if the URL is empty — a blank MEMO_DB_URL in the generated config
-    # causes the MCP server to silently fail to connect on first use.
-    if [[ -z "$db_url" ]]; then
-        echo ""
-        echo "  WARNING: MEMO_DB_URL is not set."
-        echo "  The generated MCP config will have an empty MEMO_DB_URL and the"
-        echo "  MCP server will fail to connect to Postgres."
-        echo "  Set MEMO_DB_URL before running memo calibrate, or edit the"
-        echo "  env.MEMO_DB_URL field in the generated config manually."
-        echo "  Example: export MEMO_DB_URL=postgresql://user:pass@localhost:5432/luamemo"
-    fi
-
-    # Build the MCP server env block (JSON).
-    # Embedder env vars are included only when set so the MCP server config
-    # mirrors exactly what the shell environment provides.
-    local mcp_env
-    mcp_env=$(jq -n \
-        --arg db   "$db_url" \
-        --arg sc   "$scope" \
-        --arg eurl "${MEMO_EMBEDDER_URL:-}" \
-        --arg eadp "${MEMO_EMBEDDER_ADAPTER:-}" \
-        --arg emdl "${MEMO_EMBEDDER_MODEL:-}" \
-        --arg edim "${MEMO_EMBED_DIM:-}" \
-        --arg eloc "${_mcp_embedder:-}" \
-        --arg gmdl "${MEMO_GGUF_MODEL:-}" \
-        '{"MEMO_DB_URL": $db, "MEMO_SCOPE": $sc}
-         | if $eurl != "" then . + {"MEMO_EMBEDDER_URL": $eurl} else . end
-         | if $eadp != "" then . + {"MEMO_EMBEDDER_ADAPTER": $eadp} else . end
-         | if $emdl != "" then . + {"MEMO_EMBEDDER_MODEL": $emdl} else . end
-         | if $edim != "" then . + {"MEMO_EMBED_DIM": $edim} else . end
-         | if $eurl == "" and $eloc != "" then . + {"MEMO_EMBEDDER": $eloc} else . end
-         | if $gmdl != "" then . + {"MEMO_GGUF_MODEL": $gmdl} else . end')
-
-    # Build the VS Code / Claude Desktop / Cursor MCP entry (JSON).
-    local vscode_entry
-    vscode_entry=$(jq -n \
-        --arg cmd "$lua_bin" \
-        --arg srv "$mcp_server" \
-        --argjson env "$mcp_env" \
-        '{"type":"stdio","command":$cmd,"args":[$srv],"env":$env}')
-
-    local claude_entry
-    claude_entry=$(jq -n \
-        --arg cmd "$lua_bin" \
-        --arg srv "$mcp_server" \
-        --argjson env "$mcp_env" \
-        '{"command":$cmd,"args":[$srv],"env":$env}')
+    local lua_bin; lua_bin=$(find_lua) || lua_bin="luajit"
+    local self; self=$(_memo_self_path)
 
     echo ""
     echo "MCP client configuration"
     echo "========================"
-
-    # ── VS Code (.vscode/mcp.json) ───────────────────────────────────────
-    local vscode_dir="${root}/.vscode"
-    local vscode_mcp="${vscode_dir}/mcp.json"
-    local has_vscode=false
-    [[ -d "$vscode_dir" ]] && has_vscode=true
-
-    if [[ "$has_vscode" == "true" ]]; then
-        echo "  Detected: VS Code workspace (.vscode/ found)"
-        if [[ -f "$vscode_mcp" ]]; then
-            # Check if a luamemo entry already exists under this key.
-            local already
-            already=$(jq -r --arg key "$mcp_key" '.servers[$key] // empty' "$vscode_mcp" 2>/dev/null || echo "")
-            if [[ -n "$already" ]]; then
-                echo "  .vscode/mcp.json: ${mcp_key} entry already present — skipping."
-            else
-                if _confirm_yn "Write ${mcp_key} MCP entry to .vscode/mcp.json?"; then
-                    local updated
-                    updated=$(jq --arg key "$mcp_key" --argjson entry "$vscode_entry" '.servers[$key] = $entry' "$vscode_mcp")
-                    printf '%s\n' "$updated" > "$vscode_mcp"
-                    echo "  Updated: $vscode_mcp"
-                fi
-            fi
-        else
-            if _confirm_yn "Create .vscode/mcp.json with ${mcp_key} entry?"; then
-                mkdir -p "$vscode_dir"
-                jq -n --arg key "$mcp_key" --argjson entry "$vscode_entry" '{"servers":{($key):$entry}}' > "$vscode_mcp"
-                echo "  Created: $vscode_mcp"
-            fi
-        fi
+    if ! _memo_server_path >/dev/null; then
+        echo "  WARNING: mcp/server.lua not found next to $self or in a LuaRocks tree —"
+        echo "  memo mcp can't start the server until luamemo is reinstalled (luarocks install luamemo)."
     fi
+    if [[ "${dry_run:-false}" == true ]]; then
+        echo "  [dry-run] No client config or setting written. The entry, for any client:"
+        echo ""
+        _mcp_print_config "" | sed 's/^/  /'
+        echo ""
+        return 0
+    fi
+    _calibrate_save_shell_settings "$lua_bin"
 
-    # ── Cursor (~/.cursor/mcp.json) ──────────────────────────────────────
-    local cursor_mcp="${HOME}/.cursor/mcp.json"
+    # Every entry starts `memo mcp`, which reads the project's .luamemorc: nothing in it
+    # but memo's path and, where the client has a workspace variable, the project.
+    # Calibrate before `memo mcp` named an entry per project after the scope
+    # (luamemo-<scope>) and filled it with MEMO_* settings: such an entry is replaced.
+    local old_key="luamemo"
+    if [[ -n "${scope:-}" ]]; then
+        local _safe; _safe=$(printf '%s' "$scope" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')
+        [[ -n "$_safe" ]] && old_key="luamemo-${_safe}"
+    fi
+    local ws_entry desktop_entry
+    ws_entry=$(jq -cn --arg c "$self" '{"command":$c,"args":["mcp","--project","${workspaceFolder}"]}')
+    desktop_entry=$(jq -cn --arg c "$self" --arg p "$root" '{"command":$c,"args":["mcp","--project",$p]}')
+
+    # ── VS Code (.vscode/mcp.json, this workspace) ──────────────────────────
+    if [[ -d "${root}/.vscode" ]]; then
+        echo "  Detected: VS Code workspace (.vscode/ found)"
+        _mcp_put "${root}/.vscode/mcp.json" servers luamemo "$(jq -c '{"type":"stdio"} + .' <<<"$ws_entry")" \
+            ".vscode/mcp.json" "$old_key"
+    fi
+    # ── Cursor (~/.cursor/mcp.json: every project — the workspace variable names it) ──
     if [[ -d "${HOME}/.cursor" ]]; then
         echo "  Detected: Cursor (~/.cursor/ found)"
-        if [[ -f "$cursor_mcp" ]]; then
-            local already
-            already=$(jq -r --arg key "$mcp_key" '.mcpServers[$key] // empty' "$cursor_mcp" 2>/dev/null || echo "")
-            if [[ -n "$already" ]]; then
-                echo "  ~/.cursor/mcp.json: ${mcp_key} entry already present — skipping."
-            else
-                if _confirm_yn "Write ${mcp_key} MCP entry to ~/.cursor/mcp.json?"; then
-                    local updated
-                    updated=$(jq --arg key "$mcp_key" --argjson entry "$claude_entry" '.mcpServers[$key] = $entry' "$cursor_mcp")
-                    printf '%s\n' "$updated" > "$cursor_mcp"
-                    echo "  Updated: $cursor_mcp"
-                fi
-            fi
-        else
-            if _confirm_yn "Create ~/.cursor/mcp.json with ${mcp_key} entry?"; then
-                jq -n --arg key "$mcp_key" --argjson entry "$claude_entry" '{"mcpServers":{($key):$entry}}' > "$cursor_mcp"
-                echo "  Created: $cursor_mcp"
-            fi
-        fi
+        _mcp_put "${HOME}/.cursor/mcp.json" mcpServers luamemo "$ws_entry" "~/.cursor/mcp.json" "$old_key"
     fi
-
-    # ── Claude Desktop ───────────────────────────────────────────────────
-    local claude_cfg=""
-    if [[ "$(uname)" == "Darwin" ]]; then
-        claude_cfg="${HOME}/Library/Application Support/Claude/claude_desktop_config.json"
-    else
-        claude_cfg="${HOME}/.config/Claude/claude_desktop_config.json"
-    fi
+    # ── Claude Desktop (no workspace: one entry per project, its folder pinned) ──
+    local claude_cfg="${HOME}/.config/Claude/claude_desktop_config.json"
+    [[ "$(uname)" == "Darwin" ]] && claude_cfg="${HOME}/Library/Application Support/Claude/claude_desktop_config.json"
     if [[ -f "$claude_cfg" ]]; then
         echo "  Detected: Claude Desktop (${claude_cfg})"
-        local already
-        already=$(jq -r --arg key "$mcp_key" '.mcpServers[$key] // empty' "$claude_cfg" 2>/dev/null || echo "")
-        if [[ -n "$already" ]]; then
-            echo "  claude_desktop_config.json: ${mcp_key} entry already present — skipping."
-        else
-            if _confirm_yn "Write ${mcp_key} MCP entry to Claude Desktop config?"; then
-                local updated
-                updated=$(jq --arg key "$mcp_key" --argjson entry "$claude_entry" '.mcpServers[$key] = $entry' "$claude_cfg")
-                printf '%s\n' "$updated" > "$claude_cfg"
-                echo "  Updated: $claude_cfg"
-            fi
-        fi
+        local dkey="$old_key"; [[ "$dkey" == "luamemo" ]] && dkey="luamemo-$(basename -- "$root" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')"
+        _mcp_put "$claude_cfg" mcpServers "$dkey" "$desktop_entry" "claude_desktop_config.json" "$old_key"
     fi
 
-    # ── Nothing detected — print manual instructions ─────────────────────
-    if [[ "$has_vscode" != "true" ]] && [[ ! -d "${HOME}/.cursor" ]] && [[ ! -f "$claude_cfg" ]]; then
-        echo "  No IDE config detected. Add this to your MCP client config manually:"
-        echo ""
-        echo "  VS Code (.vscode/mcp.json):"
-        jq -n --arg key "$mcp_key" --argjson entry "$vscode_entry" '{"servers":{($key):$entry}}' | sed 's/^/    /'
-        echo ""
-        echo "  Claude Desktop / Cursor (mcpServers block):"
-        jq -n --arg key "$mcp_key" --argjson entry "$claude_entry" '{"mcpServers":{($key):$entry}}' | sed 's/^/    /'
-    fi
-
+    # ── Any client: the entry, always ───────────────────────────────────────
     echo ""
-    echo "  Note: memory.setup() and routes.register() are only needed if your"
-    echo "  application code calls store.write/search in-process, or you want"
-    echo "  the /api/memory HTTP routes available to non-MCP clients."
-    echo "  For Copilot Agent Mode, Cursor, or Claude Desktop using MEMO_DB_URL,"
-    echo "  the MCP server above handles everything — no setup() call required."
-    echo ""
-    echo "  IMPORTANT — verify MEMO_DB_URL for your deployment environment:"
-    echo "  The MCP server connects to Postgres using the MEMO_DB_URL value above."
-    echo "  In Docker deployments 127.0.0.1 is the MCP client host, not the"
-    echo "  container. Use the service name or a host-routable address instead,"
-    echo "  e.g. postgresql://user:pass@db:5432/luamemo"
-    echo "  Update the env.MEMO_DB_URL field in the generated config if needed."
+    _mcp_print_config "" | sed 's/^/  /'
+    echo "  (Claude Code with the luamemo plugin needs nothing: the plugin starts memo mcp.)"
+    echo "  More clients: README.md → Connect any MCP client."
     echo ""
 }
 
-# ---------------------------------------------------------------------------
-# _cmd_doctor_check: standalone DB health check via psql.
-# Requires only a DB URL. No Lua interpreter, no setup() context needed.
-# Exits 0 if healthy, 1 if problems found.
-# ---------------------------------------------------------------------------
-_cmd_doctor_check() {
-    local db_url="${1:-${MEMO_DB_URL:-}}"
-    if [[ -z "$db_url" ]]; then
-        echo "memo doctor --db-url: no DB URL provided and MEMO_DB_URL is not set." >&2
-        echo "  Usage: memo doctor --db-url postgresql://user:pass@host:5432/dbname" >&2
-        exit 1
+# _memo_server_path → the absolute path of the mcp/server.lua that belongs with this
+# memo (exit 1 when none is found). In order:
+#   1. next to this script — a dev clone or the plugin (<root>/cli/memo → <root>/mcp);
+#   2. the rock tree of the prefix memo is installed in (<prefix>/bin/memo →
+#      <prefix>/lib/luarocks/rocks-5.1/luamemo/<version>/mcp) — fast, no luarocks call;
+#   3. `luarocks show luamemo` — the prefix luarocks installed it in;
+#   4. the usual LuaRocks trees (~/.luarocks, /usr/local, /usr).
+# Among installed versions, the newest.
+_memo_server_path() {
+    local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local rel="$script_dir/../mcp/server.lua" srv="" lr prefix
+    if [[ -f "$rel" ]]; then
+        srv=$(cd "$script_dir/../mcp" && pwd)/server.lua
+        printf '%s' "$srv"; return 0
     fi
-    if ! command -v psql &>/dev/null; then
-        echo "memo doctor --db-url: psql not found in PATH." >&2
-        exit 1
+    _memo_rock_server() {
+        [[ -d "$1/lib/luarocks" ]] || return 1
+        { find "$1/lib/luarocks" -maxdepth 8 -path "*/luamemo/*/mcp/server.lua" 2>/dev/null || true; } \
+            | sort -V | tail -1
+    }
+    srv=$(_memo_rock_server "$script_dir/..") || srv=""
+    if [[ -z "$srv" ]]; then
+        for lr in luarocks-5.1 luarocks; do
+            command -v "$lr" >/dev/null 2>&1 || continue
+            prefix=$("$lr" show luamemo 2>/dev/null | grep -i "installed in:" | head -1 \
+                | sed 's/.*[Ii]nstalled in:[[:space:]]*//')
+            [[ -n "$prefix" ]] && { srv=$(_memo_rock_server "$prefix") || srv=""; break; }
+        done
     fi
-    local all_ok=true
-
-    # Run all diagnostic queries in one psql session — single connection and
-    # auth handshake instead of 4 separate subprocesses.
-    # Section markers (\echo MARKER) delimit output sections for bash parsing.
-    local _psql_out
-    if ! _psql_out=$(PGPASSWORD="${PGPASSWORD:-}" psql "$db_url" --no-psqlrc -At 2>&1 <<'DOCTOR_SQL'
-\echo __LM_CONNECTED__
-SELECT extname FROM pg_extension WHERE extname = 'vector';
-\echo __LM_VEC_DONE__
-SELECT column_name FROM information_schema.columns
-WHERE  table_schema = 'public' AND table_name = 'lm_memories'
-ORDER  BY column_name;
-\echo __LM_COLS_DONE__
-SELECT table_name FROM information_schema.tables
-WHERE  table_schema = 'public' AND table_name = 'lm_kg_facts';
-\echo __LM_KG_DONE__
-DOCTOR_SQL
-    ); then
-        echo "DB connectivity..."
-        echo "  ✗ cannot connect to $(_redact_url "$db_url")"
-        exit 1
+    if [[ -z "$srv" ]]; then
+        for prefix in "$HOME/.luarocks" /usr/local /usr; do
+            srv=$(_memo_rock_server "$prefix") || srv=""
+            [[ -n "$srv" ]] && break
+        done
     fi
-    echo "DB connectivity..."
-    echo "  ✓ connected"
-
-    # Extract each section: lines between marker pairs, markers excluded.
-    local _vec_out _cols_out _kg_out
-    _vec_out=$(printf   '%s\n' "$_psql_out" | awk '/^__LM_CONNECTED__/{f=1;next} /^__LM_VEC_DONE__/{f=0}   f')
-    _cols_out=$(printf  '%s\n' "$_psql_out" | awk '/^__LM_VEC_DONE__/{f=1;next}  /^__LM_COLS_DONE__/{f=0}  f')
-    _kg_out=$(printf    '%s\n' "$_psql_out" | awk '/^__LM_COLS_DONE__/{f=1;next} /^__LM_KG_DONE__/{f=0}    f')
-
-    echo "pgvector extension..."
-    if [[ "$_vec_out" == "vector" ]]; then
-        echo "  ✓ vector extension installed"
-    else
-        echo "  ✗ vector extension missing (run: CREATE EXTENSION vector;)"
-        all_ok=false
-    fi
-
-    echo "lm_memories schema..."
-    if [[ -z "$_cols_out" ]]; then
-        echo "  ✗ lm_memories table not found"
-        echo "    Run: memo migrate | psql \"$(_redact_url "$db_url")\""
-        all_ok=false
-    else
-        _check_col_list "$_cols_out" || all_ok=false
-    fi
-
-    echo ""
-    echo "lm_kg_facts table..."
-    if [[ -n "$_kg_out" ]]; then
-        echo "  ✓ present"
-    else
-        echo "  ✗ missing (run: memo migrate | psql \"$(_redact_url "$db_url")\")"
-        all_ok=false
-    fi
-
-    echo ""
-    if [[ "$all_ok" == "true" ]]; then
-        echo "All checks passed — database is healthy."
-    else
-        echo "Problems found. Run: memo migrate | psql \"$(_redact_url "$db_url")\""
-        exit 1
-    fi
+    [[ -n "$srv" && -f "$srv" ]] || return 1
+    srv=$(cd "$(dirname -- "$srv")" && pwd)/server.lua
+    printf '%s' "$srv"
 }
 
-# memo doctor [--db-url URL] [--setup PATH] [--json]
-# --db-url URL: standalone mode (no Lua, no setup() context needed).
-# Without --db-url: falls through to the Lua-based doctor.
-cmd_doctor() {
-    local db_url=""
-    local passthrough_args=()
+# memo's own absolute path, as invoked (a symlink stays a symlink: an upgrade that
+# moves the files it points to keeps working) — for client configs: a GUI app may
+# not have the user's PATH.
+_memo_self_path() {
+    printf '%s/%s' "$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" "$(basename -- "${BASH_SOURCE[0]}")"
+}
+
+# memo mcp [--project PATH] [--print-config]: the MCP stdio server, with this
+# project's settings (read above, like every memo command — the client's config needs
+# no MEMO_* environment). --print-config: the client entry that starts it.
+cmd_mcp() {
+    local print=false project=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --db-url) db_url="$2"; shift 2 ;;
-            *) passthrough_args+=("$1"); shift ;;
+            --project) project="${2:?--project needs a directory}"; shift 2 ;;
+            --print-config) print=true; shift ;;
+            -h|--help)
+                cat <<'EOF'
+Usage: memo mcp [--project PATH] [--print-config]
+
+Runs the luamemo MCP server over stdio — the command an MCP client starts. The settings
+are the project's (its .luamemorc, over ~/.luamemorc), found like every memo command:
+--project PATH, else the nearest directory from the client's working directory up that
+holds a .luamemorc. The client's config needs no MEMO_* environment (nothing secret).
+
+  --project PATH   the project (e.g. VS Code: ${workspaceFolder})
+  --print-config   print the client entry that starts this server, and exit
+EOF
+                return 0 ;;
+            *) echo "memo mcp: unknown option: $1 (memo mcp --help)" >&2; return 2 ;;
         esac
     done
-    if [[ -n "$db_url" ]]; then
-        _cmd_doctor_check "$db_url"
-        return $?
+    if [[ "$print" == true ]]; then
+        _mcp_print_config "$project"
+        return 0
     fi
-    cmd_local_lua doctor "${passthrough_args[@]}"
+    local lua; lua=$(find_lua) || _no_lua
+    local server; server=$(_memo_server_path) || {
+        echo "memo mcp: mcp/server.lua not found next to $(_memo_self_path) or in a LuaRocks tree" \
+            "— reinstall luamemo (luarocks install luamemo)" >&2
+        exit 1
+    }
+    # The settings are in the environment already (memo read the .luamemorc files):
+    # the server doesn't read them a second time.
+    MEMO__SETTINGS_LOADED=1 exec "$lua" "$server"
+}
+
+# _mcp_print_config [PROJECT] — the generic client entries for `memo mcp`.
+_mcp_print_config() {
+    require_jq
+    local project="$1" self; self=$(_memo_self_path)
+    local args='["mcp"]' vsargs='["mcp","--project","${workspaceFolder}"]' cli_args=(mcp)
+    if [[ -n "$project" ]]; then
+        project=$(cd "$project" 2>/dev/null && pwd) || project="$1"
+        args=$(jq -cn --arg p "$project" '["mcp","--project",$p]'); vsargs="$args"
+        cli_args=(mcp --project "$project")
+    fi
+    echo "luamemo in an MCP client — the same entry everywhere; nothing secret in it (memo mcp"
+    echo "reads the project's .luamemorc)."
+    echo ""
+    echo "Most clients (Claude Desktop, Claude Code's .mcp.json, Cursor, Windsurf…) — \"mcpServers\":"
+    jq -n --arg c "$self" --argjson a "$args" '{"mcpServers":{"luamemo":{"command":$c,"args":$a}}}'
+    echo ""
+    echo "VS Code (.vscode/mcp.json or the user's mcp.json) — \"servers\":"
+    jq -n --arg c "$self" --argjson a "$vsargs" '{"servers":{"luamemo":{"type":"stdio","command":$c,"args":$a}}}'
+    echo ""
+    echo "Claude Code from the terminal:"
+    printf '  claude mcp add luamemo -s user --'
+    printf ' %q' "$self" "${cli_args[@]}"
+    printf '\n\n'
+    if [[ -n "$project" ]]; then
+        echo "The project: $project (--project)."
+    else
+        echo "The project: the nearest directory from the client's working directory up that holds a"
+        echo ".luamemorc (memo calibrate writes it) — or pass --project PATH in \"args\"."
+    fi
+}
+
+# memo gguf [status | install]: the in-process GGUF embedder's runtime (luamemo.cli.gguf).
+# install downloads this release's prebuilt one and records it for every project
+# (MEMO_GGUF_SHIM in ~/.luamemorc).
+cmd_gguf() {
+    local lua; lua=$(find_lua) || _no_lua
+    if [[ "${1:-status}" != install ]]; then _lua_run "$lua" gguf "$@"; return $?; fi
+    local out rc=0 shim
+    out=$(_lua_run "$lua" gguf install 2>&1) || rc=$?
+    printf '%s\n' "$out" | grep -v '^SHIM '
+    [[ $rc -eq 0 ]] || return $rc
+    shim=$(printf '%s\n' "$out" | sed -n 's/^SHIM //p' | tail -1)
+    [[ -n "$shim" ]] || return 1
+    cmd_config set --user MEMO_GGUF_SHIM "$shim" >/dev/null && export MEMO_GGUF_SHIM="$shim" \
+        && echo "  MEMO_GGUF_SHIM=$shim recorded in ~/.luamemorc (every project)."
+}
+
+# _calibrate_gguf_runtime <lua> — calibrate's offer of the prebuilt runtime (above).
+_calibrate_gguf_runtime() {
+    local lua="$1" offer
+    offer=$("$lua" -e "$_LUA_PATH_GUARD
+local shim = require('luamemo.embedders.native.ffi_shim').shim_path()
+local f = io.open(shim, 'rb'); if f then f:close(); return end
+local b = require('luamemo.embedders.native.bundle').available()
+if b then io.write(b.platform, ' ', b.asset) end" 2>/dev/null) || offer=""
+    [[ -n "$offer" ]] || return 0
+    echo ""
+    echo "GGUF runtime: this release has a prebuilt in-process embedder runtime for ${offer%% *}"
+    echo "  (${offer#* }, from github.com/kaio326/luamemo/releases; checked against the checksum"
+    echo "  in this install) — no compiler or llama.cpp build needed."
+    if _confirm_yn "Download and install it?"; then
+        cmd_gguf install || echo "  Not installed — the embedder recommendation below doesn't use it."
+    fi
 }
 
 cmd_local_lua() {
     local module="$1"; shift
-    local lua
-    if ! lua=$(find_lua); then
-        echo "memo: no Lua interpreter found (tried lua5.1, luajit, lua5.3, lua5.4, lua)" >&2
-        exit 1
+    local lua; lua=$(find_lua) || _no_lua
+    # exec: signals (e.g. SIGTERM to a `memo serve` daemon) reach Lua directly.
+    # Consequence: this must be the LAST command of its caller — nothing after it
+    # runs. Mid-function callers (e.g. calibrate) use _lua_run instead.
+    MEMO__ARGV="$(_lua_argv "$@")" MEMO__MODULE="$module" exec "$lua" -e "$_LUA_RUN"
+}
+
+# memo config …: luamemo.cli.config does the work; a setting it wrote into the
+# project's .luamemorc keeps that file out of git (it holds this machine's settings).
+cmd_config() {
+    local lua; lua=$(find_lua) || _no_lua
+    local rc=0 a user=false
+    for a in "$@"; do [[ "$a" == "--user" ]] && user=true; done
+    MEMO__PROJECT_DIR="$_MEMO_PROJECT_DIR" _lua_run "$lua" config "$@" || rc=$?
+    if [[ $rc -eq 0 && "${1:-}" == "set" && "$user" == false && -f "$_MEMO_PROJECT_DIR/.luamemorc" ]]; then
+        _gitignore_local "$_MEMO_PROJECT_DIR" ".luamemorc"
     fi
-    local args=""
-    for a in "$@"; do
-        args+="[==[${a}]==],"
-    done
-    "$lua" -e "package.path='./?/init.lua;'..package.path; require('luamemo.cli.${module}').run({${args}})"
+    return $rc
 }
 
 usage() {
@@ -2087,6 +2186,9 @@ case "$sub" in
     summarize) cmd_summarize "$@" ;;
     promote) cmd_promote "$@" ;;
     context) cmd_context "$@" ;;
+    kg)     cmd_kg     "$@" ;;
+    embed)  cmd_embed  "$@" ;;
+    tune-weights) cmd_tune_weights "$@" ;;
     brief)  cmd_brief   "$@" ;;
     consolidate) cmd_consolidate "$@" ;;
     digest) cmd_digest "$@" ;;
@@ -2100,17 +2202,24 @@ case "$sub" in
     secret-list)    cmd_secret_list         ;;
     secret-delete)  cmd_secret_delete  "$@" ;;
     secret-execute) cmd_secret_execute "$@" ;;
-    migrate) cmd_migrate "$@" ;;
+    config)  cmd_config "$@" ;;
+    mcp)     cmd_mcp "$@" ;;
+    gguf)    cmd_gguf "$@" ;;
+    backup)  cmd_local_lua backup "$@" ;;
+    export)  cmd_local_lua export "$@" ;;
+    import)  cmd_local_lua import "$@" ;;
+    serve)   cmd_local_lua serve "$@" ;;
+    org)     cmd_local_lua org "$@" ;;
     ping)
-        # Show which config file supplied MEMO_DB_URL so the user knows which
-        # database will be checked — critical when multiple projects are present.
+        # Show which config file named the database (MEMO_DB) so the user knows
+        # which one is checked — critical when multiple projects are present.
         case "${_MEMO_CONFIG_SOURCE:-}" in
-            local)  echo "[INFO] config: $PWD/.luamemorc" ;;
-            global) echo "[WARN] config: ~/.memorc (global — no .luamemorc in $PWD)" ;;
+            local)  echo "[INFO] config: $_MEMO_PROJECT_DIR/.luamemorc" ;;
+            global) echo "[WARN] config: ~/.luamemorc (every project's — no .luamemorc names a database here)" ;;
             *)      echo "[INFO] config: environment" ;;
         esac
         cmd_local_lua ping "$@" ;;
-    doctor)  cmd_doctor            "$@" ;;
+    doctor)  cmd_local_lua doctor "$@" ;;
     -h|--help|help) usage ;;
     *) echo "memo: unknown subcommand: $sub" >&2; usage ;;
 esac

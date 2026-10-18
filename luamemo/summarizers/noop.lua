@@ -31,7 +31,7 @@ function M.summarize(memories, _cfg)
 
     local title
     if #titles > 0 then
-        title = "Summary: " .. table.concat(titles, " | "):sub(1, 200)
+        title = "Summary: " .. require("luamemo.util").cut_utf8(table.concat(titles, " | "), 200)
     else
         title = "Summary of " .. tostring(#memories) .. " memories"
     end

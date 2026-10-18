@@ -1,156 +1,153 @@
 # luamemo eval harness
 
-Quantify how well luamemo retrieves the right session against the
-[LongMemEval](https://huggingface.co/datasets/xiaoyangwu/longmemeval)
-benchmark (Lin et al., 2024). The harness runs with plain `lua5.1` — no
-OpenResty or Lapis runtime required. All PostgreSQL access goes through
-`luamemo.db`, which falls back to a direct pgmoon connection when
-`ngx` is absent.
+The test suite, and the benchmarks that measure how well luamemo retrieves the
+right memory — none of it is shipped in the rock.
 
-## What it measures
-
-- **Recall@k** for k ∈ {1, 5, 10, 20}: a question is a "hit" at k when
-  any of its `answer_session_ids` appears in the top-k retrieved sessions.
-- **MRR** (Mean Reciprocal Rank).
-- Per `question_type` breakdown: `multi-session`, `single-session-user`,
-  `single-session-preference`.
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `longmemeval_run.lua` | Main eval entry point. Ingest + query loop; writes a JSON result file. |
-| `datasets/longmemeval.lua` | Pure-Lua dataset loader + session→memory flattener. |
-| `recall_bench.lua` | Synthetic recall benchmark (hash vs. HTTP embedder head-to-head). |
-| `_resty_http_shim.lua` | LuaSocket-backed `resty.http` shim. Preloaded by eval scripts so `luamemo.http`'s `resty.http` path works in plain Lua. |
-| `sidecars/` | Docker Compose file + docs for the TEI GPU sidecars (bge-m3 embedder, bge-reranker-v2-m3). |
-| `results/longmemeval.md` | Full phase-by-phase results, reproduce commands, and analysis. |
-
-## Quick start
-
-### Prerequisites
+## Running the test suite
 
 ```bash
-# PostgreSQL reachable at 127.0.0.1:5432 with a test database
-PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test PGUSER=postgres PGPASSWORD=postgres \
-  psql -c "SELECT 1"
-
-# Apply the bruteforce schema (one-time)
-PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test PGUSER=postgres PGPASSWORD=postgres \
-  psql < luamemo/schema_bruteforce.sql
-
-# Dataset (longmemeval_s.json, ~266 MB)
-# Download from HuggingFace if not present:
-# https://huggingface.co/datasets/xiaoyangwu/longmemeval
+eval "$(luarocks --lua-version 5.1 path)"     # the rocks the tests load (luasocket, …)
+luajit eval/tests/run.lua                     # every eval/tests/test_*.lua
+luajit eval/tests/run.lua --only core,cli     # a subset (names with or without test_)
+luajit eval/tests/run.lua --list              # what would run
 ```
 
-### Run with the hash embedder (zero GPU, ~1 min for n=50)
+Run it from the repository root. It needs LuaJIT and the native libraries
+(SQLite, libsodium) — no database server. Each file runs on its own, in a clean
+environment:
 
-```bash
-cd /path/to/luamemo
+- its own new database — `MEMO_DB` is a fresh SQLite file in the run's
+  temporary directory (tests create further databases there);
+- a temporary `HOME` and XDG directories, so your `~/.memorc`, `~/.luamemorc`,
+  data directory and federation keyring are never touched;
+- `MEMO_PROJECT` pointing at an empty directory, so the checkout's own
+  `.luamemorc` never redirects a `memo` the tests run from the repository root;
+- every `MEMO_*` variable from your shell removed (the optional `MEMO_GGUF_*`,
+  `MEMO_GEN_*`, `MEMO_LIB_*` and `MEMO_LIVE_*` knobs are kept) and `MEMO_EMBEDDER=hash`.
 
-PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test PGUSER=postgres PGPASSWORD=postgres \
-  lua5.1 eval/longmemeval_run.lua --embedder hash \
-    --corpus eval/data/longmemeval_s.json --n 50 \
-    --out eval/results/smoke_hash.json
-```
+It prints one line per file and the totals and exits 1 when anything fails; the
+logs of a failing run are kept and their directory is printed. Options:
+`--timeout SECONDS` (per file, default 600), `--keep` (keep the logs), `--lua
+BIN` (the interpreter for the tests; default: the one running the runner).
+Don't edit repository files while it runs — some tests index the live checkout.
+A few tests are skipped unless their optional piece is there (e.g. the
+generative sensor needs `MEMO_GEN_MODEL`). The optional ones:
 
-### Run with Ollama (nomic-embed-text, ~12 min for n=200)
-
-```bash
-PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test PGUSER=postgres PGPASSWORD=postgres \
-  OLLAMA_MODEL=nomic-embed-text OLLAMA_DIM=768 \
-  lua5.1 eval/longmemeval_run.lua --embedder ollama \
-    --corpus eval/data/longmemeval_s.json --n 200 \
-    --out eval/results/longmemeval_ollama_s_n200.json
-```
-
-### Run with bge-m3 via TEI GPU sidecar (~25 min for n=200)
-
-```bash
-# Bring up both TEI sidecars (requires NVIDIA GPU + Docker with GPU access)
-docker compose -f eval/sidecars/docker-compose.yml up -d
-
-# Wait for both sidecars to be ready
-docker compose -f eval/sidecars/docker-compose.yml logs tei-embed | grep -m1 Ready
-docker compose -f eval/sidecars/docker-compose.yml logs tei-reranker | grep -m1 Ready
-
-# Run
-PGHOST=127.0.0.1 PGDATABASE=lm_bruteforce_test PGUSER=postgres PGPASSWORD=postgres \
-  TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
-  lua5.1 eval/longmemeval_run.lua --embedder tei \
-    --corpus eval/data/longmemeval_s.json \
-    --out eval/results/longmemeval_tei_bge-m3_s.json
-```
-
-See [sidecars/tei.md](sidecars/tei.md) for sidecar setup and resource requirements.
-
-## CLI flags (`longmemeval_run.lua`)
-
-| Flag | Default | Purpose |
+| Test | Runs when | Knobs |
 |---|---|---|
-| `--embedder` | _(required)_ | `hash`, `ollama`, `tei`, `openai` |
-| `--corpus` | _(required)_ | Path to `longmemeval_s.json` |
-| `--out` | _(required)_ | Output JSON path |
-| `--n` | all | Cap to N questions (for smoke runs) |
-| `--k-max` | `20` | Max candidates to retrieve per question |
-| `--rerank` | off | Enable reranker pass |
-| `--rerank-adapter` | `noop` | `noop`, `ollama`, `openai`, `cross_encoder` |
-| `--rerank-top-n` | `20` | Candidates passed to the reranker |
-| `--sweep-weights` | off | Comma-separated vector weights (e.g. `"0.25,0.5,0.75"`) |
+| `test_gguf_ffi` | the shim is built and a GGUF model is found | `MEMO_GGUF_MODEL`, `MEMO_GGUF_SHIM` |
+| `test_gguf_bundle` (its last part) | a prebuilt runtime is given | `MEMO_LIVE_GGUF_BUNDLE` (built by `eval/release/gguf_bundle.sh`) |
+| `test_embedders_live` | Ollama / TEI answer | `MEMO_LIVE_OLLAMA_URL` / `_MODEL` / `_DIM`, `MEMO_LIVE_TEI_URL` / `_DIM` |
+| `test_rock` | `luarocks`, `git`, `jq`, `tar` are installed | — |
 
-Environment variables used:
+## Release tools (`eval/release/`)
 
-| Var | Purpose |
+| Script | What it does |
 |---|---|
-| `PGHOST` / `PGDATABASE` / `PGUSER` / `PGPASSWORD` | PostgreSQL connection (read by `luamemo.db`) |
-| `OLLAMA_URL` / `OLLAMA_MODEL` / `OLLAMA_DIM` | Ollama embedder config |
-| `TEI_URL` / `TEI_DIM` / `TEI_MODEL` | TEI embedder config |
-| `RERANK_URL` / `RERANK_MODEL` / `RERANK_API_KEY` | Cross-encoder reranker config |
-| `EMBED_MAX_CHARS` | Truncate session bodies at this length (default 6000) |
-| `INGEST_BATCH_SIZE` | INSERT chunk size for `write_many` (default 50) |
-| `INGEST_MODE=perrow` | Fall back to per-row `write` loop (A/B speedup measurement) |
+| `rockspec.lua VERSION [--check \| --print]` | Generates the rockspec (every `luamemo/**/*.lua`), or checks the committed one |
+| `smoke.sh ROCKSPEC \| SRC.ROCK` | Installs the rock into a fresh tree and uses it: modules, `memo`, `memo mcp` |
+| `gguf_bundle.sh VERSION [OUT]` | Builds the prebuilt GGUF runtime for this machine |
+| `write_bundles.lua VERSION DIR` | Writes the runtimes' checksums into `bundles.lua` (the release workflow) |
 
-## Benchmark results summary
+The workflows that use them are in `.github/workflows/`; the steps are in
+[RELEASING.md](../RELEASING.md).
 
-Full analysis in [results/longmemeval.md](results/longmemeval.md).
+## Benchmarks
 
-| Embedder | n | R@1 | R@5 | R@10 | R@20 | MRR | Phase |
-|---|---|---|---|---|---|---|---|
-| hash (in-process, lexical) | 200 | ~40% | ~60% | ~70% | ~80% | ~0.50 | — |
-| nomic-embed-text 768d (Ollama) | 200 | 62.0% | 81.5% | 87.5% | 92.5% | 0.706 | 15.3 |
-| bge-m3 1024d (TEI), n=200 slice | 200 | 80.0% | 93.5% | 96.5% | 99.5% | 0.862 | 16.1 |
-| **bge-m3 1024d (TEI), full corpus** | **500** | **87.0%** | **96.4%** | **98.6%** | **99.6%** | **0.913** | **17.2** |
+Retrieval only: does the memory that answers a question come back in the top k?
+Generated answers are not scored, so the numbers isolate luamemo's part from the
+LLM's.
 
-Key observations:
+| Runner | Dataset | Measures |
+|---|---|---|
+| `longmemeval_run.lua` | [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval) — `oracle` (default) or `_s` (`--corpus eval/data/longmemeval_s.json`) | R@k / MRR per question type |
+| `locomo_run.lua` | LoCoMo (`eval/data/locomo.json`) | R@k / MRR |
+| `convomem_run.lua` | ConvoMem (`eval/data/convomem.json`, built from the raw batches by `build_convomem_corpus.lua`) | R@k / MRR |
+| `membench_run.lua` | MemBench (`eval/data/membench/`) | R@k / MRR per category |
+| `personalization_run.lua` | the project-personalization set (`eval/personalization/`) — questions about one project's own conventions | R@k / MRR by lexical overlap |
+| `recall_bench.lua` | a synthetic, paraphrased corpus (`helpers.lua` generates it) | `--mode ci` asserts the locked baseline |
+| `rerank_bench.lua`, `projection_bench.lua` | the personalization set | the learned reranker / projection, cross-validated |
+| `embedder_compare.lua`, `portability_check.lua` | — | embedders side by side; the same results across environments |
 
-- **The embedder is the dominant accuracy lever.** Switching
-  `nomic-embed-text` → `bge-m3` adds +14.9 pp R@5 (n=500) with zero
-  other changes.
-- **Full-corpus results are more representative.** The n=200 slice
-  contained only 3 of 6 question types, all on the harder end. At
-  n=500, `single-session-assistant` (100% R@5) and `knowledge-update`
-  (100% R@5) lift the overall mean, reaching parity with LLM-summarisation
-  pipelines that report ~96.6% R@5 on the same benchmark.
-- **Cross-encoder reranking with same-family models adds nothing.** When
-  the bi-encoder (`bge-m3`) and the reranker (`bge-reranker-v2-m3`) share
-  the same model family, the reranker agrees with the bi-encoder ordering
-  and produces no measurable recall improvement (Phase 16.3).
-- **Rerank=noop regresses R@1.** The `noop` adapter retrieves `top_n=20`
-  before the pass; with a stronger embedder the extra candidates introduce
-  ordering noise. Recommended: no reranker with bge-m3.
-- **3 misses in 500** (all outside top-20). One persistent `single-session-user`
-  truncation case; two in `temporal-reasoning`. These are the hard ceiling
-  for the current single-stage retrieval path.
+Every runner writes into the database `MEMO_DB` names — use a scratch one; each
+run wipes its own scopes (e.g. `lme:<embedder>:<question id>`):
 
-## Notes & limitations
+```bash
+# hash (in-process, no GPU, a few seconds on oracle)
+MEMO_DB=bench luajit eval/longmemeval_run.lua --embedder hash --out /tmp/lme_hash.json
 
-- Decay weighting is bypassed in eval (`ignore_decay = true`) so all
-  candidates are scored on raw hybrid similarity.
-- Dedup is disabled; every haystack session must land as its own row.
-- Each question gets its own scope (`lme:<embedder>:<question_id>`) so
-  rows are isolated across questions and across embedder runs.
-- ~30–40 sessions per full run fail with
-  `ERROR: invalid byte sequence for encoding "UTF8"` from pgmoon on
-  corpus rows with mixed-encoding bytes. Failed sessions are skipped;
-  recall numbers are over the surviving population.
+# Ollama (nomic-embed-text)
+MEMO_DB=bench OLLAMA_MODEL=nomic-embed-text OLLAMA_DIM=768 \
+  luajit eval/longmemeval_run.lua --embedder ollama --out /tmp/lme_ollama.json
+
+# bge-m3 on a TEI sidecar (see sidecars/)
+docker compose -f eval/sidecars/docker-compose.yml up -d
+MEMO_DB=bench TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
+  luajit eval/longmemeval_run.lua --embedder tei --corpus eval/data/longmemeval_s.json --out /tmp/lme_tei.json
+```
+
+`longmemeval_run.lua` flags: `--embedder` (`hash`, `ollama`, `tei`, `openai`,
+`gguf`), `--corpus`, `--out`, `--n N` (the first N questions), `--k-max`
+(20), `--rerank` with `--rerank-adapter` (`noop`, `ollama`, `openai`,
+`cross_encoder`) and `--rerank-top-n`, `--sweep-weights 0.25,0.5,0.75` (vector
+weights to compare), `--with-observations` / `--skip-temporal` /
+`--no-timestamps` (ablations), `--summarizer-model`. `locomo_run.lua` and
+`convomem_run.lua` take the same flags; `membench_run.lua` takes `--embedder`,
+`--out`, `--n`, `--k-max`, `--cats`, `--topic`, `--scope-prefix`;
+`personalization_run.lua` `--embedder` and `--out`.
+
+Environment the runners read: `OLLAMA_URL` / `OLLAMA_MODEL` / `OLLAMA_DIM`,
+`TEI_URL` / `TEI_MODEL` / `TEI_DIM`, `OPENAI_URL` / `OPENAI_MODEL` /
+`OPENAI_DIM` / `OPENAI_API_KEY`, `MEMO_GGUF_MODEL` / `MEMO_GGUF_DIM`,
+`RERANK_URL` / `RERANK_MODEL` / `RERANK_API_KEY` (cross-encoder),
+`EMBED_MAX_CHARS` (default 6000), `EMBED_TIMEOUT_MS`, `INGEST_BATCH_SIZE`
+(rows per `write_many` batch, 50), `INGEST_MODE=perrow` (one write per row).
+
+Datasets live in the gitignored `eval/data/`; each runner's header says where to
+download its data. Small fixtures for the smoke tests are tracked in
+`eval/fixtures/`.
+
+## Results
+
+The current numbers (October 2026, this store — the same vectors as the previous
+Postgres store, within ±0.4 points of it everywhere):
+
+| Benchmark | hash R@1 / R@5 / R@10 | nomic-embed-text | bge-m3 (TEI) |
+|---|---|---|---|
+| Project personalization (36) | 58.3 / 88.9 / 94.4 | 72.2 / 97.2 / 100 | 94.4 / 100 / 100 |
+| LongMemEval oracle (500) | 100 / 100 / 100 | 99.8 / 99.8 / 99.8 | 100 / 100 / 100 |
+| LoCoMo | 45.3 / 68.8 / 82.6 | 52.9 / 77.3 / 87.7 | 58.3 / 84.6 / 92.3 |
+| ConvoMem | 82.8 / 96.5 / 96.5 | 90.2 / 96.5 / 96.5 | 92.0 / 96.5 / 96.5 |
+| MemBench (8,500) | 42.5 / 72.9 / 83.6 | | |
+
+LongMemEval `_s` (500 questions, ~50 sessions of haystack each), measured on the
+previous store:
+
+| Embedder | n | R@1 | R@5 | R@10 | R@20 | MRR |
+|---|---|---|---|---|---|---|
+| hash | 500 | 49.0 % | 69.4 % | 81.0 % | 91.2 % | 0.586 |
+| nomic-embed-text 768d (Ollama) | 500 | 64.8 % | 81.8 % | 90.0 % | 94.4 % | 0.733 |
+| **bge-m3 1024d (TEI)** | **500** | **87.0 %** | **96.4 %** | **98.6 %** | **99.6 %** | **0.913** |
+
+- **The embedder is the dominant lever.** `nomic-embed-text` → `bge-m3` adds
+  about 15 points of R@5 with no other change.
+- **Same-family cross-encoder reranking adds nothing**: `bge-m3` +
+  `bge-reranker-v2-m3` agree point for point.
+- **`noop` reranking hurts a strong embedder** (R@1 −7.5 points on bge-m3) while
+  it lifts a weaker one (+12 points R@1 on nomic).
+
+Phase-by-phase analyses and every reproduce command:
+[results/longmemeval.md](results/longmemeval.md), [results/locomo.md](results/locomo.md),
+[results/convomem.md](results/convomem.md), [results/recall_bench.md](results/recall_bench.md).
+The JSON files in `results/` are kept as measured, including older runs on the
+previous store.
+
+## Notes
+
+- Decay weighting is off in the runners (`ignore_decay`), so every candidate is
+  scored on raw hybrid similarity; dedup is off, so every haystack session lands
+  as its own memory.
+- Each question gets its own scope, isolated across questions and embedders.
+- An embedder that rejects a session as too long gets it shortened and retried
+  (the memory is flagged as truncated); one it still refuses is stored without a
+  vector, found by its words only.

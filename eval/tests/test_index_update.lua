@@ -5,8 +5,8 @@
 --   3. Delete a file → all associated rows deleted
 --   4. Add a new file → new rows created
 --
--- Requires MEMO_DB_URL to be set.
--- Run: lua5.1 eval/tests/test_index_update.lua
+-- Requires MEMO_DB to be set.
+-- Run: luajit eval/tests/test_index_update.lua
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 
@@ -29,9 +29,9 @@ end
 -- ---------------------------------------------------------------------------
 -- Env / setup
 -- ---------------------------------------------------------------------------
-local db_url = os.getenv("MEMO_DB_URL")
-if not db_url or db_url == "" then
-    io.stderr:write("[SKIP] MEMO_DB_URL not set\n")
+local db_name = os.getenv("MEMO_DB")
+if not db_name or db_name == "" then
+    io.stderr:write("[SKIP] MEMO_DB not set\n")
     os.exit(0)
 end
 
@@ -42,7 +42,7 @@ if not ok_lm then
 end
 
 local embedder_url = os.getenv("MEMO_EMBEDDER_URL")
-local cfg = { db_url = db_url, auth_fn = function() return true end }
+local cfg = {}
 if embedder_url and embedder_url ~= "" then
     cfg.embedder_url     = embedder_url
     cfg.embedder_adapter = os.getenv("MEMO_EMBEDDER_ADAPTER") or "generic"
@@ -231,14 +231,17 @@ end
 
 -- Use direct SQL for exact title/path checks — FTS may return any row with low relevance.
 local db = require("luamemo.db")
-local esc_scope = db.escape_literal(scope)
 
 local function count_sym(title_fragment, path)
-    local r = db.query(
-        ("SELECT COUNT(*) AS n FROM lm_memories WHERE scope = %s AND kind = 'symbol'"
-      .. " AND title LIKE '%%%s%%' AND metadata->>'path' = '%s'"):format(
-            esc_scope, title_fragment, path))
-    return r and r[1] and tonumber(r[1].n) or 0
+    return tonumber(db.value("SELECT COUNT(*) FROM lm_memories WHERE scope = ? AND kind = 'symbol' "
+        .. "AND title LIKE ? AND json_extract(metadata, '$.path') = ?",
+        scope, "%" .. title_fragment .. "%", path)) or 0
+end
+
+local function count_path(path, kind)
+    return tonumber(db.value("SELECT COUNT(*) FROM lm_memories WHERE scope = ? "
+        .. (kind and "AND kind = '" .. kind .. "' " or "")
+        .. "AND json_extract(metadata, '$.path') = ?", scope, path)) or 0
 end
 
 -- Old symbol (M.subtract) should be gone.
@@ -266,10 +269,7 @@ else
 end
 
 -- No duplicate rows for module_a.lua.
-local count_res = db.query(
-    ("SELECT COUNT(*) AS n FROM lm_memories WHERE scope = %s AND kind = 'symbol' "
-  .. "AND metadata->>'path' = 'module_a.lua'"):format(db.escape_literal(scope)))
-local sym_a_count = count_res and count_res[1] and tonumber(count_res[1].n) or 0
+local sym_a_count = count_path("module_a.lua", "symbol")
 info("module_a.lua symbol rows after modify: " .. sym_a_count)
 -- v2 has M.add + M.multiply = 2 symbols.
 assert_eq(sym_a_count, 2, "exactly 2 symbol rows for module_a.lua after rename (no duplicates)")
@@ -294,17 +294,11 @@ else
 end
 
 -- file_b rows should be gone.
-local count_b = db.query(
-    ("SELECT COUNT(*) AS n FROM lm_memories WHERE scope = %s "
-  .. "AND metadata->>'path' = 'module_b.lua'"):format(db.escape_literal(scope)))
-local b_count = count_b and count_b[1] and tonumber(count_b[1].n) or 0
+local b_count = count_path("module_b.lua")
 assert_eq(b_count, 0, "all module_b.lua rows deleted after file removal")
 
 -- file_a rows should still be intact.
-local count_a2 = db.query(
-    ("SELECT COUNT(*) AS n FROM lm_memories WHERE scope = %s "
-  .. "AND metadata->>'path' = 'module_a.lua'"):format(db.escape_literal(scope)))
-local a2_count = count_a2 and count_a2[1] and tonumber(count_a2[1].n) or 0
+local a2_count = count_path("module_a.lua")
 assert_ge(a2_count, 1, "module_a.lua rows still present after sibling deleted")
 
 -- ---------------------------------------------------------------------------
@@ -327,10 +321,7 @@ else
 end
 
 -- module_c.lua rows should exist.
-local count_c = db.query(
-    ("SELECT COUNT(*) AS n FROM lm_memories WHERE scope = %s "
-  .. "AND metadata->>'path' = 'module_c.lua'"):format(db.escape_literal(scope)))
-local c_count = count_c and count_c[1] and tonumber(count_c[1].n) or 0
+local c_count = count_path("module_c.lua")
 assert_ge(c_count, 1, "module_c.lua rows created after file added")
 
 -- M.new_fn should be searchable.

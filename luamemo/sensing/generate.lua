@@ -3,27 +3,25 @@
 -- A general complete(prompt) primitive via LuaJIT FFI over the SAME gguf_shim.so
 -- (llama.cpp) used by the embedder — a small instruct GGUF (e.g. gemma-3-1b-it)
 -- loaded ON-DEMAND (cached, not resident during normal embedding). Greedy /
--- deterministic. Requires LuaJIT; returns nil + error under PUC lua5.1 so the
--- sensing pipeline degrades to heuristics-only.
+-- deterministic. Without a model or the shim it is unavailable and the sensing
+-- pipeline degrades to heuristics-only.
 --
 -- Config (cfg or env): gen_model / MEMO_GEN_MODEL (instruct .gguf, required);
 --   gen_n_ctx / MEMO_GEN_NCTX (4096); gguf_shim_path / MEMO_GGUF_SHIM;
 --   gen_n_gpu / MEMO_GEN_NGL (0 = CPU, N = offload N layers, -1 = all — requires a
 --   CUDA-built libllama; harmless no-op on a CPU-only build).
 
-local ok_ffi, ffi = pcall(require, "ffi")
+local ffi = require("luamemo.native.loader").ffi
 
 local M = {}
 
-if ok_ffi then
-    -- Only the generation symbols (the embedder's lmembed_* may already be cdef'd
-    -- by gguf_ffi.lua; re-declaring identical names would error — these are distinct).
-    pcall(ffi.cdef, [[
-        void * lmgen_load(const char * path, int n_ctx, int n_gpu_layers);
-        int    lmgen_complete(void * handle, const char * prompt, char * out, int max_out, int max_tokens);
-        void   lmgen_free(void * handle);
-    ]])
-end
+-- Only the generation symbols (the embedder's lmembed_* may already be cdef'd
+-- by gguf_ffi.lua; re-declaring identical names would error — these are distinct).
+pcall(ffi.cdef, [[
+    void * lmgen_load(const char * path, int n_ctx, int n_gpu_layers);
+    int    lmgen_complete(void * handle, const char * prompt, char * out, int max_out, int max_tokens);
+    void   lmgen_free(void * handle);
+]])
 
 local ffishim = require("luamemo.embedders.native.ffi_shim")
 
@@ -56,16 +54,14 @@ local function ensure(cfg)
     return _handle
 end
 
---- Is in-process generation usable right now? (LuaJIT + shim + model all present.)
+--- Is in-process generation usable right now? (shim + model both present.)
 function M.available(cfg)
-    if not ok_ffi then return false end
     local m = model_path(cfg)
     return (m ~= nil and m ~= "") and ffishim.exists(ffishim.shim_path(cfg)) and ffishim.exists(m)
 end
 
 --- complete(prompt, cfg) -> string | nil, err. Greedy/deterministic.
 function M.complete(prompt, cfg)
-    if not ok_ffi then return nil, "generate: requires LuaJIT (ffi)" end
     local ok, res = pcall(function()
         local lib = ffishim.load(cfg)
         local h   = ensure(cfg)

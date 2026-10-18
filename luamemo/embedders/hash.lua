@@ -11,7 +11,7 @@
 -- It cannot tell that "car" and "automobile" are related — but it pairs
 -- well with the FTS half of the hybrid query, and beats nothing.
 --
--- Vectors are L2-normalised so cosine distance is meaningful in pgvector.
+-- Vectors are L2-normalised (cosine similarity = dot product).
 --
 -- Reference: Weinberger et al., "Feature Hashing for Large Scale Multitask
 -- Learning" (2009).

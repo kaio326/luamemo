@@ -8,9 +8,8 @@
 --   Section 3: single-scope search is unchanged (only that scope's rows)
 --   Section 4: resolve_scopes composes a deduped, nil-skipping set
 --
--- Usage:
---   MEMO_DB_URL=postgresql://postgres:postgres@127.0.0.1:5432/luamemo_dev \
---     lua5.1 eval/tests/test_multiscope.lua
+-- Usage (the test runner sets a new MEMO_DB per file):
+--   MEMO_DB=/tmp/test_multiscope.db luajit eval/tests/test_multiscope.lua
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
@@ -25,15 +24,12 @@ local function check(label, ok, detail)
 end
 local function header(s) io.write(string.format("\n=== %s ===\n", s)) end
 
-memory.setup({
-    db_table = "lm_memories", embedder_local = "hash", embed_dim = 384,
-    backend = "auto", auth_fn = function() return true end, skip_embed_probe = true,
-})
+memory.setup({ embedder_local = "hash", embed_dim = 384, skip_embed_probe = true })
 
 local ORG, REPO, USER = "ms:org", "ms:repo", "ms:user"
 local function wipe()
     for _, s in ipairs({ ORG, REPO, USER }) do
-        db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(s))
+        db.run("DELETE FROM lm_memories WHERE scope = ?", s)
     end
 end
 wipe()

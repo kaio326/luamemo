@@ -10,11 +10,9 @@ eval/tmp/
 *.src.rock
 *.rock
 
-# Dev container environment file (may contain MEMO_MASTER_KEY)
-dev/.env
-
 # Local secrets — never commit
-.github/
+# (.github/ is committed — CI workflows. The local agent / planner files that
+#  used to live there are kept outside the repo, in ~/.claude/luamemo/.)
 secrets/
 research/
 .env

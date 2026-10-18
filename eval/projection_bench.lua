@@ -1,4 +1,4 @@
-#!/usr/bin/env lua5.1
+#!/usr/bin/env luajit
 -- Phase 5 — learned projection evaluation via k-fold CV on the project-
 -- personalization set. In-memory bruteforce cosine over the corpus (the
 -- projection changes vectors, so we re-embed queries+corpus with W directly;
@@ -9,10 +9,10 @@
 --   learned : rank corpus by cos(norm(W·hash(q)), norm(W·hash(body)))
 --
 -- Usage:
---   lua5.1 eval/projection_bench.lua [--dim 128] [--folds 4] [--epochs 30] [--l2 0.05]
+--   luajit eval/projection_bench.lua [--dim 128] [--folds 4] [--epochs 30] [--l2 0.05]
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
-local cjson   = require("cjson.safe")
+local cjson   = require("luamemo.json")
 local hash    = require("luamemo.embedders.hash")
 local proj    = require("luamemo.projection_train")
 

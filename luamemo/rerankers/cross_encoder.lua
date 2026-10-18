@@ -17,10 +17,11 @@
 -- sidecar's `/rerank` URL. There is NO Ollama fallback because
 -- Ollama (as of 0.23.x) does not host cross-encoder reranker models.
 --
--- Configure setup() with:
---   rerank_url     = "http://127.0.0.1:8080/rerank"     -- TEI sidecar
---   rerank_model   = "BAAI/bge-reranker-v2-m3"          -- optional
---   rerank_headers = {}                                  -- optional
+-- Settings (memo config set, or .luamemorc):
+--   MEMO_RERANK_ADAPTER=cross_encoder
+--   MEMO_RERANK_URL=http://127.0.0.1:8080/rerank          (TEI sidecar)
+--   MEMO_RERANK_MODEL=BAAI/bge-reranker-v2-m3            (optional)
+--   MEMO_RERANK_HEADERS={"Authorization": "Bearer {secret:NAME}"}   (optional — a hosted Cohere / Jina)
 --
 -- See `eval/sidecars/tei.md` for the docker-compose stub.
 --
@@ -95,15 +96,18 @@ function M.rerank(query, hits, cfg)
         raw_scores = false,
     })
 
+    local secrets = require("luamemo.secrets")
+    local extra, xerr = secrets.resolve_headers(cfg.rerank_headers)   -- {secret:NAME} → the vault
+    if not extra then return nil, "cross_encoder.rerank: " .. xerr end
     local headers = { ["Content-Type"] = "application/json" }
-    for k, v in pairs(cfg.rerank_headers or {}) do headers[k] = v end
+    for k, v in pairs(extra) do headers[k] = v end
 
     local status, body, err = http.request(url, {
         method = "POST", body = req_body, headers = headers,
         timeout_ms = cfg.rerank_timeout_ms or 30000,
     })
     local ok, herr = util.check_http(status, body, err, "cross_encoder.rerank")
-    if not ok then return nil, herr end
+    if not ok then return nil, secrets.scrub(herr, extra) end
 
     local out, perr = parse_response(body)
     if not out then return nil, perr end

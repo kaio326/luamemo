@@ -7,8 +7,8 @@
 --      import/require dependency edges
 --   4. A DB ingest of a mixed-language dir writes symbol rows for .py/.js/.lua
 --
--- Pure-parser tests need no DB. The ingest round-trip needs MEMO_DB_URL.
--- Run: lua5.1 eval/tests/test_index_multilang.lua
+-- Pure-parser tests need no DB. The ingest round-trip needs MEMO_DB.
+-- Run: luajit eval/tests/run.lua --only index_multilang
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 
@@ -169,9 +169,9 @@ end
 -- ---------------------------------------------------------------------------
 -- Test 4: DB ingest round-trip (mixed-language dir)
 -- ---------------------------------------------------------------------------
-local db_url = os.getenv("MEMO_DB_URL")
-if not db_url or db_url == "" then
-    io.stderr:write("[SKIP] MEMO_DB_URL not set — ingest round-trip skipped\n")
+local db_name = os.getenv("MEMO_DB")
+if not db_name or db_name == "" then
+    io.stderr:write("[SKIP] MEMO_DB not set — ingest round-trip skipped\n")
     io.write(("\n=== Phase 7B results: %d passed, %d failed (parser only) ===\n"):format(PASS, FAIL))
     os.exit(FAIL > 0 and 1 or 0)
 end
@@ -179,8 +179,7 @@ end
 io.write("\n--- Test 4: DB ingest round-trip ---\n")
 
 local luamemo = require("luamemo")
-local cfg = { db_url = db_url, auth_fn = function() return true end,
-              embedder_local = os.getenv("MEMO_EMBEDDER") or "hash" }
+local cfg = { embedder_local = os.getenv("MEMO_EMBEDDER") or "hash" }
 local ed = tonumber(os.getenv("MEMO_EMBED_DIM")); if ed then cfg.embed_dim = ed end
 local ok_setup, serr = pcall(luamemo.setup, cfg)
 if not ok_setup then
@@ -190,7 +189,7 @@ end
 local scope = "codeindex:test_multilang"
 local st, db = luamemo.store, require("luamemo.db")
 st.delete_where({ scope = scope })
-db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
+db.run("DELETE FROM lm_kg_facts WHERE scope = ?", scope)
 
 local res, ierr = luamemo.index.ingest(FIX, { scope = scope })
 if not res then
@@ -202,9 +201,8 @@ else
 
     -- Symbol rows for each language by path.
     local function nsym(path)
-        local r = db.query(("SELECT COUNT(*) AS n FROM lm_memories WHERE scope=%s AND kind='symbol' AND metadata->>'path'=%s")
-            :format(db.escape_literal(scope), db.escape_literal(path)))
-        return r and r[1] and tonumber(r[1].n) or 0
+        return tonumber(db.value("SELECT COUNT(*) FROM lm_memories WHERE scope = ? AND kind = 'symbol' "
+            .. "AND json_extract(metadata, '$.path') = ?", scope, path)) or 0
     end
     if nsym("sample.py") >= 6 then pass("ingest: sample.py symbol rows >= 6") else fail("ingest: sample.py symbols=" .. nsym("sample.py")) end
     if nsym("sample.js") >= 4 then pass("ingest: sample.js symbol rows >= 4") else fail("ingest: sample.js symbols=" .. nsym("sample.js")) end
@@ -212,9 +210,8 @@ else
 
     -- Non-code files: file row present, zero symbols.
     local function nfile(path)
-        local r = db.query(("SELECT COUNT(*) AS n FROM lm_memories WHERE scope=%s AND kind='file' AND metadata->>'path'=%s")
-            :format(db.escape_literal(scope), db.escape_literal(path)))
-        return r and r[1] and tonumber(r[1].n) or 0
+        return tonumber(db.value("SELECT COUNT(*) FROM lm_memories WHERE scope = ? AND kind = 'file' "
+            .. "AND json_extract(metadata, '$.path') = ?", scope, path)) or 0
     end
     if nfile("notes.md") == 1 and nsym("notes.md") == 0 then pass("ingest: notes.md file row, 0 symbols")
     else fail("ingest: notes.md file=" .. nfile("notes.md") .. " sym=" .. nsym("notes.md")) end
@@ -222,14 +219,14 @@ else
     else fail("ingest: config.json file=" .. nfile("config.json") .. " sym=" .. nsym("config.json")) end
 
     -- Title uses dotted module derived from path.
-    local t = db.query(("SELECT title FROM lm_memories WHERE scope=%s AND kind='symbol' AND metadata->>'path'='sample.py' AND title LIKE '%%make_dog%%' LIMIT 1")
-        :format(db.escape_literal(scope)))
+    local t = db.query("SELECT title FROM lm_memories WHERE scope = ? AND kind = 'symbol' "
+        .. "AND json_extract(metadata, '$.path') = 'sample.py' AND title LIKE '%make_dog%' LIMIT 1", scope)
     if t and t[1] then pass("ingest: python symbol title = " .. t[1].title)
     else fail("ingest: make_dog title row not found") end
 end
 
 st.delete_where({ scope = scope })
-db.query(("DELETE FROM lm_kg_facts WHERE scope = %s"):format(db.escape_literal(scope)))
+db.run("DELETE FROM lm_kg_facts WHERE scope = ?", scope)
 info("cleaned up scope")
 
 io.write(("\n=== Phase 7B results: %d passed, %d failed ===\n"):format(PASS, FAIL))

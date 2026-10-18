@@ -1,28 +1,29 @@
 -- eval/tests/test_membench.lua
--- Fixture-based smoke test for the MemBench evaluation harness.
+-- Fixture-based test for the MemBench evaluation harness.
 --
--- Uses eval/data/fixtures/membench_tiny.json (3 questions, 2 categories)
--- to verify:
---   1. Dataset loader reads and iterates correctly
---   2. iter_sessions() renders turns to flat text
---   3. categories() extracts all distinct categories
---   4. Full mini-run: ingest + search + score produces expected per-category buckets
---   5. JSON output file is written and parseable
+-- Uses eval/fixtures/membench_tiny/ — a tiny dataset in the REAL MemBench
+-- layout (one JSON file per category, see eval/datasets/membench.lua):
+--   aggregative.json       role-keyed, two topic keys ("roles", "events")
+--   highlevel.json         topic-keyed ("movie" kept, "food" filtered out)
+--   knowledge_update.json  role-keyed
+--   simple.json            role-keyed, plus an empty-question item (skipped)
+-- → 5 questions, 13 turns.
 --
--- Run:
---   MEMO_DB_URL=postgresql://postgres:postgres@127.0.0.1:5432/lm_bruteforce_test \
---     lua5.1 eval/tests/test_membench.lua
+-- Verifies:
+--   1. Loader: counts, deterministic id order (category → sorted topic → file
+--      order), empty-question skip, topic filter, turn flattening for both turn
+--      shapes (sid/user_message vs mid/user), target_sids, limit, categories(),
+--      missing category files skipped
+--   2. The REAL runner (eval/membench_run.lua) end-to-end on the fixture:
+--      exit status, JSON output shape + metrics, rows written, and that its
+--      --scope-prefix keeps it off real benchmark scopes (mb:hash:*)
+--
+-- Run (the test runner sets a new MEMO_DB per file):
+--   MEMO_DB=/tmp/test_membench.db luajit eval/tests/test_membench.lua
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;eval/datasets/?.lua;" .. package.path
-package.preload["resty.http"] = function() return require("helpers") end
 
-local cjson = require("cjson.safe")
-
-local db_url = os.getenv("MEMO_DB_URL")
-if not db_url or db_url == "" then
-    print("MEMO_DB_URL not set — aborting")
-    os.exit(1)
-end
+local cjson = require("luamemo.json")
 
 local pass = 0
 local fail = 0
@@ -36,159 +37,174 @@ local function check(label, cond, detail)
     end
 end
 
+local function count_keys(t) local n = 0; for _ in pairs(t or {}) do n = n + 1 end; return n end
+
+local FIXTURE_DIR = "eval/fixtures/membench_tiny"
+local CATS        = { "aggregative", "highlevel", "knowledge_update", "simple" }
+
 -- ---------------------------------------------------------------------------
--- Unit tests: dataset loader
+-- 1. Loader
 -- ---------------------------------------------------------------------------
 print("\n-- membench dataset loader --")
 
 local membench = require("membench")
-local FIXTURE  = "eval/data/fixtures/membench_tiny.json"
 
--- Load
-local data, lerr = pcall(membench.load, FIXTURE)
-check("load fixture without error", data == true or type(data) == "table", tostring(lerr))
-data = membench.load(FIXTURE)
-check("fixture returns 3 questions", #data == 3, "got " .. #data)
+local ok, data = pcall(membench.load, FIXTURE_DIR, { cats = CATS })
+check("load fixture dir without error", ok and type(data) == "table", tostring(data))
+data = ok and data or {}
+check("fixture yields 5 questions (empty question skipped, food filtered)", #data == 5, "got " .. #data)
 
--- iter_questions
-local qs = {}
-for q in membench.iter_questions(data) do
-    qs[#qs + 1] = q
-end
-check("iter_questions yields 3 items", #qs == 3, "got " .. #qs)
-check("q[1].id = mb_001",             qs[1].id == "mb_001",      tostring(qs[1] and qs[1].id))
-check("q[1].category = simple",       qs[1].category == "simple", tostring(qs[1] and qs[1].category))
-check("q[1].question is a string",    type(qs[1].question) == "string" and #qs[1].question > 0)
-check("q[1].gold_ids has 1 entry",    #qs[1].gold_ids == 1, "got " .. #(qs[1].gold_ids or {}))
-check("q[3].gold_ids has 2 entries",  #qs[3].gold_ids == 2, "got " .. #(qs[3].gold_ids or {}))
-
--- iter_questions with limit
-local qs2 = {}
-for q in membench.iter_questions(data, 2) do qs2[#qs2 + 1] = q end
-check("iter_questions(data, 2) yields 2 items", #qs2 == 2)
-
--- iter_sessions
-local sids = {}
-for sid, body in membench.iter_sessions(qs[1]) do
-    sids[#sids + 1] = sid
-    check("session body contains USER:", body:find("USER:") ~= nil, "body: " .. body:sub(1, 40))
-end
-check("q[1] has 2 sessions", #sids == 2, "got " .. #sids)
-check("first session id = sess_a", sids[1] == "sess_a", tostring(sids[1]))
-
--- categories
-local cats = membench.categories(data)
-check("categories returns sorted array", type(cats) == "table" and #cats == 3, table.concat(cats, ", "))
-check("categories[1] = 'aggregative'",      cats[1] == "aggregative",      tostring(cats[1]))
-check("categories[2] = 'knowledge_update'", cats[2] == "knowledge_update", tostring(cats[2]))
-check("categories[3] = 'simple'",           cats[3] == "simple",           tostring(cats[3]))
-
--- ---------------------------------------------------------------------------
--- Integration: mini-run through membench_run logic
--- ---------------------------------------------------------------------------
-print("\n-- mini eval run --")
-
-local memory = require("luamemo")
-memory.setup({
-    db_url           = db_url,
-    embedder_local   = "hash",
-    backend          = "bruteforce",
-    patterns_enabled = false,
-    skip_embed_probe = true,
-})
-
-local db = require("luamemo.db")
-
--- Cleanup
-for q in membench.iter_questions(data) do
-    local scope = "smoke_mb_hash:" .. q.id
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(scope))
-end
-
-local k_max  = 5
-local hits_1 = 0
-local n_q    = 0
-local by_cat = {}
-
-for q in membench.iter_questions(data) do
-    local scope = "smoke_mb_hash:" .. q.id
-    -- Ingest
-    for sid, body in membench.iter_sessions(q) do
-        local row, werr = memory.write({
-            scope    = scope,
-            kind     = "session",
-            title    = sid,
-            body     = body,
-            metadata = { session_id = sid },
-        })
-        check("ingest " .. sid .. " for " .. q.id,
-              row ~= nil and row.id ~= nil, tostring(werr))
-    end
-    -- Search
-    local results, rerr = memory.search({
-        scope             = scope,
-        query             = q.question,
-        limit             = k_max,
-        tier_min          = 0,
-        skip_observations = true,
-    })
-    check("search returns results for " .. q.id,
-          type(results) == "table" and #results > 0, tostring(rerr))
-
-    -- Score
-    local gold = {}
-    for _, gid in ipairs(q.gold_ids) do gold[gid] = true end
-    local rank = nil
-    for ri, r in ipairs(results or {}) do
-        local meta = type(r.metadata) == "table" and r.metadata or {}
-        if gold[meta.session_id] then rank = ri; break end
-    end
-    if rank == 1 then hits_1 = hits_1 + 1 end
-    n_q = n_q + 1
-    local cat = q.category or "unknown"
-    if not by_cat[cat] then by_cat[cat] = { n = 0, hits = 0 } end
-    by_cat[cat].n = by_cat[cat].n + 1
-    if rank then by_cat[cat].hits = by_cat[cat].hits + 1 end
-end
-
-check("all 3 questions scored", n_q == 3, "n_q=" .. n_q)
-check("per-category buckets populated", next(by_cat) ~= nil)
-check("categories: simple present",          by_cat.simple ~= nil)
-check("categories: knowledge_update present", by_cat.knowledge_update ~= nil)
-check("categories: aggregative present",      by_cat.aggregative ~= nil)
-check("R@1 > 0 on fixture", hits_1 > 0, "hits_1=" .. hits_1)
-
--- ---------------------------------------------------------------------------
--- JSON output writing
--- ---------------------------------------------------------------------------
-print("\n-- JSON output --")
-
-local out_path = "/tmp/smoke_membench_out.json"
-local result = {
-    embedder    = "hash",
-    n           = n_q,
-    overall     = { r1 = hits_1 / n_q },
-    by_category = by_cat,
+-- Deterministic order: category order, then topic keys SORTED, then file order.
+local want = {
+    { "aggregative",      "events" },
+    { "aggregative",      "roles"  },
+    { "highlevel",        "movie"  },
+    { "knowledge_update", "events" },
+    { "simple",           "roles"  },
 }
-local fh, ferr = io.open(out_path, "w")
-check("output file opened", fh ~= nil, tostring(ferr))
-if fh then
-    fh:write(cjson.encode(result))
-    fh:close()
-    local rfh = io.open(out_path, "r")
-    if rfh then
-        local raw = rfh:read("*a"); rfh:close()
-        local parsed, perr = cjson.decode(raw)
-        check("output JSON is parseable", parsed ~= nil, tostring(perr))
-        check("output contains n=3", parsed and parsed.n == 3)
-        os.remove(out_path)
-    end
+for i, w in ipairs(want) do
+    local q = data[i] or {}
+    check(("q[%d] = %s/%s with id %d"):format(i, w[1], w[2], i),
+        q.category == w[1] and q.topic == w[2] and q.id == i,
+        ("got %s/%s id=%s"):format(tostring(q.category), tostring(q.topic), tostring(q.id)))
 end
 
--- Cleanup
-for q in membench.iter_questions(data) do
-    local scope = "smoke_mb_hash:" .. q.id
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(scope))
+local again = membench.load(FIXTURE_DIR, { cats = CATS })
+local same = #again == #data
+for i = 1, #data do
+    if not again[i] or again[i].question ~= data[i].question then same = false end
+end
+check("two loads give the same id → question mapping", same)
+
+local empties = 0
+for _, q in ipairs(data) do if q.question == "" then empties = empties + 1 end end
+check("no empty-question item loaded", empties == 0)
+
+-- Turn flattening — role-keyed shape (sid / user_message / assistant_message),
+-- sessions concatenated in order.
+local simple = data[5] or { turns = {} }
+check("simple: 3 turns across 2 sessions", #simple.turns == 3, "got " .. #simple.turns)
+check("simple: turn sids are strings 1,2,3",
+    simple.turns[1] and simple.turns[1].sid == "1" and simple.turns[2].sid == "2" and simple.turns[3].sid == "3")
+check("simple: turn text = 'User: …\\nAssistant: …'",
+    simple.turns[1] and simple.turns[1].text
+        == "User: I prefer Lua for scripting tasks.\nAssistant: Got it! Lua is a great choice for scripting.",
+    simple.turns[1] and simple.turns[1].text)
+check("simple: target_sids = {'1'}",
+    simple.target_sids and simple.target_sids["1"] == true and count_keys(simple.target_sids) == 1)
+
+-- Topic-keyed shape (mid / user / assistant).
+local movie = data[3] or { turns = {} }
+check("highlevel: 2 turns from mid/user/assistant",
+    #movie.turns == 2 and movie.turns[1].sid == "1"
+        and (movie.turns[1].text or ""):find("User: I loved Inception", 1, true) ~= nil)
+
+-- Multi-target question.
+local agg = data[2] or {}
+check("aggregative/roles: 2 target sids (20, 21)",
+    agg.target_sids and agg.target_sids["20"] and agg.target_sids["21"] and count_keys(agg.target_sids) == 2)
+
+-- Topic filter applies to topic-keyed files only.
+local food = membench.load(FIXTURE_DIR, { cats = { "highlevel" }, topic = "food" })
+check("topic=food selects the food item of a topic-keyed file",
+    #food == 1 and food[1].topic == "food" and food[1].question:find("food", 1, true) ~= nil)
+local agg_food = membench.load(FIXTURE_DIR, { cats = { "aggregative" }, topic = "food" })
+check("topic filter does not apply to role-keyed files", #agg_food == 2, "got " .. #agg_food)
+
+-- limit
+local limited = membench.load(FIXTURE_DIR, { cats = CATS, limit = 2 })
+check("limit=2 returns the first 2 questions",
+    #limited == 2 and limited[1].id == 1 and limited[2].id == 2)
+
+-- categories()
+local cats = membench.categories(data)
+check("categories() = sorted distinct categories",
+    table.concat(cats, ",") == "aggregative,highlevel,knowledge_update,simple", table.concat(cats, ","))
+
+-- Default category list: files absent from the fixture are skipped (the
+-- loader reports each on stderr), the rest load normally.
+local all = membench.load(FIXTURE_DIR)
+check("default cats: missing category files skipped, 5 questions", #all == 5, "got " .. #all)
+
+-- ---------------------------------------------------------------------------
+-- 2. The real runner, end to end on the fixture
+-- ---------------------------------------------------------------------------
+print("\n-- membench_run.lua on the fixture --")
+
+local db_name = os.getenv("MEMO_DB")
+if not db_name or db_name == "" then
+    print("  [SKIP] MEMO_DB not set — skipping the runner run")
+else
+    local memory = require("luamemo")
+    memory.setup({ embedder_local = "hash", patterns_enabled = false, skip_embed_probe = true })
+    local db = require("luamemo.db")
+
+    local PREFIX = "smoke_mb"
+    local function scope_rows(pattern)
+        return tonumber((db.value("SELECT count(*) FROM lm_memories WHERE scope LIKE ?", pattern))) or -1
+    end
+    local function cleanup()
+        db.run("DELETE FROM lm_memories WHERE scope LIKE ?", PREFIX .. ":hash:%")
+    end
+    cleanup()
+    local real_before = scope_rows("mb:hash:%")
+
+    -- The interpreter is the lowest negative arg index (options like -e sit between).
+    local lua_bin = "luajit"
+    if arg then
+        local i = -1
+        while arg[i - 1] do i = i - 1 end
+        lua_bin = arg[i] or lua_bin
+    end
+    local out_path = os.tmpname()
+    local cmd = ("%s eval/membench_run.lua --embedder hash --data-dir %s --cats %s --k-max 5 "
+        .. "--scope-prefix %s --out %s 2>&1; echo \"__EXIT__$?\""):format(
+        lua_bin, FIXTURE_DIR, table.concat(CATS, ","), PREFIX, out_path)
+    local p = io.popen(cmd)
+    local log = p and p:read("*a") or ""
+    if p then p:close() end
+    local exit_code = tonumber(log:match("__EXIT__(%d+)"))
+    check("runner exits 0", exit_code == 0, "exit=" .. tostring(exit_code) .. " log: " .. log:sub(1, 400))
+
+    local fh = io.open(out_path, "r")
+    local raw = fh and fh:read("*a") or ""
+    if fh then fh:close() end
+    os.remove(out_path)
+    local res, jerr = cjson.decode(raw)
+    check("runner wrote parseable JSON", type(res) == "table", tostring(jerr))
+    res = type(res) == "table" and res or {}
+
+    check("result n = 5", res.n == 5, tostring(res.n))
+    local by_cat = res.by_category or {}
+    check("by_category has the 4 fixture categories",
+        by_cat.aggregative and by_cat.highlevel and by_cat.knowledge_update and by_cat.simple
+            and count_keys(by_cat) == 4)
+    check("by_category.aggregative.n = 2", by_cat.aggregative and by_cat.aggregative.n == 2)
+    check("per_question has 5 entries", type(res.per_question) == "table" and #res.per_question == 5)
+
+    local shape_ok = true
+    for i, pq in ipairs(res.per_question or {}) do
+        local q = data[i] or {}
+        if pq.id ~= q.id or pq.n_turns ~= #(q.turns or {}) or pq.n_target ~= count_keys(q.target_sids) then
+            shape_ok = false
+        end
+    end
+    check("per_question ids / n_turns / n_target match the loader", shape_ok)
+
+    local ov = res.overall or {}
+    -- Each question's scope holds ≤ 3 turns and k_max = 5, so every target is
+    -- retrievable: R@5 must be 1. R@1 / MRR show the ranking actually works.
+    check("overall R@5 = 1 (every target within k)", ov.r5 == 1, tostring(ov.r5))
+    check("overall R@1 > 0", (ov.r1 or 0) > 0, tostring(ov.r1))
+    check("overall MRR > 0", (ov.mrr or 0) > 0, tostring(ov.mrr))
+
+    check("runner wrote one memory per turn (13) under the test prefix",
+        scope_rows(PREFIX .. ":hash:%") == 13, "got " .. scope_rows(PREFIX .. ":hash:%"))
+    check("--scope-prefix left real mb:hash:* scopes untouched",
+        scope_rows("mb:hash:%") == real_before, ("before=%d after=%d"):format(real_before, scope_rows("mb:hash:%")))
+
+    cleanup()
+    check("test scopes cleaned up", scope_rows(PREFIX .. ":hash:%") == 0)
 end
 
 print(string.format("\n%d passed, %d failed\n", pass, fail))

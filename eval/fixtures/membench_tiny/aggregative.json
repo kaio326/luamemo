@@ -1,0 +1,47 @@
+{
+  "roles": [
+    {
+      "tid": 0,
+      "message_list": [
+        [
+          { "sid": 20, "user_message": "Alice and Bob attended the architecture review meeting.", "assistant_message": "Good to have both of them in the review.", "time": "2024-05-06 15:00", "place": "office" }
+        ],
+        [
+          { "sid": 21, "user_message": "Carol also joined the architecture review remotely.", "assistant_message": "Remote participation is very common now.", "time": "2024-05-06 15:30", "place": "home" }
+        ],
+        [
+          { "sid": 22, "user_message": "We discussed the CI pipeline improvements.", "assistant_message": "Sounds productive.", "time": "2024-05-07 10:00", "place": "office" }
+        ]
+      ],
+      "QA": {
+        "qid": 0,
+        "question": "Which team members attended the architecture review?",
+        "answer": "Alice, Bob and Carol",
+        "target_step_id": [[20, 0], [21, 0]],
+        "choices": { "A": "Alice, Bob and Carol", "B": "Only Alice", "C": "Bob and Dave", "D": "Nobody" },
+        "ground_truth": "A",
+        "time": "2024-05-08 09:00"
+      }
+    }
+  ],
+  "events": [
+    {
+      "tid": 0,
+      "message_list": [
+        [
+          { "sid": 30, "user_message": "The release retrospective decided to ship weekly instead of monthly.", "assistant_message": "Weekly releases shorten the feedback loop.", "time": "2024-06-01 16:00", "place": "office" },
+          { "sid": 31, "user_message": "Lunch was pizza again.", "assistant_message": "Classic.", "time": "2024-06-01 12:00", "place": "office" }
+        ]
+      ],
+      "QA": {
+        "qid": 0,
+        "question": "What did the release retrospective decide about shipping?",
+        "answer": "Ship weekly",
+        "target_step_id": [[30, 0]],
+        "choices": { "A": "Ship weekly", "B": "Ship monthly", "C": "Stop shipping", "D": "Ship daily" },
+        "ground_truth": "A",
+        "time": "2024-06-02 09:00"
+      }
+    }
+  ]
+}

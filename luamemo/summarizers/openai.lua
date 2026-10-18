@@ -2,10 +2,11 @@
 --
 -- HTTP summarizer adapter targeting OpenAI's /v1/chat/completions endpoint
 -- (or any compatible API: Together, Fireworks, vLLM, LM Studio, ...).
--- Configure setup() with:
---   summarizer_url     = "https://api.openai.com/v1/chat/completions"
---   summarizer_model   = "gpt-4o-mini"
---   summarizer_headers = { Authorization = "Bearer sk-..." }
+-- Settings (memo config set, or .luamemorc):
+--   MEMO_SUMMARIZER_ADAPTER=openai
+--   MEMO_SUMMARIZER_URL=https://api.openai.com/v1/chat/completions
+--   MEMO_SUMMARIZER_MODEL=gpt-4o-mini
+--   MEMO_SUMMARIZER_HEADERS={"Authorization": "Bearer {secret:openai}"}   (memo secret-store openai)
 --
 -- Contract: summarize(memories, cfg) -> { title, body, metadata }, err
 
@@ -43,15 +44,18 @@ function M.summarize(memories, cfg)
         response_format = { type = "json_object" },
     })
 
+    local secrets = require("luamemo.secrets")
+    local extra, xerr = secrets.resolve_headers(cfg.summarizer_headers)   -- {secret:NAME} → the vault
+    if not extra then return nil, "openai.summarize: " .. xerr end
     local headers = { ["Content-Type"] = "application/json" }
-    for k, v in pairs(cfg.summarizer_headers or {}) do headers[k] = v end
+    for k, v in pairs(extra) do headers[k] = v end
 
     local status, body, err = http.request(url, {
         method = "POST", body = req_body, headers = headers,
         timeout_ms = cfg.summarizer_timeout_ms or 60000,
     })
     local ok, herr = util.check_http(status, body, err, "openai.summarize")
-    if not ok then return nil, herr end
+    if not ok then return nil, secrets.scrub(herr, extra) end
 
     local payload = json.decode(body)
     if not payload or not payload.choices or not payload.choices[1] then

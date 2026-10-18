@@ -1,81 +1,13 @@
 -- eval/helpers.lua
--- Two-in-one eval helper:
+-- LongMemEval-shaped synthetic dataset generator (formerly
+-- eval/_make_synthetic.lua).
 --
---   Module interface (require): minimal `resty.http` shim for plain lua5.1
---     eval harnesses.  Wraps LuaSocket/LuaSec to expose just enough of the
---     lua-resty-http surface that `luamemo.embed.http_embed` needs.
---
---     Usage:
---       package.preload["resty.http"] = function() return require("helpers") end
---
---   CLI interface (direct execution): LongMemEval-shaped synthetic dataset
---     generator (formerly eval/_make_synthetic.lua).
---
---     Usage:
---       lua5.1 eval/helpers.lua [output_path]
---       default output: eval/data/longmemeval_synthetic.json
-
--- =========================================================================
--- Part A: resty.http shim (module interface)
--- =========================================================================
-
-local http   = require("socket.http")
-local ltn12  = require("ltn12")
-local socket = require("socket")
-local has_https, https = pcall(require, "ssl.https")
-
-local M = {}
-M.__index = M
-
-function M.new()
-    return setmetatable({ timeout = 5 }, M)
-end
-
-function M:set_timeout(ms)
-    self.timeout = (tonumber(ms) or 5000) / 1000
-end
-
-function M:request_uri(url, opts)
-    opts = opts or {}
-    local resp_chunks = {}
-    local request = {
-        url     = url,
-        method  = opts.method or "GET",
-        source  = opts.body and ltn12.source.string(opts.body) or nil,
-        sink    = ltn12.sink.table(resp_chunks),
-        headers = opts.headers or {},
-    }
-    if opts.body then
-        request.headers["content-length"] = tostring(#opts.body)
-    end
-
-    local backend = http
-    if url:sub(1, 8) == "https://" then
-        if not has_https then return nil, "https requested but ssl.https unavailable" end
-        backend = https
-    end
-
-    -- LuaSocket has no per-call timeout via the high-level API; set the
-    -- module-level default before the call.  Best-effort.
-    if backend == http      then http.TIMEOUT  = self.timeout
-    elseif backend == https then https.TIMEOUT = self.timeout end
-
-    local ok, code, headers, _ = backend.request(request)
-    if not ok then return nil, tostring(code) end
-
-    return {
-        status  = tonumber(code) or 0,
-        headers = headers or {},
-        body    = table.concat(resp_chunks),
-    }
-end
-
--- =========================================================================
--- Part B: LongMemEval synthetic dataset generator (CLI mode only)
--- =========================================================================
+--   Usage:
+--     luajit eval/helpers.lua [output_path]
+--     default output: eval/data/longmemeval_synthetic.json
 
 local function run_make_synthetic(out_path)
-    local cjson = require("cjson.safe")
+    local cjson = require("luamemo.json")
 
     local function turn(role, content) return { role = role, content = content } end
 
@@ -516,4 +448,4 @@ if arg and arg[0] and tostring(arg[0]):find("helpers") then
     run_make_synthetic(arg[1])
 end
 
-return M
+return { make_synthetic = run_make_synthetic }

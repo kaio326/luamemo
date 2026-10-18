@@ -1,23 +1,21 @@
-#!/usr/bin/env lua
--- luamemo MCP stdio server (pure Lua, single-file)
+#!/usr/bin/env luajit
+-- luamemo MCP stdio server (LuaJIT, single-file)
 --
 -- Implements the Model Context Protocol (https://modelcontextprotocol.io/)
--- stdio transport: newline-delimited JSON-RPC 2.0 over stdin/stdout. Connects
--- directly to PostgreSQL via pgmoon — no HTTP intermediary required.
+-- stdio transport: newline-delimited JSON-RPC 2.0 over stdin/stdout. Works on
+-- the luamemo database (a SQLite file, luamemo.db) in-process — no server.
 --
--- Configuration (env vars)
--- ------------------------
---   MEMO_DB_URL       REQUIRED  PostgreSQL connection URL,
---                               e.g. postgresql://user:pass@localhost:5432/luamemo
---                               (Individual PG* vars also accepted; see luamemo.db)
---   MEMO_SCOPE        optional  Default scope applied when a tool call omits it
---   MEMO_SECRETS_FILE optional  Path to the JSON secrets file
---   MEMO_MASTER_KEY   optional  64-hex-char master key for the secrets module
---   MEMO_DEBUG        optional  If "1", logs raw JSON-RPC frames to stderr
+-- Configuration: the MEMO_* settings (luamemo.settings; `memo config list`), from the
+-- environment the client passes and the .luamemorc files (read at startup — the
+-- environment wins). The ones that matter most:
+--   MEMO_DB           The database: a name (kept in ~/.local/share/luamemo)
+--                     or a path (see luamemo.db)
+--   MEMO_SCOPE        Default scope applied when a tool call omits it
+--   MEMO_DEBUG        If "1", logs raw JSON-RPC frames to stderr
 --
 -- Run manually for testing:
 --   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
---     | MEMO_DB_URL=postgresql://postgres:@127.0.0.1:5432/luamemo lua mcp/server.lua
+--     | MEMO_DB=scratch luajit mcp/server.lua
 
 -- ---------------------------------------------------------------------------
 -- Self-locate the bundled luamemo modules. Derive the repo/plugin root from
@@ -27,9 +25,20 @@
 -- install can't shadow the bundled modules. Falls back to the ambient path if
 -- the root can't be derived (e.g. arg[0] unavailable).
 -- ---------------------------------------------------------------------------
+local SERVER_DIR   -- this script's directory (mcp/: instructions.md is next to it)
 do
+    -- The module paths keep absolute entries only (the root below is added after):
+    -- LuaJIT's defaults begin with ./?.lua and ./?.so — the working directory, which
+    -- for an MCP server is the user's project — so a luamemo/init.lua (or cjson.lua, …)
+    -- there would run in luamemo's place.
+    for _, k in ipairs({ "path", "cpath" }) do
+        local kept = {}
+        for e in package[k]:gmatch("[^;]+") do if e:sub(1, 1) == "/" then kept[#kept + 1] = e end end
+        package[k] = table.concat(kept, ";")
+    end
     local self_path = arg and arg[0]
     if self_path then
+        SERVER_DIR = self_path:gsub("\\", "/"):match("^(.*)/[^/]+$") or "."
         local root = self_path:gsub("\\", "/"):match("^(.-)/?mcp/[^/]+$")
         if root then
             if root == "" then root = "." end
@@ -38,7 +47,16 @@ do
     end
 end
 
+-- Settings: `memo mcp` (what client configs start) has read the .luamemorc files into
+-- the environment already. Started directly, the server reads them here — the
+-- project's (MEMO_PROJECT, else the nearest directory from the working directory up
+-- that holds one) over ~/.luamemorc; a variable the client's config passes wins.
+if os.getenv("MEMO__SETTINGS_LOADED") ~= "1" then
+    require("luamemo.settings").load_files()
+end
+
 local json  = require("luamemo.json")
+local ops   = require("luamemo.ops")   -- the operations memo offers too (their arguments read once)
 local util  = require("luamemo.util")
 
 math.randomseed(os.time() + math.floor(os.clock() * 1e6))
@@ -46,11 +64,33 @@ math.randomseed(os.time() + math.floor(os.clock() * 1e6))
 -- ===========================================================================
 -- Config
 -- ===========================================================================
-local MEMO_DB_URL = os.getenv("MEMO_DB_URL")
 local MEMO_SCOPE  = os.getenv("MEMO_SCOPE")
 local DEBUG       = os.getenv("MEMO_DEBUG") == "1"
 
-local PROTOCOL_VERSION = "2024-11-05"
+-- MEMO_MCP_TOOLS=core: only the everyday tools are offered — every tool's description sits
+-- in each session's context; the maintenance, diary and vault-admin ones stay on memo.
+local CORE_TOOLS = {
+    memory_brief = true, memory_search = true, memory_write = true, memory_recent = true,
+    memory_get = true, memory_update = true, memory_delete = true, memory_promote = true,
+    memory_sense = true, memory_status = true, index_search = true, index_outline = true,
+    index_explore = true, index_status = true, secret_list = true, secret_execute = true,
+}
+local TOOL_PROFILE = (os.getenv("MEMO_MCP_TOOLS") == "core") and "core" or "all"
+local function offered(name) return TOOL_PROFILE == "all" or CORE_TOOLS[name] == true end
+
+-- MCP revisions, newest first. Modern (2026-07-28 on): stateless — every request carries
+-- its version and the client's capabilities in _meta. Legacy: an initialize handshake
+-- picks the version for the whole process. The server speaks both (dual-era).
+local MODERN_VERSIONS = { "2026-07-28" }
+local LEGACY_VERSIONS = { "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05" }
+local SUPPORTED_VERSIONS = {}
+for _, v in ipairs(MODERN_VERSIONS) do SUPPORTED_VERSIONS[#SUPPORTED_VERSIONS + 1] = v end
+for _, v in ipairs(LEGACY_VERSIONS) do SUPPORTED_VERSIONS[#SUPPORTED_VERSIONS + 1] = v end
+local function member(list, v)
+    for _, x in ipairs(list) do if x == v then return true end end
+    return false
+end
+local META = "io.modelcontextprotocol/"
 local SERVER_NAME      = "luamemo"
 -- Single source of truth: luamemo.VERSION (luamemo/init.lua) — was a
 -- hardcoded literal here that silently went stale every release; require()
@@ -58,6 +98,16 @@ local SERVER_NAME      = "luamemo"
 local SERVER_VERSION   = (function()
     local ok, lm = pcall(require, "luamemo")
     return (ok and lm.VERSION) or "unknown"
+end)()
+
+-- The guidance sent to every client (initialize / server/discover `instructions`):
+-- mcp/instructions.md, without its HTML comments (notes for whoever edits it).
+local INSTRUCTIONS = (function()
+    local f = SERVER_DIR and io.open(SERVER_DIR .. "/instructions.md", "r")
+    if not f then return nil end
+    local text = f:read("*a"); f:close()
+    text = text:gsub("<!%-%-.-%-%->\n?", ""):gsub("\n\n\n+", "\n\n"):gsub("^%s+", ""):gsub("%s+$", "")
+    return text ~= "" and text or nil
 end)()
 
 -- ===========================================================================
@@ -108,15 +158,90 @@ local function ensure_setup()
     end
     -- Build the config from the MEMO_* environment via the shared helper, so the
     -- embedder / DB / secrets / learning-flag parsing lives in ONE place (the
-    -- api/CLI path uses the same). No auth=true: the MCP server makes direct,
-    -- already-trusted store calls, so auth_fn stays the deny-by-default (the tools
-    -- never consult it) and the embed probe behaviour is unchanged.
-    local cfg = require("luamemo.cli._common").config_from_env({ secrets = true })
+    -- api/CLI path uses the same).
+    local cfg = require("luamemo.cli._common").config_from_env({
+        warn = function(line) io.stderr:write("[luamemo-mcp] ", line, "\n") end })
     local pok, perr = pcall(luamemo.setup, cfg)
     if not pok then
         io.stderr:write("[luamemo-mcp] setup warning: " .. tostring(perr) .. "\n")
     end
 end
+
+--- nil when a database is configured, else what to do about it — the answer to every
+--- tool call (the configuration doesn't change while the server runs).
+local _unconfigured
+local function not_configured()
+    if _unconfigured == nil then
+        _unconfigured = false
+        if not require("luamemo.db").path() then
+            local settings = require("luamemo.settings")
+            local files = settings.files()
+            local f = io.open(files.paths.project, "r")
+            if f then f:close() end
+            local restart = " Then restart luamemo in the MCP client."
+            if files.untrusted then
+                _unconfigured = "luamemo has no database: it is " .. settings.untrusted_message(
+                    files.paths.project, files.untrusted) .. " (in that folder)." .. restart
+            else
+                _unconfigured = "luamemo has no database for this project yet: "
+                    .. (f and (files.paths.project .. " names none (MEMO_DB).")
+                        or ("no .luamemorc in " .. files.dir .. " or the folders above it (the "
+                            .. "project is found from the directory the MCP client starts luamemo in)."))
+                    .. " To set it up, run `memo calibrate` in the project's folder; for a project "
+                    .. "elsewhere, start the server with `memo mcp --project /path/to/project` in "
+                    .. "this MCP client's config." .. restart
+            end
+        end
+    end
+    return _unconfigured or nil
+end
+
+local list = json.list   -- an empty list encodes as []
+
+-- What an agent reads of a memory (search, recent, get): its text and where it lives —
+-- not the scoring internals (vec_score, fts_score, weight, decay_rate, …), empty tags /
+-- metadata left out, the time to the second. About half the tokens of the whole row;
+-- `verbose` returns the whole row. In a list (search, recent) a body is at most
+-- BODY_CAP bytes (`truncated`: memory_get has it whole) — one long memory (an imported
+-- document) cost its full length in every search it matched.
+local BODY_CAP = 2000
+local function compact(r, cap)
+    local out = { id = r.id, observation_id = r.observation_id, title = r.title, body = r.body, kind = r.kind,
+                  scope = r.scope, tier = r.tier }
+    if cap and type(r.body) == "string" and #r.body > cap then
+        out.body, out.truncated = util.cut_utf8(r.body, cap) .. "…", true
+    end
+    if type(r.tags) == "table" and next(r.tags) ~= nil then out.tags = r.tags end
+    -- luamemo's own bookkeeping (lm_*: replica ids, sync clocks, proposal links) and an org
+    -- memory's proposers (people's e-mail identities) stay out: half of an org search's
+    -- answer, sent to the model on every call (verbose keeps them).
+    if type(r.metadata) == "table" then
+        local m
+        for k, v in pairs(r.metadata) do
+            if type(k) ~= "string" or (k:sub(1, 3) ~= "lm_" and k ~= "proposers") then
+                m = m or {}
+                m[k] = v
+            end
+        end
+        out.metadata = m
+    end
+    if r.created_at ~= nil then out.created_at = tostring(r.created_at):sub(1, 19) end
+    if tonumber(r.score) then out.score = tonumber(("%.3f"):format(tonumber(r.score))) end
+    return out
+end
+local function rows_out(rows, verbose)
+    if verbose or type(rows) ~= "table" then return list(rows) end
+    local out = {}
+    for i, r in ipairs(rows) do out[i] = type(r) == "table" and compact(r, BODY_CAP) or r end
+    return list(out)
+end
+-- What a write / update answers (the agent sent the text): the row's handle, and the
+-- store's note when it kept the row otherwise (no vector: too long for the embedder).
+local function ack(r)
+    return { id = r.id, scope = r.scope, kind = r.kind, title = r.title, tier = r.tier, warning = r.warning }
+end
+local VERBOSE = { type = "boolean", description = "Whole rows (scores, decay, timestamps) instead of the "
+    .. "compact ones (default false)." }
 
 -- Coerce "true"/"1" strings to booleans (tool input always comes as JSON,
 -- so this is mainly for robustness when values are passed as strings).
@@ -132,142 +257,154 @@ local function with_default_scope(args)
     return args
 end
 
+-- The scope a call works on: its own, else the project's (MEMO_SCOPE) — nil without either.
+local function scope_of(args)
+    local s = (type(args.scope) == "string" and args.scope ~= "") and args.scope or MEMO_SCOPE
+    return (s and s ~= "") and s or nil
+end
+
 local Tools = {}
 
 Tools.memory_write = {
-    description = "Store a new memory in the persistent vector store. "
-        .. "Call this whenever you make an architectural decision, resolve a bug, "
-        .. "choose a design pattern, or establish any fact that should survive to "
-        .. "the next session. Also call at the end of a session to write a brief "
-        .. "summary of what was done and what comes next.",
+    description = "Store a memory: a decision, a bug's cause, a chosen pattern, a fact or a plan that "
+        .. "should outlive the session (and, at its end, a summary of what was done and what comes next). "
+        .. "A near-duplicate is merged into the memory it repeats.",
     inputSchema = {
         type = "object",
         properties = {
-            scope    = { type = "string", description = "Bucket: 'global', 'repo:<name>', 'session:<id>', or custom." },
-            kind     = { type = "string", description = "One of: decision | fact | plan | snippet | (custom)." },
-            title    = { type = "string", description = "Short label for the memory." },
-            body     = { type = "string", description = "Full content; this is what gets embedded and searched." },
-            tags     = { type = "array", items = { type = "string" }, description = "Optional tags." },
-            metadata = { type = "object", description = "Arbitrary structured metadata." },
-            importance = {
-                type = "number", minimum = 0, maximum = 10,
-                description = "Search-ranking weight (0..10). Higher = more pull. Default 1.0.",
-            },
-            decay_rate = {
-                type = "number", minimum = 0, maximum = 1,
-                description = "Per-day exponential decay (0..1). 0 disables decay. Default 0.0.",
-            },
+            scope    = { type = "string", description = "e.g. repo:<name>, user:<name>, session:<id>." },
+            kind     = { type = "string", description = "decision, fact, plan, … (any word)." },
+            title    = { type = "string" },
+            body     = { type = "string", description = "What is embedded and searched." },
+            tags     = { type = "array", items = { type = "string" } },
+            metadata = { type = "object" },
+            importance = { type = "number", minimum = 0, maximum = 10, description = "Ranking weight (default 1)." },
+            decay_rate = { type = "number", minimum = 0, maximum = 1, description = "Per day (default 0)." },
             dedup_strategy = {
                 type = "string", enum = { "update", "skip", "append" },
-                description = "Override per-call dedup behaviour. 'update' (default) merges a near-duplicate; 'skip' returns the existing row unchanged; 'append' forces a new row.",
+                description = "A near-duplicate: update merges (default), skip keeps it, append adds anyway.",
             },
+            created_at = { type = "string", description = "When it happened, if not now (ISO 8601)." },
+            tier = { type = "integer", minimum = 0, maximum = 3, description = "Default: from importance." },
+            items = {
+                type = "array", maxItems = 100,
+                description = "Up to 100 memories (objects with the fields above) instead of title / body.",
+                items = { type = "object" },
+            },
+            verbose = { type = "boolean", description = "Answer with the whole stored memory." },
         },
-        required = { "title", "body" },
     },
     handler = function(args)
         ensure_setup()
         local store = require("luamemo.store")
-        local row, err, action = store.write(with_default_scope({
-            scope          = args.scope,
-            kind           = args.kind,
-            title          = args.title,
-            body           = args.body,
-            tags           = args.tags,
-            metadata       = args.metadata,
-            importance     = tonumber(args.importance),
-            decay_rate     = tonumber(args.decay_rate),
-            dedup_strategy = args.dedup_strategy,
-        }))
+        local function fields(a)
+            local f, err = ops.write_fields(a, a.scope)
+            if not f then return nil, err end
+            f.dedup_strategy = args.dedup_strategy   -- (the call's, for each of its items)
+            return with_default_scope(f)
+        end
+        if args.items ~= nil then
+            if type(args.items) ~= "table" or #args.items == 0 then return nil, "items: a list of memories" end
+            if #args.items > 100 then return nil, "items: at most 100 per call" end
+            local rows = {}
+            for i, it in ipairs(args.items) do
+                if type(it) ~= "table" then return nil, ("items[%d]: a memory object"):format(i) end
+                local f, ferr = fields(it)
+                if not f then return nil, ("items[%d]: %s"):format(i, ferr) end
+                rows[i] = f
+            end
+            local res, err = store.write_many(rows, {
+                dedup_strategy = args.dedup_strategy or require("luamemo").config.dedup_strategy })
+            if not res then return nil, err end
+            local out, written, failed = {}, 0, 0
+            for i, r in ipairs(res) do
+                if r.row then
+                    written = written + 1
+                    out[i] = { id = r.row.id, action = r.action, merged_into = r.merged_into }
+                else
+                    failed = failed + 1
+                    out[i] = { error = tostring(r.error) }
+                end
+            end
+            return { ok = failed == 0, written = written, failed = failed, results = out }
+        end
+        if (args.title == nil or args.title == "") and (args.body == nil or args.body == "") then
+            return nil, "memory_write: title and body (or items)"
+        end
+        local f, ferr = fields(args)
+        if not f then return nil, ferr end
+        local row, err, action = store.write(f)
         if not row then return nil, err end
-        return { ok = true, memory = row, action = action }
+        -- The agent sent the text: echoing it back costs tokens for nothing.
+        return { ok = true, memory = to_bool(args.verbose) and row or ack(row), action = action }
     end,
 }
 
 Tools.memory_search = {
-    description = "Hybrid search (vector + full-text) across stored memories. "
-        .. "Returns top-K matches ordered by blended score, weighted by each "
-        .. "memory's importance and time-decay. "
-        .. "CALL THIS AT THE START OF EVERY SESSION with a broad query such as "
-        .. "'recent decisions and context' to reload what was decided in prior "
-        .. "sessions before starting any work.",
+    description = "Search memories (meaning + words), ranked by relevance, importance and age — call it "
+        .. "before answering about earlier work or decisions. `facts` in the result: the current values "
+        .. "of things that change over time — authoritative for what is true now; memories may be older.",
     inputSchema = {
         type = "object",
         properties = {
-            query = { type = "string", description = "Natural-language query." },
-            scope = { type = "string", description = "Restrict to a single scope." },
+            query = { type = "string" },
+            scope = { type = "string" },
             scopes = {
                 type = "array",
-                description = "Search a SET of scopes as a hierarchy (e.g. org ∪ repo ∪ user). "
-                    .. "Returns the union; higher-tier memories (e.g. org directives) surface first. "
-                    .. "Overrides `scope` when provided.",
+                description = "Several scopes as one (e.g. repo + user + the brief's org: replica); "
+                    .. "higher tiers first. Instead of scope.",
                 items = { type = "string" },
             },
-            kind  = { type = "string", description = "Restrict to a kind." },
-            limit = { type = "integer", description = "Max results (default 10).", minimum = 1, maximum = 100 },
-            ignore_decay = {
-                type = "boolean",
-                description = "If true, bypass importance/decay weighting and rank purely by hybrid similarity (debug aid).",
-            },
-            since = {
-                type = "string",
-                description = "Only return memories with updated_at >= this bound. Accepts an ISO 8601 date (YYYY-MM-DD) or full RFC3339 timestamp.",
-            },
-            ["until"] = {
-                type = "string",
-                description = "Only return memories with updated_at < this bound. Half-open interval [since, until).",
-            },
-            tier_min = {
-                type = "integer",
-                description = "Minimum tier (0–3) to include. Default 1 — excludes ephemeral (tier=0) raw events. Pass 0 to see all tiers.",
-                minimum = 0, maximum = 3,
-            },
+            kind  = { type = "string" },
+            limit = { type = "integer", description = "Default 10.", minimum = 1, maximum = 100 },
+            ignore_decay = { type = "boolean", description = "Rank by similarity only." },
+            since = { type = "string", description = "Updated at or after (ISO 8601 or a date)." },
+            ["until"] = { type = "string", description = "Updated before." },
+            tier_min = { type = "integer", minimum = 0, maximum = 3, description = "Default 1 (hides tier 0)." },
+            project = { type = "string", description = "Narrow org: scopes to one project (+ org-wide)." },
+            tier_max = { type = "integer", minimum = 0, maximum = 3 },
+            metadata_filter = { type = "object", description = "Metadata values to match, e.g. {\"source\": \"import\"}." },
+            min_score = { type = "number", description = "Drop results scoring below this." },
+            rerank = { type = "boolean", description = "Default: MEMO_RERANK_ENABLED." },
+            hybrid_weights = { type = "object", description = "e.g. {\"vector\": 0.7, \"fts\": 0.3}." },
+            verbose = VERBOSE,
         },
         required = { "query" },
     },
     handler = function(args)
         ensure_setup()
-        local store = require("luamemo.store")
-        local scope = args.scope or MEMO_SCOPE
-        -- Default tier_min=1 so ephemeral events are hidden from MCP callers
-        -- unless they explicitly pass tier_min=0.
-        local tier_min = (args.tier_min ~= nil) and tonumber(args.tier_min) or 1
-        local rows, err = store.search({
-            query        = args.query,
-            scope        = scope,
-            scopes       = (type(args.scopes) == "table" and #args.scopes > 0) and args.scopes or nil,
-            kind         = args.kind,
-            limit        = tonumber(args.limit),
-            ignore_decay = to_bool(args.ignore_decay),
-            since        = args.since,
-            ["until"]    = args["until"],
-            tier_min     = tier_min,
-        })
-        if not rows then return nil, err end
-        return { ok = true, results = rows }
+        -- The project's scope when the call names none; tier_min 1 hides ephemeral events
+        -- unless the call passes tier_min = 0.
+        local rows, facts = ops.search(args, { scope = MEMO_SCOPE, tier_min = 1 })
+        if not rows then return nil, facts end
+        local res = { ok = true, results = rows_out(rows, to_bool(args.verbose)) }
+        -- The facts the query is about ride along (KG spike 2: agents read them here;
+        -- they rarely ask a separate fact tool).
+        if #facts > 0 then res.facts = facts end
+        return res
     end,
 }
 
 Tools.memory_recent = {
-    description = "List the most recently created memories in a scope. "
-        .. "Use at session start alongside memory_search to quickly orient "
-        .. "yourself on the latest stored context.",
+    description = "The newest memories of a scope.",
     inputSchema = {
         type = "object",
         properties = {
-            scope = { type = "string" },
-            limit = { type = "integer", minimum = 1, maximum = 200 },
+            scope  = { type = "string" },
+            limit  = { type = "integer", minimum = 1, maximum = 200 },
+            kind   = { type = "string" },
+            offset = { type = "integer", minimum = 0, description = "Skip this many (paging)." },
+            tier_min = { type = "integer", minimum = 0, maximum = 3, description = "Default 1 (hides tier 0)." },
+            verbose = VERBOSE,
         },
     },
     handler = function(args)
         ensure_setup()
-        local store = require("luamemo.store")
-        local scope = args.scope or MEMO_SCOPE
-        local rows, err = store.recent({
-            scope = scope,
-            limit = tonumber(args.limit),
-        })
+        -- tier_min 1, as search: tier 0 is raw conversation the hooks save for the digest
+        -- (a session scope's newest 20 were all transcript chunks — 26 KB).
+        local rows, err = ops.recent(args, { scope = MEMO_SCOPE, tier_min = 1 })
         if not rows then return nil, err end
-        return { ok = true, results = rows }
+        return { ok = true, results = rows_out(rows, to_bool(args.verbose)) }
     end,
 }
 
@@ -275,21 +412,20 @@ Tools.memory_get = {
     description = "Fetch a single memory by its numeric ID.",
     inputSchema = {
         type = "object",
-        properties = { id = { type = "integer" } },
+        properties = { id = { type = "integer" }, verbose = VERBOSE },
         required = { "id" },
     },
     handler = function(args)
         ensure_setup()
         local store = require("luamemo.store")
         local row, err = store.get(tonumber(args.id))
-        if not row then return nil, err end
-        return { ok = true, memory = row }
+        if not row then return nil, err or ("memory " .. tostring(args.id) .. " not found") end
+        return { ok = true, memory = args.verbose and row or compact(row) }   -- as a list row, the body whole
     end,
 }
 
 Tools.memory_update = {
-    description = "Update fields of an existing memory by ID. Re-embeds if "
-        .. "title or body changed.",
+    description = "Change fields of a memory by id (re-embedded when the text changes).",
     inputSchema = {
         type = "object",
         properties = {
@@ -300,233 +436,263 @@ Tools.memory_update = {
             body     = { type = "string" },
             tags     = { type = "array", items = { type = "string" } },
             metadata = { type = "object" },
-            importance = {
-                type = "number", minimum = 0, maximum = 10,
-                description = "Search-ranking weight (0..10).",
-            },
-            decay_rate = {
-                type = "number", minimum = 0, maximum = 1,
-                description = "Per-day exponential decay (0..1).",
-            },
+            importance = { type = "number", minimum = 0, maximum = 10 },
+            decay_rate = { type = "number", minimum = 0, maximum = 1 },
+            verbose  = { type = "boolean", description = "Answer with the whole stored memory." },
         },
         required = { "id" },
     },
     handler = function(args)
         ensure_setup()
-        local store = require("luamemo.store")
-        local id = tonumber(args.id)
-        local row, err = store.update(id, {
-            title      = args.title,
-            body       = args.body,
-            tags       = args.tags,
-            metadata   = args.metadata,
-            importance = tonumber(args.importance),
-            decay_rate = tonumber(args.decay_rate),
-            kind       = args.kind,
-            scope      = args.scope,
-        })
+        local row, err = ops.update(args.id, args)
         if not row then return nil, err end
-        return { ok = true, memory = row }
+        -- As memory_write: the agent sent the change — the whole row back (its body) costs tokens.
+        return { ok = true, memory = to_bool(args.verbose) and row or ack(row) }
     end,
 }
 
+-- Bulk delete by filter goes in two calls (owner, 2026-10-08): the first only previews
+-- (count + a few titles) and returns a confirmation token; the second, with the same
+-- filter and the token, deletes. The token is an HMAC (a key random to this server
+-- process) over the database, the filter, the count and an expiry 5 minutes out — it
+-- can't be made up, reused for another filter, or used after the matches changed.
+local DELETE_TOKEN_SECS = 300
+local _delete_key
+
+local function canonical(v)
+    if type(v) ~= "table" then return json.encode(v) end
+    local keys = {}
+    for k in pairs(v) do keys[#keys + 1] = tostring(k) end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do parts[#parts + 1] = json.encode(k) .. ":" .. canonical(v[k]) end
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function delete_token(filter, count, expires)
+    local sodium = require("luamemo.native.sodium")
+    _delete_key = _delete_key or sodium.random_bytes(32)
+    local db_id = require("luamemo.db").value("SELECT value FROM lm_meta WHERE key = 'db_id'")
+    local mac = sodium.hmac_sha256(_delete_key, table.concat({ tostring(db_id), canonical(filter),
+        tostring(count), tostring(expires) }, "\n"))
+    return ("%s.%d.%d"):format(util.to_hex(mac):sub(1, 32), count, expires)
+end
+
+-- nil when `token` confirms deleting `count` rows matching `filter` now, else why not.
+local function token_problem(token, filter, count)
+    local _, was, expires = tostring(token):match("^(%x+)%.(%d+)%.(%d+)$")
+    if not expires then return "that confirm token isn't one a preview gave" end
+    if tonumber(expires) < os.time() then return "the confirm token expired (they last 5 minutes)" end
+    if delete_token(filter, tonumber(was), tonumber(expires)) ~= token then
+        return "the confirm token was given for another filter"
+    end
+    if tonumber(was) ~= count then
+        return ("the matching memories changed since the preview (%s then, %d now)"):format(was, count)
+    end
+    return nil
+end
+
 Tools.memory_delete = {
-    description = "Permanently delete a memory by ID.",
+    description = "Delete one memory by `id`, or every memory matching a filter (`scope`, optionally "
+        .. "`kind` / `metadata_filter`): a filter's first call only previews and returns a `confirm` "
+        .. "token — show the user, then call again with it to delete.",
     inputSchema = {
         type = "object",
-        properties = { id = { type = "integer" } },
-        required = { "id" },
+        properties = {
+            id = { type = "integer" },
+            scope = { type = "string", description = "A filter's scope." },
+            kind = { type = "string" },
+            metadata_filter = { type = "object", description = "Metadata values to match." },
+            confirm = { type = "string", description = "The preview's token (5 minutes)." },
+        },
     },
     handler = function(args)
         ensure_setup()
         local store = require("luamemo.store")
-        local ok, err = store.delete(tonumber(args.id))
-        if not ok then return nil, err end
-        return { ok = true }
+        if args.id ~= nil then
+            local ok, err = store.delete(tonumber(args.id))
+            if not ok then return nil, err end
+            return { ok = true }
+        end
+        if type(args.scope) ~= "string" or args.scope == "" then
+            return nil, "memory_delete: give an id — or a scope (and optionally kind / metadata_filter) to "
+                .. "delete by filter"
+        end
+        local filter = { scope = args.scope, kind = args.kind, metadata_filter = args.metadata_filter }
+        local m, err = store.match_where(filter, 5)
+        if not m then return nil, err end
+        local why
+        if args.confirm ~= nil then
+            why = token_problem(args.confirm, filter, m.count)
+            if not why then
+                local n, derr = store.delete_where(filter)
+                if not n then return nil, derr end
+                return { ok = true, deleted = n }
+            end
+        end
+        if m.count == 0 then
+            return { ok = true, count = 0, deleted = 0, note = (why and (why .. ". ") or "") .. "Nothing matches." }
+        end
+        local expires = os.time() + DELETE_TOKEN_SECS
+        return {
+            ok = true, preview = true, deleted = 0, count = m.count, titles = m.titles,
+            confirm = delete_token(filter, m.count, expires), expires_in_seconds = DELETE_TOKEN_SECS,
+            note = (why and (why .. ". ") or "") .. ("Nothing was deleted. To delete these %d memories, call "
+                .. "memory_delete again with the same filter and this confirm token."):format(m.count),
+        }
     end,
 }
 
 Tools.memory_promote = {
-    description = "Roll all memories from a session scope into a single "
-        .. "summary in a long-term scope. Call this at end of session to "
-        .. "promote `session:<uuid>` rows into `user:<id>:long_term` so "
-        .. "the next session can find them. Solves the 'memory loss when "
-        .. "session changes' problem.",
+    description = "At a session's end: fold a session scope (session:<id>) into one summary in a "
+        .. "long-term scope, so the next session finds it.",
     inputSchema = {
         type = "object",
         properties = {
-            from_scope = {
-                type = "string",
-                description = "Source scope, e.g. 'session:abc123'.",
-            },
-            to_scope = {
-                type = "string",
-                description = "Target scope, e.g. 'user:42:long_term'. Must differ from from_scope.",
-            },
-            delete_source = {
-                type = "boolean",
-                description = "If true, hard-delete source rows after summary is written. Default false.",
-            },
-            dry_run = {
-                type = "boolean",
-                description = "If true, report what would happen without writing. Default false.",
-            },
-            limit = {
-                type = "integer", minimum = 1, maximum = 1000,
-                description = "Max source rows to fold (default 200).",
-            },
-            min_rows = {
-                type = "integer", minimum = 1,
-                description = "Bail with reason='no_rows' if source has fewer rows (default 1).",
-            },
+            from_scope = { type = "string" },
+            to_scope = { type = "string" },
+            delete_source = { type = "boolean", description = "Delete the folded rows (default false)." },
+            dry_run = { type = "boolean" },
+            limit = { type = "integer", minimum = 1, maximum = 1000, description = "Rows folded at most (200)." },
+            min_rows = { type = "integer", minimum = 1, description = "Fewer rows: nothing done (default 1)." },
         },
         required = { "from_scope", "to_scope" },
     },
-    handler = function(args)
-        ensure_setup()
-        local summarizer = require("luamemo.summarizer")
-        local result, err = summarizer.promote({
-            from_scope    = args.from_scope,
-            to_scope      = args.to_scope,
-            delete_source = to_bool(args.delete_source),
-            dry_run       = to_bool(args.dry_run),
-            limit         = tonumber(args.limit),
-            min_rows      = tonumber(args.min_rows),
-        })
-        if not result then return nil, err end
-        local ok_flag = (result.promoted == 1 or result.reason == "no_rows")
-        return { ok = ok_flag, result = result }
-    end,
+    handler = function(args) ensure_setup(); return ops.promote(args) end,
 }
 
 Tools.memory_consolidate = {
-    description = "Maintenance: expire fully-decayed memories, detect near-duplicate clusters, "
-        .. "and optionally merge them via the configured summarizer. "
-        .. "Run periodically to keep the store compact and retrieval quality high. "
-        .. "With dry_run=true, reports what would change without modifying anything.",
+    description = "Maintenance (when the user asks): expire decayed memories, group near-duplicates "
+        .. "(merged by the summarizer). dry_run=true previews.",
     inputSchema = {
         type = "object",
         properties = {
-            scope = { type = "string", description = "Scope to consolidate. Omit to consolidate all scopes." },
-            dry_run = {
-                type = "boolean",
-                description = "Report changes without applying them (default false).",
-            },
-            similarity_threshold = {
-                type = "number", minimum = 0.5, maximum = 1.0,
-                description = "Cosine similarity above which two memories are near-duplicates (default 0.85).",
-            },
-            decay_threshold = {
-                type = "number", minimum = 0, maximum = 1,
-                description = "Effective importance below which a decayed memory is expired (default 0.05).",
-            },
-            max_rows = {
-                type = "integer", minimum = 1, maximum = 5000,
-                description = "Max memories to inspect per run (default 500).",
-            },
+            scope = { type = "string", description = "Default: every scope." },
+            dry_run = { type = "boolean" },
+            similarity_threshold = { type = "number", minimum = 0.5, maximum = 1.0, description = "Default 0.85." },
+            decay_threshold = { type = "number", minimum = 0, maximum = 1, description = "Default 0.05." },
+            max_rows = { type = "integer", minimum = 1, maximum = 5000, description = "Default 500." },
+        },
+    },
+    handler = function(args) ensure_setup(); return ops.consolidate(args) end,
+}
+
+Tools.memory_summarize = {
+    description = "Maintenance (when the user asks): fold old, low-weight memories of a scope into "
+        .. "summaries (MEMO_SUMMARIZER_ADAPTER). dry_run=true previews.",
+    inputSchema = {
+        type = "object",
+        properties = {
+            scope = { type = "string" },
+            dry_run = { type = "boolean" },
+            weight_threshold = { type = "number", minimum = 0, description = "Fold memories weighing less." },
+            retention_days = { type = "integer", minimum = 0, description = "… and older than this." },
+            batch_size = { type = "integer", minimum = 1, description = "Memories per summary." },
+            max_batches = { type = "integer", minimum = 1, description = "Summaries per call." },
         },
     },
     handler = function(args)
         ensure_setup()
-        local summarizer = require("luamemo.summarizer")
-        local result, err = summarizer.consolidate({
-            scope                = args.scope,
-            dry_run              = to_bool(args.dry_run),
-            similarity_threshold = tonumber(args.similarity_threshold),
-            decay_threshold      = tonumber(args.decay_threshold),
-            max_rows             = tonumber(args.max_rows),
-        })
-        if not result then return nil, err end
-        return { ok = true, result = result }
+        -- Over MCP one scope at a time (the project's by default) — memo can do them all.
+        local scope = scope_of(args)
+        if not scope then return nil, "memory_summarize: scope required" end
+        return ops.summarize(args, scope)
     end,
+}
+
+Tools.memory_embed = {
+    description = "The embedder's model and vector size for a text; with compare_to, how similar two "
+        .. "phrasings are to it (cosine).",
+    inputSchema = {
+        type = "object",
+        properties = {
+            text = { type = "string" },
+            compare_to = { type = "string" },
+            include_vector = { type = "boolean", description = "Also the vector (long)." },
+        },
+        required = { "text" },
+    },
+    handler = function(args)
+        ensure_setup()
+        local res, err = ops.embed(args)
+        if not res then return nil, err end
+        res.ok = true
+        return res
+    end,
+}
+
+Tools.memory_tune_weights = {
+    description = "Measure the vector / full-text blend that finds a scope's memories best (no model "
+        .. "calls). A report for the user, who applies it with the `apply` command.",
+    inputSchema = {
+        type = "object",
+        properties = {
+            scope = { type = "string" },
+            samples = { type = "integer", minimum = 5, maximum = 1000, description = "Default 50." },
+            metric = { type = "string", enum = { "r_at_1", "r_at_3", "r_at_5", "r_at_10", "mrr" } },
+        },
+    },
+    handler = function(args)
+        ensure_setup()
+        local report, err = ops.tune_weights(args, scope_of(args))
+        if not report then return nil, err end
+        report.ok = true
+        return report
+    end,
+}
+
+Tools.memory_learn = {
+    description = "The scope's learned reranker: run (train on the feedback; promoted only if it beats "
+        .. "the current one), status, rollback.",
+    inputSchema = {
+        type = "object",
+        properties = {
+            action = { type = "string", enum = { "run", "status", "rollback" }, description = "Default run." },
+            scope = { type = "string" },
+            dry_run = { type = "boolean", description = "run: compare, promote nothing." },
+            min_samples = { type = "integer", minimum = 1, description = "Default 20." },
+            margin = { type = "number", minimum = 0, description = "How much better it must be (0)." },
+        },
+    },
+    handler = function(args) ensure_setup(); return ops.learn(args, scope_of(args)) end,
 }
 
 Tools.memory_digest = {
-    description = "Run hippocampus digest for a scope: consolidate ephemeral tier-0 "
-        .. "memories, reinforce matching observations, and promote tier-1/2 memories "
-        .. "when proof_count or mistake-event thresholds are met. "
-        .. "Returns a summary of actions taken (processed, promoted2, promoted3, deleted). "
-        .. "Use dry_run=true to preview without writing.",
+    description = "Maintenance (when the user asks): group ephemeral memories, promote proven ones to "
+        .. "higher tiers. dry_run=true previews.",
     inputSchema = {
         type = "object",
         properties = {
-            scope = {
-                type = "string",
-                description = "Scope to digest. Defaults to the server's configured scope.",
-            },
-            dry_run = {
-                type = "boolean",
-                description = "If true, report what would happen without writing (default false).",
-            },
-            threshold = {
-                type = "number", minimum = 0.5, maximum = 1.0,
-                description = "Cosine clustering threshold for ephemeral grouping (default 0.80).",
-            },
+            scope = { type = "string" },
+            dry_run = { type = "boolean" },
+            threshold = { type = "number", minimum = 0.5, maximum = 1.0, description = "Default 0.80." },
         },
     },
-    handler = function(args)
-        ensure_setup()
-        local digest = require("luamemo.digest")
-        local scope = args.scope or MEMO_SCOPE
-        local result = digest.run(scope, {
-            dry_run   = to_bool(args.dry_run),
-            threshold = tonumber(args.threshold),
-        })
-        return { ok = true, result = result }
-    end,
+    handler = function(args) ensure_setup(); return ops.digest(args, scope_of(args)) end,
 }
 
 Tools.memory_sense = {
-    description = "Capture feedback signals from the recent conversation and record them as "
-        .. "reinforcements on the memories they concern — this is how memory LEARNS from use. "
-        .. "luamemo cannot read the chat itself, so the agent RELAYS the recent turns as "
-        .. "{role, text} objects (oldest first). Heuristics detect explicit corrections "
-        .. "(\"no, we use X not Y\"), standing commands (\"always/never …\"), and praise; each is "
-        .. "attributed to the nearest memory in scope and logged once (idempotent — re-relaying "
-        .. "the same turns records nothing new). Set generative=true to ALSO run the in-process "
-        .. "instruct model for implicit/paraphrased signals (opt-in; needs MEMO_GEN_MODEL + LuaJIT; "
-        .. "precision-first, so it stays quiet when unsure). Call this at a natural session boundary "
-        .. "or after the user corrects you. Returns {recorded, skipped, signals}.",
+    description = "How memory learns from use: relay the recent turns (oldest first) after the user "
+        .. "corrects you, sets a standing rule or confirms something; corrections, rules and praise are "
+        .. "recorded on the memories they concern. Re-sending the same turns records nothing new.",
     inputSchema = {
         type = "object",
         properties = {
             turns = {
                 type = "array",
-                description = "Recent conversation turns, oldest first. Only USER turns are scanned "
-                    .. "for signals; assistant turns give context to the generative extractor.",
+                description = "{role: user | assistant, text}, oldest first.",
                 items = {
                     type = "object",
-                    properties = {
-                        role = { type = "string", description = "'user' or 'assistant'." },
-                        text = { type = "string", description = "The turn's text." },
-                    },
+                    properties = { role = { type = "string" }, text = { type = "string" } },
                 },
             },
-            scope = {
-                type = "string",
-                description = "Scope whose memories may be reinforced. Defaults to the server's scope.",
-            },
-            generative = {
-                type = "boolean",
-                description = "Also run the in-process generative extractor (opt-in; default false).",
-            },
-            min_similarity = {
-                type = "number", minimum = 0, maximum = 1,
-                description = "Memory-resolution floor (default 0.15). Higher = stricter attribution.",
-            },
+            scope = { type = "string" },
+            generative = { type = "boolean", description = "Also the in-process model (MEMO_GEN_MODEL)." },
+            min_similarity = { type = "number", minimum = 0, maximum = 1, description = "Default 0.15." },
         },
         required = { "turns" },
     },
-    handler = function(args)
-        ensure_setup()
-        local sensing = require("luamemo.sensing")
-        local scope = args.scope or MEMO_SCOPE
-        local result = sensing.process(scope, args.turns or {}, {
-            generative     = to_bool(args.generative),
-            min_similarity = tonumber(args.min_similarity),
-        })
-        return { ok = true, result = result }
-    end,
+    handler = function(args) ensure_setup(); return ops.sense(args, scope_of(args)) end,
 }
 
 -- ===========================================================================
@@ -534,15 +700,8 @@ Tools.memory_sense = {
 -- ===========================================================================
 
 Tools.secret_list = {
-    description = "List all stored secrets (names and metadata only). "
-        .. "Secret VALUES are never returned — not by this tool, not by any other tool. "
-        .. "If the user needs to store a new API key or token, instruct them to run "
-        .. "'memo secret-store NAME --desc DESCRIPTION' in their terminal (NOT in chat). "
-        .. "Explain that typing a secret value in chat would expose it to the LLM and "
-        .. "potentially log it with the AI provider. "
-        .. "The terminal command prompts with no echo, keeping the value out of chat entirely. "
-        .. "Once stored, use secret_execute to make authenticated HTTP requests "
-        .. "with {secret} substituted server-side.",
+    description = "The stored secrets: names and metadata, never values. A new key: the user runs "
+        .. "`memo secret-store NAME` in a terminal (never in the chat); then use it with secret_execute.",
     inputSchema = {
         type       = "object",
         properties = {},
@@ -551,38 +710,32 @@ Tools.secret_list = {
         ensure_setup()
         local secrets = require("luamemo.secrets")
         if not secrets.enabled() then
-            return nil, "secrets: not configured (secrets_file or master_key not set)"
+            return nil, secrets.NOT_CONFIGURED
         end
         local rows = secrets.list()
-        return { ok = true, secrets = rows }
+        return { ok = true, secrets = list(rows) }
     end,
 }
 
+-- The vault over MCP: an agent may add a secret but never replace one, and deletes in two
+-- calls (a preview, then a confirm token) — a prompt-injected agent could otherwise swap
+-- the user's API key for its own or destroy it. Replacing: `memo secret-store NAME`.
+local function secret_meta(name)
+    for _, s in ipairs(require("luamemo.secrets").list() or {}) do
+        if s.name == name then return s end
+    end
+    return nil
+end
+
 Tools.secret_store = {
-    description = "Store (create or replace) an encrypted secret by name. "
-        .. "The value is AES-256-CBC encrypted before writing; it can never "
-        .. "be retrieved — only used via secret_execute. "
-        .. "WARNING: do NOT call this tool from the chat window. "
-        .. "The 'value' parameter would enter the LLM context and may be "
-        .. "logged by the AI provider. Use the terminal CLI instead: "
-        .. "'memo secret-store NAME --desc DESCRIPTION' prompts for the value "
-        .. "with no echo and stores it without the value ever entering chat. "
-        .. "Requires the server to be configured with MEMO_MASTER_KEY and MEMO_SECRETS_FILE.",
+    description = "Add a NEW encrypted secret (never replaces one). Not with a value from the chat — it "
+        .. "would reach the model: the user runs `memo secret-store NAME` in a terminal instead.",
     inputSchema = {
         type = "object",
         properties = {
-            name = {
-                type        = "string",
-                description = "Unique identifier. Alphanumeric, hyphens, underscores, and dots; max 128 chars.",
-            },
-            value = {
-                type        = "string",
-                description = "The plaintext secret value (API key, token, password, …).",
-            },
-            description = {
-                type        = "string",
-                description = "Optional human-readable description (stored in plaintext alongside the ciphertext).",
-            },
+            name = { type = "string", description = "Letters, digits, - _ . (at most 128)." },
+            value = { type = "string" },
+            description = { type = "string", description = "Stored in plain text." },
         },
         required = { "name", "value" },
     },
@@ -590,10 +743,14 @@ Tools.secret_store = {
         ensure_setup()
         local secrets = require("luamemo.secrets")
         if not secrets.enabled() then
-            return nil, "secrets: not configured (secrets_file or master_key not set)"
+            return nil, secrets.NOT_CONFIGURED
         end
         if not args.name or args.name == "" then return nil, "name is required" end
         if not args.value or args.value == "" then return nil, "value is required" end
+        if secret_meta(tostring(args.name)) then
+            return nil, ("a secret named %s exists — replacing it is the user's step, in a terminal: "
+                .. "memo secret-store %s"):format(args.name, args.name)
+        end
         local row, err = secrets.store(args.name, args.value, args.description)
         if not row then return nil, err end
         return { ok = true, secret = row }
@@ -601,68 +758,63 @@ Tools.secret_store = {
 }
 
 Tools.secret_delete = {
-    description = "Permanently delete a stored secret by name.",
+    description = "Permanently delete a stored secret, in two calls: the first only shows which secret "
+        .. "and returns a `confirm` token; call again with that token to delete. Ask the user first.",
     inputSchema = {
         type = "object",
         properties = {
-            name = { type = "string", description = "Secret name to delete." },
+            name    = { type = "string", description = "Secret name to delete." },
+            confirm = { type = "string", description = "The token the first call returned (valid 5 minutes)." },
         },
         required = { "name" },
     },
     handler = function(args)
         ensure_setup()
         local secrets = require("luamemo.secrets")
-        local ok, err = secrets.delete(tostring(args.name))
+        local name = tostring(args.name)
+        local meta = secret_meta(name)
+        if not meta then return nil, "secrets: not found: " .. name end
+        local filter = { secret = name }
+        if args.confirm == nil then
+            local expires = os.time() + DELETE_TOKEN_SECS
+            return { ok = false, preview = { name = meta.name, description = meta.description,
+                         used_count = meta.used_count, last_used_at = meta.last_used_at },
+                     confirm = delete_token(filter, 1, expires), expires_in_seconds = DELETE_TOKEN_SECS,
+                     note = "Nothing deleted yet. Ask the user; to delete, call secret_delete again with "
+                         .. "this confirm token." }
+        end
+        local why = token_problem(args.confirm, filter, 1)
+        if why then return nil, why end
+        local ok, err = secrets.delete(name)
         if not ok then return nil, err end
-        return { ok = true }
+        return { ok = true, deleted = name }
     end,
 }
 
 Tools.secret_execute = {
-    description = "Execute an HTTP request with a stored secret substituted "
-        .. "server-side. Write {secret} anywhere in the url, header values, "
-        .. "or body — the server replaces it with the decrypted value before "
-        .. "making the request. Only the response body is returned; the raw "
-        .. "secret NEVER appears in the tool result. "
-        .. "For multipart/form-data uploads (e.g. file uploads to an API), "
-        .. "use the multipart field instead of body.",
+    description = "An HTTP request with a stored secret filled in server-side: write {secret} in the "
+        .. "URL's path or query, a header or the body. Returns the response body (the value masked).",
     inputSchema = {
         type = "object",
         properties = {
-            name = {
-                type        = "string",
-                description = "Secret name to use.",
-            },
-            url = {
-                type        = "string",
-                description = "Request URL. May contain {secret}, e.g. 'https://api.example.com/1/{secret}/upload'.",
-            },
-            method = {
-                type        = "string",
-                enum        = { "GET", "POST", "PUT", "PATCH", "DELETE" },
-                description = "HTTP method (default GET, or POST when multipart is set).",
-            },
-            headers = {
-                type        = "object",
-                description = "Header map. Any value may contain {secret}, e.g. { Authorization = 'Bearer {secret}' }.",
-            },
-            body = {
-                type        = "string",
-                description = "Request body string. May contain {secret}. Mutually exclusive with multipart.",
-            },
+            name = { type = "string" },
+            url = { type = "string", description = "http[s]://public-host[:port]/… — {secret} in path / query only." },
+            method = { type = "string", enum = { "GET", "POST", "PUT", "PATCH", "DELETE" },
+                       description = "Default GET (POST with multipart)." },
+            headers = { type = "object", description = "e.g. {\"Authorization\": \"Bearer {secret}\"}." },
+            body = { type = "string", description = "May hold {secret}. Or multipart." },
             multipart = {
                 type        = "object",
-                description = "Multipart/form-data fields. Each key is a field name. "
-                    .. "String values are plain fields (may contain {secret}). "
-                    .. "File fields must be objects: { file = '/absolute/path', content_type? = '...' }. "
-                    .. "Mutually exclusive with body.",
+                description = "Form fields: text (may hold {secret}), or {file = 'path/in/the/project', "
+                    .. "content_type?} — project files only, never hidden or credential files.",
                 additionalProperties = true,
             },
-            timeout_ms = {
+            timeout_ms = { type = "integer", minimum = 100, maximum = 120000, description = "Default 10000." },
+            max_bytes = {
                 type        = "integer",
-                description = "Request timeout in milliseconds (default 10000).",
-                minimum     = 100,
-                maximum     = 120000,
+                description = "Response bytes returned at most (default 65536; then `truncated`).",
+                minimum     = 1024,
+                maximum     = 1048576,
             },
         },
         required = { "name", "url" },
@@ -671,30 +823,38 @@ Tools.secret_execute = {
         ensure_setup()
         local secrets = require("luamemo.secrets")
         local name = tostring(args.name)
-        local body, err = secrets.execute_with_secret(name, {
+        -- A bounded answer: a whole web page or file would fill the agent's context.
+        local max = math.max(1024, math.min(tonumber(args.max_bytes) or 65536, 1048576))
+        local body, err, info = secrets.execute_with_secret(name, {
             url        = args.url,
             method     = args.method,
             headers    = args.headers,
             body       = args.body,
             multipart  = args.multipart,
             timeout_ms = tonumber(args.timeout_ms),
+            max_bytes  = max,
+            restrict_uploads = true,   -- the agent picks the files: the project's, never credentials
         })
         if not body then return nil, err end
-        return { ok = true, response = body }
+        return { ok = true, response = body, truncated = (info and info.truncated) or nil }
     end,
 }
 
+-- Knowledge-graph facts, READ-only (owner, 2026-10-08/09, decided by a spike: with a facts
+-- tool an agent tends to call it first, find nothing and answer "unknown" without searching
+-- memories; writes added stale / wrong facts). The description and the empty-result hint
+-- are the measured ones (77 % vs 50 % for read/write) — keep them. Writes: `memo kg`.
+-- The knowledge graph reaches agents through memory_search's `facts` (owner, 2026-10-10,
+-- KG spike 2: a separate fact tool went almost unused and hurt when asked first); facts are
+-- recorded, queried at a time and traced through their history with `memo kg`.
+
 Tools.memory_status = {
-    description = "Return a DB health snapshot: total row count, per-scope row counts, "
-        .. "and a summary of the active configuration (embedder, backend, features).",
+    description = "Memory counts per scope and the active configuration.",
     inputSchema = {
         type       = "object",
         properties = {
-            verbose = {
-                type        = "boolean",
-                description = "When true, include internal config details "
-                    .. "(embedder, backend, embed_dim) in the response.",
-            },
+            verbose = { type = "boolean", description = "Also the embedder and its size." },
+            details = { type = "boolean", description = "Every setting and where it comes from (read-only)." },
         },
     },
     handler = function(args)
@@ -707,12 +867,14 @@ Tools.memory_status = {
             "FROM " .. store_mod.table_name() .. " GROUP BY scope ORDER BY n DESC LIMIT 20")
         if not scopes then return nil, tostring(serr) end
         local total = tonumber(scopes[1] and scopes[1].grand_total or 0)
+        for _, r in ipairs(scopes) do r.grand_total = nil end   -- that is total_rows, once
         local lm    = require("luamemo")  -- single local reference
         local resp  = {
             connected  = true,
             total_rows = total,
             top_scopes = scopes,
             version    = lm.VERSION or "unknown",
+            settings_warning = require("luamemo.brief").settings_note(),   -- an ignored project file
         }
         -- expose internal config only when the caller explicitly requests
         -- it (verbose=true).  Guards against architecture reconnaissance if the
@@ -720,21 +882,62 @@ Tools.memory_status = {
         if args.verbose == true then
             local cfg_ref = lm.config or {}
             resp.config = {
-                embedder     = cfg_ref.embedder_local,
+                embedder     = cfg_ref.embedder_local or cfg_ref.embedder_adapter,
                 embed_dim    = cfg_ref.embed_dim,
-                backend      = cfg_ref.backend,
                 patterns_en  = cfg_ref.patterns_enabled ~= false,
                 tier_min_mcp = 1,
             }
+        end
+        if args.details == true then
+            resp.settings = require("luamemo.settings").view(lm.config)
+            resp.settings_note = "Settings are changed by people, not over MCP: memo config set KEY VALUE "
+                .. "(or the project's .luamemorc). This server reads them when it starts."
         end
         return resp
     end,
 }
 
+-- The clients this process has served (what they say about themselves): recorded for
+-- memo calibrate / memo doctor (luamemo.clients), and named in the brief when one is too
+-- old for something luamemo needs — once per process (a session).
+local seen_clients, noted = {}, false
+local function client_seen(info, version, caps)
+    local clip = require("luamemo.clients")._clip
+    local rec = { name = clip(type(info) == "table" and info.name or nil) or "unknown client",
+        version = clip(type(info) == "table" and info.version or nil) or "?", protocol = clip(version, 20) }
+    seen_clients[tostring(rec.name) .. "|" .. tostring(rec.version) .. "|" .. tostring(version)] = rec
+    pcall(require("luamemo.clients").record, info, version, caps)
+end
+local function client_notes()
+    if noted then return {} end
+    noted = true
+    local out = {}
+    for _, rec in pairs(seen_clients) do
+        local w = require("luamemo.clients").warning(rec)
+        if w then out[#out + 1] = "client: " .. w .. " Tell the user." end
+    end
+    table.sort(out)
+    return out
+end
+
+Tools.memory_brief = {
+    description = "The session brief — the project's scope and latest memories, its code map, what waits "
+        .. "for the user. Call it first in a session unless the context holds a `=== LUAMEMO ===` block.",
+    inputSchema = {
+        type       = "object",
+        properties = {
+            scope = { type = "string", description = "Default: the project's." },
+        },
+    },
+    handler = function(args)
+        ensure_setup()
+        local scope = (args.scope ~= nil and args.scope ~= "") and args.scope or MEMO_SCOPE
+        return require("luamemo.brief").text(scope, { extra = client_notes() })
+    end,
+}
+
 Tools.memory_reconnect = {
-    description = "Force re-open the database connection. "
-        .. "Useful after an external script modified lm_memories directly, "
-        .. "or after a transient connection drop.",
+    description = "Re-open the database file (after a restore). Returns its memory count.",
     inputSchema = {
         type       = "object",
         properties = {},
@@ -744,34 +947,23 @@ Tools.memory_reconnect = {
         local db_mod    = require("luamemo.db")
         local store_mod = require("luamemo.store")
         db_mod.reset()
-        local ok, res = pcall(db_mod.query, "SELECT COUNT(*) AS n FROM " .. store_mod.table_name())
+        local n, err = db_mod.value("SELECT COUNT(*) FROM " .. store_mod.table_name())
         return {
-            success    = ok,
-            rows_after = ok and tonumber(res[1].n) or nil,
-            error      = (not ok) and tostring(res) or nil,
+            success    = n ~= nil,
+            rows_after = tonumber(n),
+            error      = (n == nil) and tostring(err) or nil,
         }
     end,
 }
 
 Tools.memory_diary_write = {
-    description = "Write a personal diary entry for a named agent. "
-        .. "Each agent_name gets its own isolated scope (diary:<agent_name>). "
-        .. "Use this to log reflections, session summaries, or ongoing thoughts.",
+    description = "An entry in a named agent's own diary (scope diary:<agent_name>).",
     inputSchema = {
         type       = "object",
         properties = {
-            agent_name = {
-                type        = "string",
-                description = "Agent identifier (e.g. 'momo', 'assistant').",
-            },
-            entry = {
-                type        = "string",
-                description = "The diary entry text to store.",
-            },
-            topic = {
-                type        = "string",
-                description = "Optional topic tag (default: 'general').",
-            },
+            agent_name = { type = "string" },
+            entry = { type = "string" },
+            topic = { type = "string", description = "Default general." },
         },
         required = { "agent_name", "entry" },
     },
@@ -810,21 +1002,12 @@ Tools.memory_diary_write = {
 }
 
 Tools.memory_diary_read = {
-    description = "Read recent diary entries for a named agent in chronological order "
-        .. "(newest first). Returns up to last_n entries (max 50).",
+    description = "A named agent's latest diary entries, newest first.",
     inputSchema = {
         type       = "object",
         properties = {
-            agent_name = {
-                type        = "string",
-                description = "Agent identifier matching what was used in memory_diary_write.",
-            },
-            last_n = {
-                type        = "integer",
-                description = "Maximum number of entries to return (default 10, max 50).",
-                minimum     = 1,
-                maximum     = 50,
-            },
+            agent_name = { type = "string" },
+            last_n = { type = "integer", minimum = 1, maximum = 50, description = "Default 10." },
         },
         required = { "agent_name" },
     },
@@ -839,7 +1022,7 @@ Tools.memory_diary_read = {
         local rows, err = db_mod.query(
             "SELECT id, body, importance, metadata, created_at " ..
             "FROM " .. store_mod.table_name() .. " WHERE scope = ? " ..
-            "ORDER BY created_at DESC LIMIT ?",
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
             scope, limit)
         if not rows then return nil, err end
         local entries = {}
@@ -847,12 +1030,12 @@ Tools.memory_diary_read = {
             local meta = (type(r.metadata) == "table") and r.metadata or {}
             entries[#entries + 1] = {
                 entry_id  = r.id,
-                timestamp = r.created_at,
+                timestamp = require("luamemo.util").us_to_iso(r.created_at),
                 topic     = meta.topic or "general",
                 content   = r.body,
             }
         end
-        return { agent = args.agent_name, entries = entries, total = #entries, scope = scope }
+        return { agent = args.agent_name, entries = list(entries), total = #entries, scope = scope }
     end,
 }
 
@@ -862,36 +1045,25 @@ Tools.memory_diary_read = {
 -- ~30 tokens locating code rather than reading files or parsing JSON.
 -- ===========================================================================
 
--- Resolve the codeindex scope for an index_* call. Explicit `scope` wins;
--- else `codeindex:<project>` where project comes from the `project` arg or is
--- derived from MEMO_SCOPE (strip a leading "repo:"), defaulting to "default".
-local function index_scope(args)
-    if args.scope and args.scope ~= "" then return args.scope end
-    local project = args.project
-    if not project or project == "" then
-        if MEMO_SCOPE and MEMO_SCOPE ~= "" then
-            project = MEMO_SCOPE:gsub("^repo:", "")
-        else
-            project = "default"
-        end
-    end
-    return "codeindex:" .. project
-end
+-- The codeindex scope for an index_* call: explicit `scope`, else codeindex:<project> —
+-- the `project` arg, else MEMO_SCOPE's project (luamemo.index.scope_for: memo index's rule).
+local function index_scope(args) return require("luamemo.index").scope_for(args) end
+
+-- The index_* tools' project / scope parameters.
+local INDEX_PROJECT = { type = "string", description = "Default: this project." }
+local INDEX_SCOPE   = { type = "string", description = "codeindex:<project>, instead of project." }
 
 Tools.index_search = {
-    description = "Search the codebase MAP (symbols, files, dependencies) — call this "
-        .. "BEFORE grepping or reading files to find WHERE code lives. Returns compact "
-        .. "'path:line  name (type) — doc' lines, not file contents. Use it to locate the "
-        .. "right file/function, then read only that region. Requires a built index "
-        .. "(run `memo index ingest`).",
+    description = "Find WHERE code lives in the codebase map (symbols, files, dependencies) — before "
+        .. "grepping or reading files. Returns 'path:line name (type) — doc' lines. Needs `memo index ingest`.",
     inputSchema = {
         type       = "object",
         properties = {
-            query   = { type = "string",  description = "Natural-language or identifier query, e.g. 'where is dedup handled'." },
-            project = { type = "string",  description = "Project name → scope codeindex:<project>. Defaults from MEMO_SCOPE." },
-            scope   = { type = "string",  description = "Explicit codeindex:<project> scope (overrides project)." },
-            kind    = { type = "string",  description = "Restrict to 'symbol', 'file', 'dependency', or 'diff'." },
-            limit   = { type = "integer", description = "Max results (default 15, max 50).", minimum = 1, maximum = 50 },
+            query   = { type = "string",  description = "Words or an identifier, e.g. 'where is dedup handled'." },
+            project = INDEX_PROJECT,
+            scope   = INDEX_SCOPE,
+            kind    = { type = "string",  description = "symbol, file, dependency or diff." },
+            limit   = { type = "integer", description = "Default 15.", minimum = 1, maximum = 50 },
         },
         required = { "query" },
     },
@@ -904,20 +1076,19 @@ Tools.index_search = {
             limit = math.max(1, math.min(math.floor(tonumber(args.limit) or 15), 50)),
         })
         if not rows then return nil, err end
-        return { ok = true, text = index.format.results(rows) }
+        return index.format.results(rows)   -- prose, sent as it is (no JSON escapes)
     end,
 }
 
 Tools.index_outline = {
-    description = "List everything defined in ONE file (symbol names, line numbers, one-line "
-        .. "docs) — call before editing a file instead of reading it whole. Returns a compact "
-        .. "outline; the file on disk remains the source of truth to read before writing.",
+    description = "Everything one file defines (names, lines, one-line docs) — instead of reading it "
+        .. "whole. Read the file itself before editing it.",
     inputSchema = {
         type       = "object",
         properties = {
-            path    = { type = "string", description = "Repo-relative file path, e.g. 'luamemo/store.lua'." },
-            project = { type = "string", description = "Project name → scope codeindex:<project>. Defaults from MEMO_SCOPE." },
-            scope   = { type = "string", description = "Explicit codeindex:<project> scope (overrides project)." },
+            path    = { type = "string", description = "Relative to the repository." },
+            project = INDEX_PROJECT,
+            scope   = INDEX_SCOPE,
         },
         required = { "path" },
     },
@@ -926,21 +1097,19 @@ Tools.index_outline = {
         local index = require("luamemo.index")
         local res, err = index.outline(args.path, { scope = index_scope(args) })
         if not res then return nil, err end
-        return { ok = true, text = index.format.outline(res.file, res.symbols) }
+        return index.format.outline(res.file, res.symbols)
     end,
 }
 
 Tools.index_explore = {
-    description = "Impact/blast-radius query over the dependency graph: given a query, return "
-        .. "matched symbols PLUS the modules that depend on them (callers) and that they depend "
-        .. "on (callees). Use before refactoring to see what a change touches. One hop.",
+    description = "A symbol's callers and callees (one hop) — what a change touches. Use before refactoring.",
     inputSchema = {
         type       = "object",
         properties = {
-            query   = { type = "string",  description = "Symbol or concept to explore, e.g. 'store.write'." },
-            project = { type = "string",  description = "Project name → scope codeindex:<project>. Defaults from MEMO_SCOPE." },
-            scope   = { type = "string",  description = "Explicit codeindex:<project> scope (overrides project)." },
-            limit   = { type = "integer", description = "Max matched symbols before expansion (default 10, max 30).", minimum = 1, maximum = 30 },
+            query   = { type = "string",  description = "A symbol or concept, e.g. 'store.write'." },
+            project = INDEX_PROJECT,
+            scope   = INDEX_SCOPE,
+            limit   = { type = "integer", description = "Matched symbols (default 10).", minimum = 1, maximum = 30 },
         },
         required = { "query" },
     },
@@ -952,19 +1121,17 @@ Tools.index_explore = {
             limit = math.max(1, math.min(math.floor(tonumber(args.limit) or 10), 30)),
         })
         if not res then return nil, err end
-        return { ok = true, text = index.format.explore(res) }
+        return index.format.explore(res)
     end,
 }
 
 Tools.index_status = {
-    description = "Report whether a codebase map exists for this project and its size "
-        .. "(file / symbol / dependency / diff row counts). Call at session start to learn "
-        .. "if index_search/index_outline are available.",
+    description = "Whether a codebase map exists for this project, and its size.",
     inputSchema = {
         type       = "object",
         properties = {
-            project = { type = "string", description = "Project name → scope codeindex:<project>. Defaults from MEMO_SCOPE." },
-            scope   = { type = "string", description = "Explicit codeindex:<project> scope (overrides project)." },
+            project = INDEX_PROJECT,
+            scope   = INDEX_SCOPE,
         },
     },
     handler = function(args)
@@ -983,7 +1150,7 @@ Tools.index_status = {
                 scope, counts.file or 0, counts.symbol or 0,
                 counts.dependency or 0, counts.diff or 0)
         end
-        return { ok = true, text = text, counts = counts, scope = scope }
+        return text   -- the counts are in it (they were sent twice)
     end,
 }
 
@@ -1015,20 +1182,23 @@ Prompts.session_start = {
 -- JSON-RPC framing
 -- ===========================================================================
 local function send(msg)
-    local enc = json.encode(msg)
+    -- Valid UTF-8 always: text stored by an earlier version (cut inside a character) or
+    -- from elsewhere reaches the client with U+FFFD in place of a broken byte — a strict
+    -- JSON reader refuses the whole message otherwise.
+    local enc = util.fix_utf8(json.encode(msg))
     log("<<", enc)
     io.stdout:write(enc, "\n")
     io.stdout:flush()
 end
 
-local function reply_result(id, result)
-    send({ jsonrpc = "2.0", id = id, result = result })
-end
-
-local function reply_error(id, code, message, data)
-    local err = { code = code, message = message }
-    if data then err.data = data end
-    send({ jsonrpc = "2.0", id = id, error = err })
+-- A tool's result as the text the model reads. lua-cjson writes every "/" as "\/" (paths
+-- and URLs cost a character each, for nothing); undone here. Only when the encoder
+-- escapes all of them: then a "\" before "/" is always that escape (a "\" of the text is
+-- "\\"), so nothing else changes. dkjson leaves "/" alone.
+local ESCAPES_SLASH = json.encode("/") == '"\\/"'
+local function encode_result(result)
+    local text = json.encode(result)
+    return ESCAPES_SLASH and (text:gsub("\\/", "/")) or text
 end
 
 -- ===========================================================================
@@ -1036,17 +1206,37 @@ end
 -- ===========================================================================
 local Methods = {}
 
-function Methods.initialize(_, _)
+local SERVER_INFO  = { name = SERVER_NAME, version = SERVER_VERSION }
+local CAPABILITIES = { tools = {}, prompts = {} }
+-- How long a client may keep tools/list, prompts/list, server/discover (modern caching
+-- hints): they don't change while the process runs; an upgrade restarts it.
+local CACHE_TTL_MS = 3600000
+
+-- The legacy version this process speaks once a client sent initialize (nil before).
+local legacy_version
+
+-- Legacy handshake: the client's version when we speak it, else our newest legacy one
+-- (the client then decides whether it can go on).
+function Methods.initialize(params, _)
+    params = params or {}
+    local asked = params.protocolVersion
+    legacy_version = member(LEGACY_VERSIONS, asked) and asked or LEGACY_VERSIONS[1]
+    client_seen(params.clientInfo, legacy_version, params.capabilities)
     return {
-        protocolVersion = PROTOCOL_VERSION,
-        serverInfo = {
-            name    = SERVER_NAME,
-            version = SERVER_VERSION,
-        },
-        capabilities = {
-            tools   = {},
-            prompts = {},
-        },
+        protocolVersion = legacy_version,
+        serverInfo      = SERVER_INFO,
+        capabilities    = CAPABILITIES,
+        instructions    = INSTRUCTIONS,   -- since 2025-03-26; older clients ignore it
+    }
+end
+
+-- Modern discovery (2026-07-28): versions, capabilities, identity, guidance.
+Methods["server/discover"] = function(_, _)
+    return {
+        supportedVersions = SUPPORTED_VERSIONS,
+        capabilities      = CAPABILITIES,
+        instructions      = INSTRUCTIONS,
+        ttlMs = CACHE_TTL_MS, cacheScope = "public",
     }
 end
 
@@ -1057,7 +1247,7 @@ end
 Methods["tools/list"] = function(_, _)
     local list  = {}
     local names = {}
-    for name in pairs(Tools) do names[#names + 1] = name end
+    for name in pairs(Tools) do if offered(name) then names[#names + 1] = name end end
     table.sort(names)
     for _, name in ipairs(names) do
         local def = Tools[name]
@@ -1070,12 +1260,86 @@ Methods["tools/list"] = function(_, _)
     return { tools = list }
 end
 
+-- A tool's arguments, checked against its own inputSchema before its handler runs: a
+-- wrong-typed argument (an object as a scope, a number as a name, null as a required
+-- field) was a Lua error inside the handler — a bare "Internal error" (720 wrong-typed
+-- calls: 45 of them, in 9 tools). Now a tool error naming the argument. JSON null is an
+-- absent argument; safe coercions: a number for a string, "5" for a number, "true" /
+-- "false" for a boolean. Arguments the schema doesn't name are left alone.
+-- A list or an object holds at most its schema's maxItems / maxProperties, else MAX_ENTRIES:
+-- 10,000 scopes or metadata-filter keys overran LuaJIT's unpack / SQLite's expression depth.
+local MAX_ENTRIES = 200
+local function entries(t) local n = 0; for _ in pairs(t) do n = n + 1 end; return n end
+local function is_list(t) return entries(t) == #t end   -- (an empty table is either)
+local function check_value(name, v, spec)
+    if type(v) == "table" and entries(v) > (spec.maxItems or spec.maxProperties or MAX_ENTRIES) then
+        return nil, ("%s holds at most %d entries"):format(name, spec.maxItems or spec.maxProperties or MAX_ENTRIES)
+    end
+    local ty = spec.type
+    if ty == "string" then
+        if type(v) == "number" then v = tostring(v) end
+        if type(v) ~= "string" then return nil, name .. " must be a string" end
+    elseif ty == "integer" or ty == "number" then
+        local n = (type(v) == "number" or type(v) == "string") and tonumber(v) or nil
+        if not n then return nil, name .. " must be a number" end
+        if ty == "integer" and n ~= math.floor(n) then return nil, name .. " must be a whole number" end
+        v = n
+    elseif ty == "boolean" then
+        if v == "true" then v = true elseif v == "false" then v = false end
+        if type(v) ~= "boolean" then return nil, name .. " must be true or false" end
+    elseif (ty == "object" or ty == "array") and type(v) == "string" then
+        return v   -- JSON text: the handler parses it, as it always did (metadata, scopes, …)
+    elseif ty == "object" then
+        if type(v) ~= "table" or (next(v) ~= nil and is_list(v)) then return nil, name .. " must be an object" end
+    elseif ty == "array" then
+        if type(v) ~= "table" or not is_list(v) then return nil, name .. " must be a list" end
+        if (spec.items or {}).type == "string" then
+            for i, e in ipairs(v) do
+                if type(e) == "number" then v[i] = tostring(e)
+                elseif type(e) ~= "string" then return nil, name .. " must be a list of strings" end
+            end
+        end
+    end
+    if spec.enum then
+        for _, e in ipairs(spec.enum) do if e == v then return v end end
+        return nil, name .. " must be one of: " .. table.concat(spec.enum, ", ")
+    end
+    return v
+end
+local function check_args(def, args)
+    local schema = def.inputSchema or {}
+    for k, v in pairs(args) do if v == json.null then args[k] = nil end end
+    for k, spec in pairs(schema.properties or {}) do
+        if args[k] ~= nil then
+            local v, err = check_value(k, args[k], spec)
+            if err then return err end
+            args[k] = v
+        end
+    end
+    for _, r in ipairs(schema.required or {}) do
+        if args[r] == nil then return r .. " is required" end
+    end
+end
+
 Methods["tools/call"] = function(params, _)
     local name = params and params.name
     local args = (params and params.arguments) or {}
     local def = name and Tools[name]
     if not def then
         return nil, { code = -32601, message = "Unknown tool: " .. tostring(name) }
+    end
+    if not offered(name) then
+        return { isError = true, content = { { type = "text", text = name .. " isn't offered here "
+            .. "(MEMO_MCP_TOOLS=core): run it with memo, or set MEMO_MCP_TOOLS=all (memo config set)." } } }
+    end
+    local bad = type(args) ~= "table" and "arguments must be an object" or check_args(def, args)
+    if bad then
+        return { isError = true, content = { { type = "text", text = "Error: " .. bad } } }
+    end
+    -- No database configured: every tool says what to do (the client shows it).
+    local unconfigured = not_configured()
+    if unconfigured then
+        return { isError = true, content = { { type = "text", text = unconfigured } } }
     end
 
     local result, err = def.handler(args)
@@ -1086,10 +1350,11 @@ Methods["tools/call"] = function(params, _)
         }
     end
 
-    local pretty = json.encode(result)
+    -- A tool that answers in prose (memory_brief, index_*) returns a string: sent as it is.
+    local text = type(result) == "string" and result or encode_result(result)
     return {
         isError = false,
-        content = { { type = "text", text = pretty } },
+        content = { { type = "text", text = text } },
     }
 end
 
@@ -1193,60 +1458,114 @@ Notifications["notifications/cancelled"]   = function() end
 -- ===========================================================================
 -- Main loop
 -- ===========================================================================
-local function dispatch(line)
-    local msg, derr = json.decode(line)
-    if not msg then
-        log("decode error:", derr, "line:", line)
-        return
+-- Results that carry caching hints in the modern protocol.
+local CACHEABLE = { ["server/discover"] = true, ["tools/list"] = true, ["prompts/list"] = true }
+
+local function err_response(id, code, message, data)
+    local e = { code = code, message = message }
+    if data ~= nil then e.data = data end
+    return { jsonrpc = "2.0", id = id, error = e }
+end
+
+--- One message → its response (nil for a notification). The protocol version is the
+--- request's own (_meta, modern) or else the one initialize picked (legacy); a modern
+--- result says it is complete and who answered.
+local function handle(msg)
+    if type(msg) ~= "table" then
+        return err_response(json.null, -32600, "Invalid Request")
     end
-
-    log(">>", line)
-
-    local method = msg.method
-    local id     = msg.id
-    local params = msg.params
-
+    local method, id, params = msg.method, msg.id, msg.params
     if id == nil then
         local nh = Notifications[method]
         if nh then nh(params) end
-        return
+        return nil
+    end
+
+    local meta = type(params) == "table" and type(params._meta) == "table" and params._meta or nil
+    local version = meta and meta[META .. "protocolVersion"]
+    local modern = false
+    if method ~= "initialize" and version ~= nil then
+        if not member(SUPPORTED_VERSIONS, version) then
+            return err_response(id, -32022, "Unsupported protocol version",
+                { supported = SUPPORTED_VERSIONS, requested = version })
+        end
+        modern = member(MODERN_VERSIONS, version)
+        if modern then
+            if type(meta[META .. "clientCapabilities"]) ~= "table" then
+                return err_response(id, -32602, "Invalid params: _meta is missing \""
+                    .. META .. "clientCapabilities\"")
+            end
+            client_seen(meta[META .. "clientInfo"], version, meta[META .. "clientCapabilities"])
+        end
+    elseif method == "server/discover" then
+        return err_response(id, -32602, "Invalid params: _meta is missing \"" .. META .. "protocolVersion\"")
     end
 
     local handler = Methods[method]
     if not handler then
-        return reply_error(id, -32601, "Method not found: " .. tostring(method))
+        return err_response(id, -32601, "Method not found: " .. tostring(method))
     end
-
     local ok, result, err = pcall(handler, params, msg)
     if not ok then
-        return reply_error(id, -32603, "Internal error: " .. tostring(result))
+        return err_response(id, -32603, "Internal error: " .. tostring(result))
     end
     if err then
-        return reply_error(id, err.code or -32603, err.message or "error", err.data)
+        return err_response(id, err.code or -32603, err.message or "error", err.data)
     end
-    reply_result(id, result)
+    if modern then
+        result.resultType = result.resultType or "complete"
+        result._meta = result._meta or {}
+        result._meta[META .. "serverInfo"] = SERVER_INFO
+        if CACHEABLE[method] and result.ttlMs == nil then
+            result.ttlMs, result.cacheScope = CACHE_TTL_MS, "public"
+        end
+    end
+    return { jsonrpc = "2.0", id = id, result = result }
+end
+
+local function dispatch(line)
+    local msg, derr = json.decode(line)
+    if msg == nil then
+        log("decode error:", derr, "line:", line)
+        return send(err_response(json.null, -32700, "Parse error"))
+    end
+    log(">>", line)
+    -- A JSON-RPC batch (2025-03-26 clients may send one): the answers, as one array.
+    if type(msg) == "table" and msg[1] ~= nil and msg.jsonrpc == nil then
+        local out = {}
+        for _, m in ipairs(msg) do
+            local r = handle(m)
+            if r then out[#out + 1] = r end
+        end
+        if #out > 0 then send(out) end
+        return
+    end
+    local r = handle(msg)
+    if r then send(r) end
 end
 
 local function main()
-    local have_db = (MEMO_DB_URL and MEMO_DB_URL ~= "")
-        or os.getenv("PGHOST") or os.getenv("PGDATABASE")
-    if not have_db then
-        io.stderr:write("[luamemo-mcp] WARNING: no database config found. "
-            .. "Set MEMO_DB_URL=postgresql://user:pass@host:5432/db "
-            .. "or individual PGHOST/PGDATABASE/PGUSER/PGPASSWORD env vars.\n")
+    local db_path, db_err = require("luamemo.db").path()
+    if not db_path then
+        io.stderr:write("[luamemo-mcp] WARNING: " .. tostring(db_err) .. "\n")
         io.stderr:flush()
     end
-    local db_display = MEMO_DB_URL
-        and MEMO_DB_URL:gsub(":[^:@]+@", ":***@")  -- redact password from URL
-        or nil
     log("started"
-        .. (db_display and (" MEMO_DB_URL=" .. db_display) or "")
+        .. (db_path and (" database=" .. db_path) or "")
         .. (MEMO_SCOPE  and (" MEMO_SCOPE=" .. MEMO_SCOPE)  or ""))
 
     while true do
         local line = io.read("*l")
         if not line then break end
-        if line ~= "" then dispatch(line) end
+        if line ~= "" then
+            -- One message that raises (outside a tool handler, which answers -32603 itself)
+            -- must not end the server: the client's later calls would go unanswered.
+            local ok, err = pcall(dispatch, line)
+            if not ok then
+                log("dispatch error:", err)
+                pcall(send, err_response(json.null, -32603, "Internal error"))
+            end
+        end
     end
     log("stdin closed; exiting")
 end

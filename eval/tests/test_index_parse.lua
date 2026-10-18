@@ -4,7 +4,7 @@
 --   2. parser.parse_file() extracts ≥95% of real symbols with 0 crashes
 --   3. checksum.file() produces stable, collision-free hashes
 --
--- Run: lua5.1 eval/tests/test_index_parse.lua [--root <path>]
+-- Run: luajit eval/tests/run.lua --only index_parse   (or luajit eval/tests/test_index_parse.lua --root <path>)
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 
@@ -75,6 +75,25 @@ else
     else
         fail(abs_count .. " rel paths start with / (should be relative)")
     end
+
+    -- Exclude patterns match as prefix/substring/glob — never as a character
+    -- subsequence. Regression: a "\0" sentinel in the glob→pattern rewrite made
+    -- ".git" match any path containing g…i…t (e.g. luamemo/sensing/init.lua).
+    local got = {}
+    for _, f in ipairs(files) do got[f.rel] = true end
+    local function on_disk(rel)
+        local h = io.open(root .. "/" .. rel, "r")
+        if h then h:close() end
+        return h ~= nil
+    end
+    local function present(rel, want, why)
+        if not on_disk(rel) then info("skip (not on disk): " .. rel); return end
+        if (got[rel] == true) == want then pass(why)
+        else fail(why .. " — " .. rel .. (want and " was excluded" or " was walked")) end
+    end
+    present("luamemo/sensing/init.lua",       true,  "'.git' exclude does not subsequence-match sensing/init.lua")
+    present("luamemo/sensing/heuristics.lua", true,  "'.git' exclude does not subsequence-match sensing/heuristics.lua")
+    present("luamemo/vendor/dkjson.lua",      false, "'vendor/' exclude still drops vendored files")
 end
 
 -- ---------------------------------------------------------------------------

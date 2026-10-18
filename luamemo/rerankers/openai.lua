@@ -2,10 +2,11 @@
 --
 -- HTTP rerank adapter targeting OpenAI's /v1/chat/completions endpoint
 -- (or any compatible API: Together, Fireworks, vLLM, LM Studio, ...).
--- Configure setup() with:
---   rerank_url     = "https://api.openai.com/v1/chat/completions"
---   rerank_model   = "gpt-4o-mini"
---   rerank_headers = { Authorization = "Bearer sk-..." }
+-- Settings (memo config set, or .luamemorc):
+--   MEMO_RERANK_ADAPTER=openai
+--   MEMO_RERANK_URL=https://api.openai.com/v1/chat/completions
+--   MEMO_RERANK_MODEL=gpt-4o-mini
+--   MEMO_RERANK_HEADERS={"Authorization": "Bearer {secret:openai}"}   (memo secret-store openai)
 --
 -- Contract: rerank(query, hits, cfg) -> { {index, score}, ... }, err
 
@@ -46,15 +47,18 @@ function M.rerank(query, hits, cfg)
         response_format = { type = "json_object" },
     })
 
+    local secrets = require("luamemo.secrets")
+    local extra, xerr = secrets.resolve_headers(cfg.rerank_headers)   -- {secret:NAME} → the vault
+    if not extra then return nil, "openai.rerank: " .. xerr end
     local headers = { ["Content-Type"] = "application/json" }
-    for k, v in pairs(cfg.rerank_headers or {}) do headers[k] = v end
+    for k, v in pairs(extra) do headers[k] = v end
 
     local status, body, err = http.request(url, {
         method = "POST", body = req_body, headers = headers,
         timeout_ms = cfg.rerank_timeout_ms or 30000,
     })
     local ok, herr = util.check_http(status, body, err, "openai.rerank")
-    if not ok then return nil, herr end
+    if not ok then return nil, secrets.scrub(herr, extra) end
 
     local payload = json.decode(body)
     if not payload or not payload.choices or not payload.choices[1] then

@@ -1,0 +1,1315 @@
+{
+  "about": "Golden fixture (Phase 14.1b): what luamemo/routes.lua (Lapis HTTP routes) and luamemo/hooks.lua (capture helpers) wrote and returned, recorded on a throwaway database with the hash embedder just before both modules were removed. Ids are symbolic per table (m = memory, f = fact, o = observation; numbered in order of first appearance); times, scores and vectors are omitted. Phase 14.5b proves the memo CLI and the MCP server reproduce every capability recorded here.",
+  "hooks": [
+    {
+      "helper": "session_scope",
+      "input": [
+        "u1",
+        "s1"
+      ],
+      "row": {
+        "scope": "user:u1:session:s1"
+      }
+    },
+    {
+      "helper": "long_term_scope",
+      "input": [
+        "u1"
+      ],
+      "row": {
+        "scope": "user:u1:long_term"
+      }
+    },
+    {
+      "helper": "capture_user_message",
+      "input": {
+        "content": "I want to refactor the auth helper.",
+        "session_id": "s1",
+        "user_id": "u1"
+      },
+      "row": {
+        "body": "I want to refactor the auth helper.",
+        "decay_rate": 0,
+        "id": "m8",
+        "importance": 1,
+        "kind": "chat",
+        "metadata": {
+          "role": "user",
+          "session_id": "s1",
+          "user_id": "u1"
+        },
+        "scope": "user:u1:session:s1",
+        "tags": [
+          "chat",
+          "user"
+        ],
+        "tier": 1,
+        "title": "user: I want to refactor the auth helper.",
+        "was_truncated": null
+      }
+    },
+    {
+      "helper": "capture_assistant_message",
+      "input": {
+        "content": "Here is the refactor plan for the auth helper.",
+        "session_id": "s1",
+        "tool_calls": [
+          {
+            "args": {
+              "filename": "auth.lua"
+            },
+            "name": "read_file"
+          }
+        ],
+        "user_id": "u1"
+      },
+      "row": {
+        "body": "Here is the refactor plan for the auth helper.",
+        "decay_rate": 0,
+        "id": "m9",
+        "importance": 1,
+        "kind": "chat",
+        "metadata": {
+          "role": "assistant",
+          "session_id": "s1",
+          "tool_calls": [
+            {
+              "args": {
+                "filename": "auth.lua"
+              },
+              "name": "read_file"
+            }
+          ],
+          "user_id": "u1"
+        },
+        "scope": "user:u1:session:s1",
+        "tags": [
+          "chat",
+          "assistant"
+        ],
+        "tier": 1,
+        "title": "assistant: Here is the refactor plan for the auth helper.",
+        "was_truncated": null
+      }
+    },
+    {
+      "helper": "capture_tool_call",
+      "input": {
+        "args": "auth.lua",
+        "result": "local M = {} return M",
+        "session_id": "s1",
+        "success": true,
+        "tool": "read_file",
+        "user_id": "u1"
+      },
+      "row": {
+        "body": "tool: read_file\nsuccess: true\nargs: auth.lua\nresult: local M = {} return M",
+        "decay_rate": 0,
+        "id": "m10",
+        "importance": 1,
+        "kind": "tool_call",
+        "metadata": {
+          "args": "auth.lua",
+          "result": "local M = {} return M",
+          "role": "tool",
+          "session_id": "s1",
+          "success": true,
+          "tool": "read_file",
+          "user_id": "u1"
+        },
+        "scope": "user:u1:session:s1",
+        "tags": [
+          "tool",
+          "read_file"
+        ],
+        "tier": 1,
+        "title": "tool: read_file",
+        "was_truncated": null
+      }
+    },
+    {
+      "helper": "capture_tool_call (same call again)",
+      "input": {
+        "args": "auth.lua",
+        "result": "local M = {} return M",
+        "session_id": "s1",
+        "success": true,
+        "tool": "read_file",
+        "user_id": "u1"
+      },
+      "row": {
+        "body": "tool: read_file\nsuccess: true\nargs: auth.lua\nresult: local M = {} return M",
+        "decay_rate": 0,
+        "id": "m10",
+        "importance": 1,
+        "kind": "tool_call",
+        "metadata": {
+          "args": "auth.lua",
+          "result": "local M = {} return M",
+          "role": "tool",
+          "session_id": "s1",
+          "success": true,
+          "tool": "read_file",
+          "user_id": "u1"
+        },
+        "scope": "user:u1:session:s1",
+        "tags": [
+          "tool",
+          "read_file"
+        ],
+        "tier": 1,
+        "title": "tool: read_file",
+        "was_truncated": null
+      }
+    },
+    {
+      "helper": "capture_decision",
+      "input": {
+        "content": "User prefers Tailwind v4 utilities.",
+        "session_id": "s1",
+        "title": "preference: tailwind v4",
+        "user_id": "u1"
+      },
+      "row": {
+        "body": "User prefers Tailwind v4 utilities.",
+        "decay_rate": 0,
+        "id": "m11",
+        "importance": 3,
+        "kind": "decision",
+        "metadata": {
+          "role": "decision",
+          "session_id": "s1",
+          "user_id": "u1"
+        },
+        "scope": "user:u1:long_term",
+        "tags": [
+          "decision"
+        ],
+        "tier": 1,
+        "title": "preference: tailwind v4",
+        "was_truncated": null
+      }
+    },
+    {
+      "helper": "capture_decision (restated)",
+      "input": {
+        "content": "User prefers Tailwind v4 utilities.",
+        "session_id": "s1",
+        "title": "preference: tailwind v4",
+        "user_id": "u1"
+      },
+      "row": {
+        "body": "User prefers Tailwind v4 utilities.",
+        "decay_rate": 0,
+        "id": "m11",
+        "importance": 3,
+        "kind": "decision",
+        "metadata": {
+          "role": "decision",
+          "session_id": "s1",
+          "user_id": "u1"
+        },
+        "scope": "user:u1:long_term",
+        "tags": [
+          "decision"
+        ],
+        "tier": 1,
+        "title": "preference: tailwind v4",
+        "was_truncated": null
+      }
+    },
+    {
+      "error": "capture_user_message: content required",
+      "helper": "capture_user_message (empty)",
+      "input": {
+        "content": "",
+        "session_id": "s1",
+        "user_id": "u1"
+      }
+    }
+  ],
+  "hooks_final_rows": {
+    "long_term": [
+      {
+        "body": "User prefers Tailwind v4 utilities.",
+        "decay_rate": 0,
+        "id": "m11",
+        "importance": 3,
+        "kind": "decision",
+        "metadata": {
+          "role": "decision",
+          "session_id": "s1",
+          "user_id": "u1"
+        },
+        "scope": "user:u1:long_term",
+        "tags": [
+          "decision"
+        ],
+        "tier": 1,
+        "title": "preference: tailwind v4",
+        "was_truncated": null
+      }
+    ],
+    "session": [
+      {
+        "body": "tool: read_file\nsuccess: true\nargs: auth.lua\nresult: local M = {} return M",
+        "decay_rate": 0,
+        "id": "m10",
+        "importance": 1,
+        "kind": "tool_call",
+        "metadata": {
+          "args": "auth.lua",
+          "result": "local M = {} return M",
+          "role": "tool",
+          "session_id": "s1",
+          "success": true,
+          "tool": "read_file",
+          "user_id": "u1"
+        },
+        "scope": "user:u1:session:s1",
+        "tags": [
+          "tool",
+          "read_file"
+        ],
+        "tier": 1,
+        "title": "tool: read_file",
+        "was_truncated": null
+      },
+      {
+        "body": "Here is the refactor plan for the auth helper.",
+        "decay_rate": 0,
+        "id": "m9",
+        "importance": 1,
+        "kind": "chat",
+        "metadata": {
+          "role": "assistant",
+          "session_id": "s1",
+          "tool_calls": [
+            {
+              "args": {
+                "filename": "auth.lua"
+              },
+              "name": "read_file"
+            }
+          ],
+          "user_id": "u1"
+        },
+        "scope": "user:u1:session:s1",
+        "tags": [
+          "chat",
+          "assistant"
+        ],
+        "tier": 1,
+        "title": "assistant: Here is the refactor plan for the auth helper.",
+        "was_truncated": null
+      },
+      {
+        "body": "I want to refactor the auth helper.",
+        "decay_rate": 0,
+        "id": "m8",
+        "importance": 1,
+        "kind": "chat",
+        "metadata": {
+          "role": "user",
+          "session_id": "s1",
+          "user_id": "u1"
+        },
+        "scope": "user:u1:session:s1",
+        "tags": [
+          "chat",
+          "user"
+        ],
+        "tier": 1,
+        "title": "user: I want to refactor the auth helper.",
+        "was_truncated": null
+      }
+    ]
+  },
+  "recorded": "2026-10-09",
+  "routes": [
+    {
+      "request": {
+        "body": {
+          "body": "How to deploy the app with docker compose on the staging host",
+          "decay_rate": 0.01,
+          "importance": 2,
+          "kind": "fact",
+          "metadata": {
+            "source": "golden"
+          },
+          "scope": "golden:routes",
+          "tags": [
+            "deploy",
+            "docker"
+          ],
+          "title": "Deploy guide"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /write"
+      },
+      "response": {
+        "action": "inserted",
+        "memory": {
+          "body": "How to deploy the app with docker compose on the staging host",
+          "decay_rate": 0.01,
+          "id": "m1",
+          "importance": 2,
+          "kind": "fact",
+          "metadata": {
+            "source": "golden"
+          },
+          "scope": "golden:routes",
+          "tags": [
+            "deploy",
+            "docker"
+          ],
+          "tier": 1,
+          "title": "Deploy guide",
+          "was_truncated": null
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "body": "We keep the Redis cache TTL at ten minutes for session data",
+          "importance": 3,
+          "kind": "decision",
+          "scope": "golden:routes",
+          "title": "Cache notes"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /write"
+      },
+      "response": {
+        "action": "inserted",
+        "memory": {
+          "body": "We keep the Redis cache TTL at ten minutes for session data",
+          "decay_rate": 0,
+          "id": "m2",
+          "importance": 3,
+          "kind": "decision",
+          "metadata": {},
+          "scope": "golden:routes",
+          "tags": [],
+          "tier": 1,
+          "title": "Cache notes",
+          "was_truncated": null
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "body": "How to deploy the app with docker compose on the staging host",
+          "dedup_strategy": "update",
+          "kind": "fact",
+          "scope": "golden:routes",
+          "tags": [
+            "deploy"
+          ],
+          "title": "Deploy guide"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /write"
+      },
+      "response": {
+        "action": "merged",
+        "memory": {
+          "body": "How to deploy the app with docker compose on the staging host",
+          "decay_rate": 0.01,
+          "id": "m1",
+          "importance": 2,
+          "kind": "fact",
+          "metadata": {
+            "source": "golden"
+          },
+          "scope": "golden:routes",
+          "tags": [
+            "deploy"
+          ],
+          "tier": 1,
+          "title": "Deploy guide",
+          "was_truncated": null
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "kind": "fact",
+          "scope": "golden:routes",
+          "title": "no body"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /write"
+      },
+      "response": {
+        "action": "inserted",
+        "memory": {
+          "body": "",
+          "decay_rate": 0,
+          "id": "m3",
+          "importance": 1,
+          "kind": "fact",
+          "metadata": {},
+          "scope": "golden:routes",
+          "tags": [],
+          "tier": 1,
+          "title": "no body",
+          "was_truncated": null
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {
+          "limit": "5",
+          "q": "deploy docker compose",
+          "scope": "golden:routes"
+        },
+        "route": "GET /search"
+      },
+      "response": {
+        "ok": true,
+        "results": [
+          {
+            "body": "How to deploy the app with docker compose on the staging host",
+            "decay_rate": 0.01,
+            "id": "m1",
+            "importance": 2,
+            "kind": "fact",
+            "metadata": {
+              "source": "golden"
+            },
+            "scope": "golden:routes",
+            "tags": [
+              "deploy"
+            ],
+            "tier": 1,
+            "title": "Deploy guide"
+          },
+          {
+            "body": "",
+            "decay_rate": 0,
+            "id": "m3",
+            "importance": 1,
+            "kind": "fact",
+            "metadata": {},
+            "scope": "golden:routes",
+            "tags": [],
+            "tier": 1,
+            "title": "no body"
+          },
+          {
+            "body": "We keep the Redis cache TTL at ten minutes for session data",
+            "decay_rate": 0,
+            "id": "m2",
+            "importance": 3,
+            "kind": "decision",
+            "metadata": {},
+            "scope": "golden:routes",
+            "tags": [],
+            "tier": 1,
+            "title": "Cache notes"
+          },
+          {
+            "body": "How to deploy the app with docker compose on the staging host",
+            "decay_rate": 0,
+            "freshness_trend": "new",
+            "id": "o1",
+            "importance": 2,
+            "kind": "observation",
+            "metadata": {},
+            "proof_count": 1,
+            "scope": "golden:routes",
+            "tags": [],
+            "title": "",
+            "type": "observation",
+            "was_truncated": null
+          }
+        ]
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {
+          "kind": "decision",
+          "q": "redis cache",
+          "scope": "golden:routes"
+        },
+        "route": "GET /search"
+      },
+      "response": {
+        "ok": true,
+        "results": [
+          {
+            "body": "We keep the Redis cache TTL at ten minutes for session data",
+            "decay_rate": 0,
+            "id": "m2",
+            "importance": 3,
+            "kind": "decision",
+            "metadata": {},
+            "scope": "golden:routes",
+            "tags": [],
+            "tier": 1,
+            "title": "Cache notes"
+          },
+          {
+            "body": "We keep the Redis cache TTL at ten minutes for session data",
+            "decay_rate": 0,
+            "freshness_trend": "new",
+            "id": "o2",
+            "importance": 3,
+            "kind": "observation",
+            "metadata": {},
+            "proof_count": 1,
+            "scope": "golden:routes",
+            "tags": [],
+            "title": "",
+            "type": "observation",
+            "was_truncated": null
+          },
+          {
+            "body": "How to deploy the app with docker compose on the staging host",
+            "decay_rate": 0,
+            "freshness_trend": "new",
+            "id": "o1",
+            "importance": 2,
+            "kind": "observation",
+            "metadata": {},
+            "proof_count": 1,
+            "scope": "golden:routes",
+            "tags": [],
+            "title": "",
+            "type": "observation",
+            "was_truncated": null
+          }
+        ]
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {
+          "scope": "golden:routes"
+        },
+        "route": "GET /search"
+      },
+      "response": {
+        "error": "q is required"
+      },
+      "status": 400
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {
+          "limit": "10",
+          "scope": "golden:routes"
+        },
+        "route": "GET /recent"
+      },
+      "response": {
+        "ok": true,
+        "results": [
+          {
+            "body": "",
+            "decay_rate": 0,
+            "id": "m3",
+            "importance": 1,
+            "kind": "fact",
+            "metadata": {},
+            "scope": "golden:routes",
+            "tags": [],
+            "tier": 1,
+            "title": "no body",
+            "was_truncated": null
+          },
+          {
+            "body": "We keep the Redis cache TTL at ten minutes for session data",
+            "decay_rate": 0,
+            "id": "m2",
+            "importance": 3,
+            "kind": "decision",
+            "metadata": {},
+            "scope": "golden:routes",
+            "tags": [],
+            "tier": 1,
+            "title": "Cache notes",
+            "was_truncated": null
+          },
+          {
+            "body": "How to deploy the app with docker compose on the staging host",
+            "decay_rate": 0.01,
+            "id": "m1",
+            "importance": 2,
+            "kind": "fact",
+            "metadata": {
+              "source": "golden"
+            },
+            "scope": "golden:routes",
+            "tags": [
+              "deploy"
+            ],
+            "tier": 1,
+            "title": "Deploy guide",
+            "was_truncated": null
+          }
+        ]
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {
+          "id": "m1"
+        },
+        "route": "GET /:id"
+      },
+      "response": {
+        "memory": {
+          "body": "How to deploy the app with docker compose on the staging host",
+          "decay_rate": 0.01,
+          "id": "m1",
+          "importance": 2,
+          "kind": "fact",
+          "metadata": {
+            "source": "golden"
+          },
+          "scope": "golden:routes",
+          "tags": [
+            "deploy"
+          ],
+          "tier": 1,
+          "title": "Deploy guide",
+          "was_truncated": null
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "importance": 5,
+          "title": "Cache notes v2"
+        },
+        "method": "POST",
+        "params": {
+          "id": "m2"
+        },
+        "route": "POST /:id/update"
+      },
+      "response": {
+        "memory": {
+          "body": "We keep the Redis cache TTL at ten minutes for session data",
+          "decay_rate": 0,
+          "id": "m2",
+          "importance": 5,
+          "kind": "decision",
+          "metadata": {},
+          "scope": "golden:routes",
+          "tags": [],
+          "tier": 1,
+          "title": "Cache notes v2",
+          "was_truncated": null
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "POST",
+        "params": {
+          "id": "m2"
+        },
+        "route": "POST /:id/delete"
+      },
+      "response": {
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {
+          "id": "m2"
+        },
+        "route": "GET /:id"
+      },
+      "response": {
+        "error": "not found"
+      },
+      "status": 404
+    },
+    {
+      "request": {
+        "body": {
+          "dry_run": "true",
+          "scope": "golden:routes"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /summarize"
+      },
+      "response": {
+        "ok": true,
+        "result": {
+          "batches": 0,
+          "errors": [],
+          "new_ids": [],
+          "replaced_ids": [],
+          "summarised": 0
+        }
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "body": "session turn 1 about the deploy plan",
+          "kind": "chat",
+          "scope": "golden:session",
+          "title": "turn 1"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /write"
+      },
+      "response": {
+        "action": "inserted",
+        "memory": {
+          "body": "session turn 1 about the deploy plan",
+          "decay_rate": 0,
+          "id": "m4",
+          "importance": 1,
+          "kind": "chat",
+          "metadata": {},
+          "scope": "golden:session",
+          "tags": [],
+          "tier": 1,
+          "title": "turn 1",
+          "was_truncated": null
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "body": "session turn 2 about the deploy plan",
+          "kind": "chat",
+          "scope": "golden:session",
+          "title": "turn 2"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /write"
+      },
+      "response": {
+        "action": "inserted",
+        "memory": {
+          "body": "session turn 2 about the deploy plan",
+          "decay_rate": 0,
+          "id": "m5",
+          "importance": 1,
+          "kind": "chat",
+          "metadata": {},
+          "scope": "golden:session",
+          "tags": [],
+          "tier": 1,
+          "title": "turn 2",
+          "was_truncated": null
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "body": "session turn 3 about the deploy plan",
+          "kind": "chat",
+          "scope": "golden:session",
+          "title": "turn 3"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /write"
+      },
+      "response": {
+        "action": "inserted",
+        "memory": {
+          "body": "session turn 3 about the deploy plan",
+          "decay_rate": 0,
+          "id": "m6",
+          "importance": 1,
+          "kind": "chat",
+          "metadata": {},
+          "scope": "golden:session",
+          "tags": [],
+          "tier": 1,
+          "title": "turn 3",
+          "was_truncated": null
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "dry_run": "true",
+          "from_scope": "golden:session",
+          "to_scope": "golden:long"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /promote"
+      },
+      "response": {
+        "ok": true,
+        "result": {
+          "deleted_source": null,
+          "dry_run": true,
+          "promoted": 1,
+          "source_ids": [
+            "m4",
+            "m5",
+            "m6"
+          ]
+        }
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "from_scope": "golden:session",
+          "to_scope": "golden:long"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /promote"
+      },
+      "response": {
+        "ok": true,
+        "result": {
+          "deleted_source": null,
+          "dry_run": null,
+          "promoted": 1,
+          "source_ids": [
+            "m4",
+            "m5",
+            "m6"
+          ],
+          "summary_id": "m7"
+        }
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "dry_run": "true",
+          "scope": "golden:routes"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /consolidate"
+      },
+      "response": {
+        "ok": true,
+        "result": {
+          "clusters": [],
+          "errors": [],
+          "expired": [],
+          "merged": [],
+          "new_ids": []
+        }
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "object": "postgres",
+          "predicate": "stores_in",
+          "scope": "golden:kg",
+          "subject": "luamemo"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /kg/assert"
+      },
+      "response": {
+        "fact": {
+          "id": "f1",
+          "object": "postgres",
+          "predicate": "stores_in",
+          "scope": "golden:kg",
+          "subject": "luamemo",
+          "valid_from": "<time>"
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "object": "sqlite",
+          "predicate": "stores_in",
+          "scope": "golden:kg",
+          "subject": "luamemo",
+          "supersede": "true"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /kg/assert"
+      },
+      "response": {
+        "fact": {
+          "id": "f2",
+          "object": "sqlite",
+          "predicate": "stores_in",
+          "scope": "golden:kg",
+          "subject": "luamemo",
+          "valid_from": "<time>"
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "object": "lua",
+          "predicate": "written_in",
+          "scope": "golden:kg",
+          "subject": "luamemo"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /kg/assert"
+      },
+      "response": {
+        "fact": {
+          "id": "f3",
+          "object": "lua",
+          "predicate": "written_in",
+          "scope": "golden:kg",
+          "subject": "luamemo",
+          "valid_from": "<time>"
+        },
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {
+          "scope": "golden:kg",
+          "subject": "luamemo"
+        },
+        "route": "GET /kg/query"
+      },
+      "response": {
+        "ok": true,
+        "results": [
+          {
+            "id": "f3",
+            "object": "lua",
+            "predicate": "written_in",
+            "scope": "golden:kg",
+            "subject": "luamemo",
+            "valid_from": "<time>"
+          },
+          {
+            "id": "f2",
+            "object": "sqlite",
+            "predicate": "stores_in",
+            "scope": "golden:kg",
+            "subject": "luamemo",
+            "valid_from": "<time>"
+          }
+        ]
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {
+          "include_invalidated": "true",
+          "scope": "golden:kg",
+          "subject": "luamemo"
+        },
+        "route": "GET /kg/query"
+      },
+      "response": {
+        "ok": true,
+        "results": [
+          {
+            "id": "f3",
+            "object": "lua",
+            "predicate": "written_in",
+            "scope": "golden:kg",
+            "subject": "luamemo",
+            "valid_from": "<time>"
+          },
+          {
+            "id": "f2",
+            "object": "sqlite",
+            "predicate": "stores_in",
+            "scope": "golden:kg",
+            "subject": "luamemo",
+            "valid_from": "<time>"
+          },
+          {
+            "id": "f1",
+            "object": "postgres",
+            "predicate": "stores_in",
+            "scope": "golden:kg",
+            "subject": "luamemo",
+            "valid_from": "<time>",
+            "valid_until": "<time>"
+          }
+        ]
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {
+          "predicate": "stores_in",
+          "scope": "golden:kg",
+          "subject": "luamemo"
+        },
+        "route": "GET /kg/timeline"
+      },
+      "response": {
+        "ok": true,
+        "results": [
+          {
+            "id": "f1",
+            "object": "postgres",
+            "predicate": "stores_in",
+            "scope": "golden:kg",
+            "subject": "luamemo",
+            "valid_from": "<time>",
+            "valid_until": "<time>"
+          },
+          {
+            "id": "f2",
+            "object": "sqlite",
+            "predicate": "stores_in",
+            "scope": "golden:kg",
+            "subject": "luamemo",
+            "valid_from": "<time>"
+          }
+        ]
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "predicate": "written_in",
+          "scope": "golden:kg",
+          "subject": "luamemo"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /kg/invalidate"
+      },
+      "response": {
+        "invalidated": 1,
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {
+          "scope": "golden:kg",
+          "subject": "luamemo"
+        },
+        "route": "GET /kg/query"
+      },
+      "response": {
+        "ok": true,
+        "results": [
+          {
+            "id": "f2",
+            "object": "sqlite",
+            "predicate": "stores_in",
+            "scope": "golden:kg",
+            "subject": "luamemo",
+            "valid_from": "<time>"
+          }
+        ]
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "scope": "golden:kg",
+          "subject": "x"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /kg/assert"
+      },
+      "response": {
+        "error": "predicate is required (non-empty string)"
+      },
+      "status": 400
+    },
+    {
+      "request": {
+        "body": {
+          "description": "fixture",
+          "name": "golden_token",
+          "value": "not-a-real-secret"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /secrets"
+      },
+      "response": {
+        "ok": true,
+        "secret": {
+          "description": "fixture",
+          "internal": null,
+          "name": "golden_token"
+        }
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {},
+        "route": "GET /secrets"
+      },
+      "response": {
+        "ok": true,
+        "secrets": [
+          {
+            "description": "fixture",
+            "name": "golden_token",
+            "used_count": 0
+          }
+        ]
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {
+          "name": "golden_token"
+        },
+        "method": "POST",
+        "params": {},
+        "route": "POST /secrets"
+      },
+      "response": {
+        "error": "value is required"
+      },
+      "status": 400
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "POST",
+        "params": {
+          "name": "golden_token"
+        },
+        "route": "POST /secrets/:name/delete"
+      },
+      "response": {
+        "ok": true
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "POST",
+        "params": {
+          "name": "missing_one"
+        },
+        "route": "POST /secrets/:name/delete"
+      },
+      "response": {
+        "error": "secrets: not found: missing_one"
+      },
+      "status": 404
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "GET",
+        "params": {},
+        "route": "GET /secrets"
+      },
+      "response": {
+        "ok": true,
+        "secrets": []
+      },
+      "status": 200
+    },
+    {
+      "request": {
+        "body": {},
+        "method": "POST",
+        "params": {
+          "name": "golden_token"
+        },
+        "route": "POST /secrets/:name/execute"
+      },
+      "response": {
+        "error": "url is required"
+      },
+      "status": 400
+    }
+  ]
+}

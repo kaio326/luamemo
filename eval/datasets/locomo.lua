@@ -39,7 +39,7 @@
 --
 -- License: MIT (snap-research/locomo). Public dataset.
 
-local cjson = require("cjson.safe")
+local cjson = require("luamemo.json")
 
 local M = {}
 

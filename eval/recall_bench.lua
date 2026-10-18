@@ -1,7 +1,7 @@
 -- Phase 13.1 — Real-Embedder Recall Benchmark harness.
 --
 -- Measures recall@K + MRR for a configured embedder against the
--- LongMemEval-shaped synthetic surrogate (eval/_make_synthetic.lua).
+-- LongMemEval-shaped synthetic surrogate (eval/helpers.lua).
 -- One scope per question (`bench:<embedder>:<question_id>`) so haystacks
 -- never bleed across questions; that mirrors the way agents would
 -- actually scope memories at run time and isolates ranking quality from
@@ -12,9 +12,8 @@
 -- answer. That isolates luamemo's contribution from the downstream
 -- generator.
 --
--- Usage:
---   PGHOST=127.0.0.1 PGPORT=5432 PGDATABASE=lm_bruteforce_test \
---     lua5.1 eval/recall_bench.lua \
+-- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes):
+--   MEMO_DB=bench luajit eval/recall_bench.lua \
 --       --embedder hash --n 20 --out eval/results/recall_hash.json
 --
 -- Embedders:
@@ -29,7 +28,7 @@
 --   ollama serve  &&  ollama pull nomic-embed-text
 --
 -- The synthetic corpus is auto-generated on first run by invoking
--- eval/_make_synthetic.lua; subsequent runs reuse the cached file.
+-- eval/helpers.lua; subsequent runs reuse the cached file.
 --
 -- CI mode (`--mode ci`) forces `--embedder hash` and asserts the
 -- recall@K / MRR numbers against a locked-in baseline. Designed to run
@@ -39,12 +38,7 @@
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;eval/datasets/?.lua;" .. package.path
 
--- Preload a `resty.http` shim so HTTP embedders (Ollama / OpenAI) work
--- under plain `lua5.1`. The shim wraps LuaSocket; it is NOT loaded when
--- the embedder is `hash` (no HTTP traffic) and is harmless when unused.
-package.preload["resty.http"] = function() return require("helpers") end
-
-local cjson = require("cjson.safe")
+local cjson = require("luamemo.json")
 
 -- --- arg parsing ---------------------------------------------------------
 local args = {
@@ -109,7 +103,11 @@ local function ensure_corpus(path)
     local fh = io.open(path, "rb")
     if fh then fh:close(); return end
     io.write("corpus missing, generating " .. path .. " ... ")
-    local cmd = "lua5.1 eval/_make_synthetic.lua " .. path
+    -- Same interpreter as this script (arg[-1] …).
+    local i = -1
+    while arg and arg[i - 1] do i = i - 1 end
+    local lua = (arg and arg[i]) or "luajit"
+    local cmd = ("%s eval/helpers.lua %s"):format(lua, path)
     local ok = os.execute(cmd)
     if ok ~= true and ok ~= 0 then
         io.stderr:write("\nfailed to run: " .. cmd .. "\n")
@@ -119,8 +117,7 @@ local function ensure_corpus(path)
 end
 ensure_corpus(args.corpus)
 
--- luamemo.db creates a pgmoon connection automatically from
--- PGHOST / PGDATABASE / PGUSER / PGPASSWORD env vars when outside OpenResty.
+-- luamemo.db opens the database MEMO_DB names.
 
 local memory     = require("luamemo")
 local db         = require("luamemo.db")
@@ -132,9 +129,6 @@ end
 
 -- --- embedder config -----------------------------------------------------
 local setup_opts = {
-    db_table         = "lm_memories",
-    backend          = "auto",
-    auth_fn          = function() return true end,
     skip_embed_probe = true,
     default_scope    = "bench:" .. args.embedder,
 }
@@ -238,10 +232,16 @@ local t_start = os.time()
 for qi, q in ipairs(rows) do
     local scope = "bench:" .. args.embedder .. ":" .. tostring(q.question_id)
     -- Wipe scope so reruns are deterministic.
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(scope))
+    assert(db.run("DELETE FROM lm_memories WHERE scope = ?", scope))
 
-    -- Write every haystack session as one memory.
-    for sid, turns in pairs(q.haystack_sessions or {}) do
+    -- Write every haystack session as one memory, in session-id order: pairs() order
+    -- over string keys changes from run to run under LuaJIT (randomised string
+    -- hashing), and the insertion order breaks score ties — the run must not depend on it.
+    local sids = {}
+    for sid in pairs(q.haystack_sessions or {}) do sids[#sids + 1] = sid end
+    table.sort(sids)
+    for _, sid in ipairs(sids) do
+        local turns = q.haystack_sessions[sid]
         local _, werr = memory.write({
             scope    = scope,
             kind     = "session",

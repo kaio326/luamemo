@@ -16,22 +16,26 @@
 
 local M = {}
 
--- Build (features, positive) examples from harvested triples by re-running search.
-local function build_examples(scope, triples, opts)
-    local store   = require("luamemo.store")
-    local learned = require("luamemo.rerankers.learned")
-    -- reuse feature: how often each memory is a labelled positive across triples.
+-- reuse feature: how often each memory is a labelled positive across triples.
+local function reuse_counts(triples)
     local reuse = {}
     for _, t in ipairs(triples) do
         if t.positive then reuse[t.positive] = (reuse[t.positive] or 0) + 1 end
     end
+    return reuse
+end
+
+-- Build (features, positive) examples from harvested triples by re-running search.
+local function build_examples(scope, triples, opts, reuse)
+    local store   = require("luamemo.store")
+    local learned = require("luamemo.rerankers.learned")
     local cand = tonumber(opts.candidate_limit) or 20
     local examples = {}
     for _, t in ipairs(triples) do
         if t.query and t.positive then
             local rows = store.search({
                 query = t.query, scope = scope, limit = cand,
-                skip_temporal = true, skip_observations = true, rerank = false,
+                skip_temporal = true, skip_observations = true, rerank = false, skip_feedback = true,
             })
             if rows and #rows > 0 then
                 for _, r in ipairs(rows) do r.reuse_count = reuse[r.id] or 0 end
@@ -61,9 +65,26 @@ local function split(examples, gate_frac)
     return train, gate
 end
 
+-- Extra gates (pluggable): each { name, fn } where fn(ctx) → pass, info. ctx =
+-- { scope, candidate, incumbent, reuse, opts }. A gate that raises fails closed.
+local function run_gates(gates, ctx)
+    local results = {}
+    for i, g in ipairs(gates or {}) do
+        local name = (type(g) == "table" and g.name) or ("gate" .. i)
+        local fn   = (type(g) == "table") and g.fn or g
+        local ok, pass, info = pcall(fn, ctx)
+        if not ok then pass, info = false, "gate error: " .. tostring(pass) end
+        results[#results + 1] = { name = name, pass = pass and true or false, info = info }
+        if not pass then return false, results, name end
+    end
+    return true, results
+end
+
 --- run(scope, opts) -> decision table. opts: min_samples(20), margin(0.0),
 --- gate_frac(0.3), epochs/lr/l2 (trainer), candidate_limit(20), harvest_limit,
---- dry_run (train + gate but never promote). Decision ∈ skip|promote|reject.
+--- dry_run (train + gate but never promote), gates (extra promotion gates —
+--- see run_gates; all must pass after the loss gate), note (version note).
+--- Decision ∈ skip|promote|reject.
 function M.run(scope, opts)
     opts = opts or {}
     local kind = "reranker"
@@ -81,7 +102,8 @@ function M.run(scope, opts)
     local ok_h, triples = pcall(feedback.harvest, scope, { limit = opts.harvest_limit })
     if not ok_h or type(triples) ~= "table" then out.reason = "harvest failed"; return out end
 
-    local ok_b, examples = pcall(build_examples, scope, triples, opts)
+    local reuse = reuse_counts(triples)
+    local ok_b, examples = pcall(build_examples, scope, triples, opts, reuse)
     if not ok_b or type(examples) ~= "table" then out.reason = "example build failed"; return out end
     out.n_examples = #examples
     if #examples < min_samples then
@@ -108,12 +130,23 @@ function M.run(scope, opts)
     out.new_score, out.incumbent_score = new_loss, inc_loss
     out.n_train, out.n_gate = #train, #gate
 
+    local beats = new_loss < (inc_loss - margin)
+    local gates_ok, failed_gate = true, nil
+    if beats and opts.gates then
+        gates_ok, out.gates, failed_gate = run_gates(opts.gates, {
+            scope = scope, candidate = new_w, incumbent = incumbent, reuse = reuse, opts = opts })
+    end
+
     if opts.dry_run then
-        out.decision = (new_loss < inc_loss - margin) and "would-promote" or "would-reject"
+        out.decision = (beats and gates_ok) and "would-promote" or "would-reject"
         return out
     end
 
-    if new_loss < (inc_loss - margin) then
+    if beats and not gates_ok then
+        local g = out.gates[#out.gates]
+        out.decision = "reject"
+        out.reason = ("%s gate failed: %s"):format(failed_gate, tostring(g and g.info or "?"))
+    elseif beats then
         local version, verr = lstore.save_version(scope, kind, new_w, { score = new_loss, note = opts.note })
         if version then
             lstore.promote(scope, kind, version)

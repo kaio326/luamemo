@@ -13,11 +13,12 @@
 -- embedder (gguf_ffi / hash). Use this when you want to point at any OpenAI-
 -- compatible endpoint, cloud or self-hosted.
 --
--- Configure setup() with, e.g.:
---   embedder_url = "https://api.openai.com/v1/embeddings"   -- or http://localhost:8000/v1/embeddings (vLLM), etc.
---   embedder_adapter = "openai_compatible"
---   embedder_model = "text-embedding-3-small"               -- or whatever the endpoint serves
---   embedder_headers = { Authorization = "Bearer " .. os.getenv("OPENAI_API_KEY") }  -- if the endpoint needs auth
+-- Settings (memo config set, or .luamemorc), e.g.:
+--   MEMO_EMBEDDER_URL=https://api.openai.com/v1/embeddings   (or http://localhost:8000/v1/embeddings — vLLM, …)
+--   MEMO_EMBEDDER_ADAPTER=openai_compatible
+--   MEMO_EMBEDDER_MODEL=text-embedding-3-small               (or whatever the endpoint serves)
+--   MEMO_EMBEDDER_HEADERS={"Authorization": "Bearer {secret:openai}"}   (if the endpoint needs a key:
+--                                                            memo secret-store openai)
 
 local json = require("luamemo.json")
 

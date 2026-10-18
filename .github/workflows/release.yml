@@ -1,0 +1,130 @@
+# A release, by hand: Actions → Release → Run workflow, with the version (it must be
+# luamemo.VERSION, with its rockspec and its CHANGELOG section already on the branch).
+#   1. the checks, and the whole CI (tests + rock smoke test) on that commit;
+#   2. the prebuilt GGUF runtime for Linux x86_64 and macOS arm64 (eval/release/gguf_bundle.sh);
+#   3. the release commit — its checksums in luamemo/embedders/native/bundles.lua and the
+#      CHANGELOG date — which only the tag points to (the branch is left as it is), the
+#      tag v<version>;
+#   4. the source rock packed from that tag, smoke-tested exactly as it will be published;
+#   5. the GitHub Release (rock, rockspec, runtimes + checksums, notes from the CHANGELOG);
+#   6. with "publish", luarocks.org — needs the repository secret LUAROCKS_API_KEY.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (X.Y.Z — luamemo.VERSION)"
+        required: true
+      publish:
+        description: "Also upload the rock to luarocks.org"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0 (pinned by commit)
+        with:
+          fetch-depth: 0
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends luajit
+      - name: Version, rockspec, CHANGELOG, tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be X.Y.Z"; exit 1; }
+          have=$(luajit -e 'package.path="./?.lua;./?/init.lua;"..package.path io.write(require("luamemo").VERSION)')
+          [[ "$have" == "$VERSION" ]] || { echo "::error::luamemo.VERSION is $have, not $VERSION"; exit 1; }
+          luajit eval/release/rockspec.lua "$VERSION" --check
+          grep -q "^## \[$VERSION\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no ## [$VERSION] section"; exit 1; }
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::tag v$VERSION exists already"; exit 1; fi
+
+  ci:
+    needs: checks
+    uses: ./.github/workflows/ci.yml
+
+  gguf:
+    needs: checks
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0 (pinned by commit)
+      - name: Build tools
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake luajit
+          else
+            brew install cmake luajit
+          fi
+      - name: Prebuilt runtime
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bash eval/release/gguf_bundle.sh "$VERSION" dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with:
+          name: gguf-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [ci, gguf]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0 (pinned by commit)
+        with:
+          fetch-depth: 0
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends luajit luarocks libsqlite3-0 libsodium23 lua-socket jq git
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4.3.0
+        with:
+          pattern: gguf-*
+          path: dist
+          merge-multiple: true
+
+      - name: Release commit (only the tag points to it) and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          luajit eval/release/write_bundles.lua "$VERSION" dist
+          sed -i "s/^## \[$VERSION\] — unreleased/## [$VERSION] — $(date -u +%Y-%m-%d)/" CHANGELOG.md
+          git add luamemo/embedders/native/bundles.lua CHANGELOG.md
+          git commit -m "release: v$VERSION (prebuilt GGUF runtime checksums, CHANGELOG date)"
+          git tag -a "v$VERSION" -m "luamemo $VERSION"
+          git push origin "v$VERSION"
+
+      - name: Source rock, from the tag
+        run: |
+          luarocks pack "luamemo-$VERSION-1.rockspec"
+          ls -l "luamemo-$VERSION-1.src.rock"
+
+      - name: Smoke test of that rock
+        run: bash eval/release/smoke.sh "luamemo-$VERSION-1.src.rock"
+
+      - name: GitHub Release
+        run: |
+          awk -v v="$VERSION" '$0 ~ "^## \\[" v "\\]" {on=1; next} on && /^## \[/ {exit} on' CHANGELOG.md > notes.md
+          gh release create "v$VERSION" --title "luamemo $VERSION" --notes-file notes.md --verify-tag \
+            "luamemo-$VERSION-1.src.rock" "luamemo-$VERSION-1.rockspec" dist/*.tar.gz dist/*.sha256
+
+      - name: luarocks.org
+        if: inputs.publish
+        env:
+          LUAROCKS_API_KEY: ${{ secrets.LUAROCKS_API_KEY }}
+        run: |
+          [[ -n "$LUAROCKS_API_KEY" ]] || { echo "::error::the repository secret LUAROCKS_API_KEY is not set"; exit 1; }
+          # Uploads the rockspec and the source rock it packs from the tag (as above).
+          luarocks upload "luamemo-$VERSION-1.rockspec" --api-key="$LUAROCKS_API_KEY"

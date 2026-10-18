@@ -1,0 +1,70 @@
+[
+  {
+    "sample_id": "fixture-conv-1",
+    "conversation": {
+      "session_1": [
+        { "speaker": "Alice", "text": "I just got back from a trip to Paris.", "dia_id": "D1:1" },
+        { "speaker": "Bob",   "text": "Nice! When was that?",                   "dia_id": "D1:2" },
+        { "speaker": "Alice", "text": "March 2024. We saw the Louvre.",         "dia_id": "D1:3" }
+      ],
+      "session_1_date_time": "2:00 pm on 1 April, 2024",
+      "session_2": [
+        { "speaker": "Alice", "text": "I'm thinking of going to Berlin next.",  "dia_id": "D2:1" },
+        { "speaker": "Bob",   "text": "Oh, in summer or winter?",               "dia_id": "D2:2" },
+        { "speaker": "Alice", "text": "Probably July, after my work deadline.", "dia_id": "D2:3" }
+      ],
+      "session_2_date_time": "11:00 am on 5 May, 2024",
+      "session_3": [
+        { "speaker": "Alice", "text": "Adopted a cat last weekend!",            "dia_id": "D3:1" },
+        { "speaker": "Bob",   "text": "What's its name?",                       "dia_id": "D3:2" },
+        { "speaker": "Alice", "text": "Pixel. He's a black-and-white tabby.",   "dia_id": "D3:3" }
+      ],
+      "session_3_date_time": "9:00 pm on 1 June, 2024"
+    },
+    "qa": [
+      {
+        "question": "When did Alice last visit Paris?",
+        "answer":   "March 2024",
+        "category": 3,
+        "evidence": ["D1:3"]
+      },
+      {
+        "question": "What is the name of Alice's cat?",
+        "answer":   "Pixel",
+        "category": 1,
+        "evidence": ["D3:3"]
+      },
+      {
+        "question": "After which trip did Alice plan to go to Berlin?",
+        "answer":   "After her Paris trip",
+        "category": 2,
+        "evidence": ["D1:1", "D2:1"]
+      }
+    ]
+  },
+  {
+    "sample_id": "fixture-conv-2",
+    "conversation": {
+      "session_1": [
+        { "speaker": "Carol",  "text": "I started learning the violin.",        "dia_id": "D1:1" },
+        { "speaker": "Daniel", "text": "How's it going?",                       "dia_id": "D1:2" },
+        { "speaker": "Carol",  "text": "Hard. My teacher is Mrs. Tanaka.",      "dia_id": "D1:3" }
+      ],
+      "session_1_date_time": "10:00 am on 3 March, 2024",
+      "session_2": [
+        { "speaker": "Carol",  "text": "Switched teachers — now with Mr. Lee.", "dia_id": "D2:1" },
+        { "speaker": "Daniel", "text": "Why the change?",                        "dia_id": "D2:2" },
+        { "speaker": "Carol",  "text": "Mrs. Tanaka moved to Osaka.",            "dia_id": "D2:3" }
+      ],
+      "session_2_date_time": "10:00 am on 3 May, 2024"
+    },
+    "qa": [
+      {
+        "question": "Who is Carol's current violin teacher?",
+        "answer":   "Mr. Lee",
+        "category": 1,
+        "evidence": ["D2:1"]
+      }
+    ]
+  }
+]

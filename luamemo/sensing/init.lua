@@ -44,15 +44,13 @@ local function reclassify_if_miss(db, scope, mem_id, event_type)
     if event_type ~= "mistake" then return event_type end
     local mid = math.floor(tonumber(mem_id) or 0)
     if mid == 0 then return event_type end
-    local lok, lrows = pcall(db.query,
-        "SELECT 1 FROM lm_retrieval_feedback WHERE scope = "
-        .. db.escape_literal(scope) .. " LIMIT 1")
-    if not (lok and lrows and #lrows > 0) then return event_type end  -- log inactive
-    local rok, rrows = pcall(db.query,
-        "SELECT 1 FROM lm_retrieval_feedback WHERE scope = " .. db.escape_literal(scope)
-        .. " AND candidate_ids @> ARRAY[" .. mid .. "]::bigint[] LIMIT 1")
-    if rok and rrows and #rrows > 0 then return event_type end  -- was retrieved → real mistake
-    return "miss"                                                -- existed but never surfaced
+    local lok, active = pcall(db.value, "SELECT 1 FROM lm_retrieval_feedback WHERE scope = ? LIMIT 1", scope)
+    if not (lok and active) then return event_type end  -- log inactive
+    local rok, seen = pcall(db.value, "SELECT 1 FROM lm_retrieval_candidates c "
+        .. "JOIN lm_retrieval_feedback f ON f.id = c.feedback_id WHERE c.memory_id = ? AND f.scope = ? LIMIT 1",
+        mid, scope)
+    if rok and seen then return event_type end  -- was retrieved → real mistake
+    return "miss"                               -- existed but never surfaced
 end
 
 -- Resolve a signal to the memory it refers to: the nearest memory in the scope.
@@ -111,16 +109,15 @@ function M.process(scope, turns, opts)
                 local marker = "sensing:" .. util.djb2_hex(scope .. "|" .. sig.text .. "|" .. ev_type)
                 -- idempotency: skip if this exact signal is already on this memory.
                 local existed = false
-                local eok, erows = pcall(db.query,
-                    "SELECT 1 FROM lm_reinforcements WHERE memory_id = " .. tostring(math.floor(mem_id))
-                    .. " AND scope = " .. db.escape_literal(scope)
-                    .. " AND note LIKE " .. db.escape_literal(marker .. "%") .. " LIMIT 1")
-                if eok and erows and #erows > 0 then existed = true end
+                local eok, hit = pcall(db.value, "SELECT 1 FROM lm_reinforcements WHERE memory_id = ? "
+                    .. "AND scope = ? AND substr(note, 1, ?) = ? LIMIT 1",
+                    math.floor(mem_id), scope, #marker, marker)
+                if eok and hit then existed = true end
                 if existed then
                     out.skipped = out.skipped + 1
                 else
                     local delta = (sig.confidence or 0.7) * scale
-                    local note  = marker .. " " .. sig.text:sub(1, 80)
+                    local note  = marker .. " " .. util.cut_utf8(sig.text, 80)
                     local rok = pcall(digest.record_event, mem_id, scope, ev_type, delta, note)
                     if rok then out.recorded = out.recorded + 1 else out.skipped = out.skipped + 1 end
                 end

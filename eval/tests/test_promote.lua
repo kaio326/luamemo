@@ -7,9 +7,8 @@
 --   Section 2: the reranker loads per-scope promoted weights
 --   Section 3: promote.run decisions (skip / valid decision + audit / dry-run)
 --
--- Usage:
---   MEMO_DB_URL=postgresql://postgres:postgres@127.0.0.1:5432/luamemo_dev \
---     lua5.1 eval/tests/test_promote.lua
+-- Usage (the test runner sets a new MEMO_DB per file):
+--   MEMO_DB=/tmp/test_promote.db luajit eval/tests/test_promote.lua
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
@@ -26,20 +25,16 @@ local function check(label, ok, detail)
     else io.write("[FAIL] " .. label .. (detail and (" — " .. detail) or "") .. "\n"); fail = fail + 1 end
 end
 local function header(s) io.write(string.format("\n=== %s ===\n", s)) end
-local function esc(s) return db.escape_literal(s) end
+local now_us = require("luamemo.util").now_us
 
-memory.setup({
-    db_table = "lm_memories", embedder_local = "hash", embed_dim = 384,
-    backend = "auto", auth_fn = function() return true end, skip_embed_probe = true,
-})
+memory.setup({ embedder_local = "hash", embed_dim = 384, skip_embed_probe = true })
 
 local function wipe_learner(s)
-    db.query("DELETE FROM lm_learner_weights WHERE scope = " .. esc(s))
-    db.query("DELETE FROM lm_promotion_runs  WHERE scope = " .. esc(s))
+    db.run("DELETE FROM lm_learner_weights WHERE scope = ?", s)
+    db.run("DELETE FROM lm_promotion_runs  WHERE scope = ?", s)
 end
 local function runs_for(s)
-    local r = db.query("SELECT count(*) AS n FROM lm_promotion_runs WHERE scope = " .. esc(s))
-    return r and tonumber(r[1].n) or -1
+    return tonumber((db.value("SELECT count(*) FROM lm_promotion_runs WHERE scope = ?", s))) or -1
 end
 
 -- =========================================================================
@@ -87,9 +82,9 @@ learned.reset_cache()
 header("Section 3 — promote.run decisions (skip / valid decision + audit / dry-run)")
 local S = "ps:run"
 local function wipe_run()
-    db.query("DELETE FROM lm_retrieval_feedback WHERE scope = " .. esc(S))
-    db.query("DELETE FROM lm_reinforcements     WHERE scope = " .. esc(S))
-    db.query("DELETE FROM lm_memories           WHERE scope = " .. esc(S))
+    db.run("DELETE FROM lm_retrieval_feedback WHERE scope = ?", S)
+    db.run("DELETE FROM lm_reinforcements     WHERE scope = ?", S)
+    db.run("DELETE FROM lm_memories           WHERE scope = ?", S)
     wipe_learner(S)
 end
 wipe_run()
@@ -107,12 +102,11 @@ for _, t in ipairs(topics) do
     ids[t] = row and row.id
 end
 local all = {}; for _, t in ipairs(topics) do all[#all + 1] = math.floor(ids[t]) end
-local candarr = "'{" .. table.concat(all, ",") .. "}'"
 for _, t in ipairs(topics) do
-    db.query("INSERT INTO lm_retrieval_feedback (scope, query, candidate_ids) VALUES ("
-        .. esc(S) .. ", " .. esc(t) .. ", " .. candarr .. ")")
-    db.query("INSERT INTO lm_reinforcements (memory_id, scope, event_type, delta, note) VALUES ("
-        .. math.floor(ids[t]) .. ", " .. esc(S) .. ", 'praise', 0.5, 'seed')")
+    assert(db.run("INSERT INTO lm_retrieval_feedback (scope, query, candidate_ids, created_at) VALUES (?, ?, ?, ?)",
+        S, t, db.json(all), now_us()))
+    assert(db.run("INSERT INTO lm_reinforcements (memory_id, scope, event_type, delta, note, created_at) "
+        .. "VALUES (?, ?, 'praise', 0.5, 'seed', ?)", math.floor(ids[t]), S, now_us()))
 end
 
 local runs0 = runs_for(S)

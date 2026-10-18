@@ -4,14 +4,14 @@
 --   Section 2: Digest      (hippocampus digest: tier-0 processing, purge, dry_run)
 --   Section 3: MCP Tools   (memory_status, memory_reconnect, memory_diary_write/read)
 --
--- Usage:
---   MEMO_DB_URL=postgresql://postgres:postgres@127.0.0.1:5432/luamemo_dev \
---     lua5.1 eval/tests/test_pipeline.lua
+-- Usage (the test runner sets a new MEMO_DB per file):
+--   MEMO_DB=/tmp/test_pipeline.db luajit eval/tests/test_pipeline.lua
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
 local db     = require("luamemo.db")
 local memory = require("luamemo")
+local util   = require("luamemo.util")
 
 local pass = 0
 local fail = 0
@@ -30,6 +30,9 @@ local function header(s)
     io.write(string.format("\n=== %s ===\n", s))
 end
 
+local function count(sql, ...) return tonumber((db.value(sql, ...))) end
+local function ids_in(ids) return "id IN (" .. db.placeholders(#ids) .. ")" end
+
 -- =========================================================================
 -- Section 1: Consolidate
 -- =========================================================================
@@ -38,12 +41,9 @@ header("Consolidate")
 local consolidate = require("luamemo.consolidate")
 
 memory.setup({
-    db_table          = "lm_memories",
     embedder_local    = "hash",
     embed_dim         = 384,
-    backend           = "auto",
     default_scope     = "smoke:consolidate",
-    auth_fn           = function() return true end,
     summarizer_adapter = "noop",
     consolidate_threshold            = 0.70,
     consolidate_reinforce_threshold  = 0.50,
@@ -53,25 +53,16 @@ local SCOPE_C   = "smoke:consolidate"
 local MEM_TBL   = "lm_memories"
 local OBS_TBL   = "lm_observations"
 
-db.query("DELETE FROM " .. MEM_TBL .. " WHERE scope = " .. db.escape_literal(SCOPE_C))
-db.query("DELETE FROM " .. OBS_TBL .. " WHERE scope = " .. db.escape_literal(SCOPE_C))
+db.run("DELETE FROM " .. MEM_TBL .. " WHERE scope = ?", SCOPE_C)
+db.run("DELETE FROM " .. OBS_TBL .. " WHERE scope = ?", SCOPE_C)
 
 do
-    -- Migration check
-    local tbl_check = db.query([[
-        SELECT 1 FROM information_schema.tables
-         WHERE table_name = 'lm_observations' LIMIT 1]])
-    local col_check = db.query([[
-        SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'lm_memories'
-           AND column_name = 'consolidated_at' LIMIT 1]])
-    local migrate_ok = tbl_check and #tbl_check > 0 and col_check and #col_check > 0
-    check("consolidate: lm_observations table exists (migration 007)",
-        tbl_check and #tbl_check > 0,
-        "apply luamemo/migrations/007_observations.sql")
-    check("consolidate: lm_memories.consolidated_at column exists (migration 007)",
-        col_check and #col_check > 0,
-        "apply luamemo/migrations/007_observations.sql")
+    -- Schema check
+    local tbl_ok = db.value("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lm_observations'") ~= nil
+    local col_ok = db.value("SELECT 1 FROM pragma_table_info('lm_memories') WHERE name = 'consolidated_at'") ~= nil
+    local migrate_ok = tbl_ok and col_ok
+    check("consolidate: lm_observations table exists", tbl_ok)
+    check("consolidate: lm_memories.consolidated_at column exists", col_ok)
 
     if migrate_ok then
         -- Seed related + unrelated memories
@@ -88,11 +79,8 @@ do
         local urow, uerr = memory.write({ scope = SCOPE_C, body = unrelated_body })
         assert(urow and urow.id, "seed write failed: " .. tostring(uerr))
 
-        local seeded = db.query(
-            "SELECT COUNT(*) AS n FROM " .. MEM_TBL
-            .. " WHERE scope = " .. db.escape_literal(SCOPE_C))[1]
-        check("consolidate: 4 memories seeded",
-            tonumber(seeded.n) == 4, "got " .. tostring(seeded.n))
+        local seeded = count("SELECT COUNT(*) FROM " .. MEM_TBL .. " WHERE scope = ?", SCOPE_C)
+        check("consolidate: 4 memories seeded", seeded == 4, "got " .. tostring(seeded))
 
         -- Process
         local result = consolidate.process(SCOPE_C)
@@ -105,25 +93,18 @@ do
             .. " reinforced=" .. tostring(result.reinforced))
 
         -- consolidated_at stamped
-        local unconsolidated = db.query([[
-            SELECT COUNT(*) AS n FROM ]] .. MEM_TBL .. [[
-             WHERE scope = ]] .. db.escape_literal(SCOPE_C) .. [[
-               AND consolidated_at IS NULL]])[1]
+        local unconsolidated = count("SELECT COUNT(*) FROM " .. MEM_TBL
+            .. " WHERE scope = ? AND consolidated_at IS NULL", SCOPE_C)
         check("consolidate: all memories stamped consolidated_at",
-            tonumber(unconsolidated.n) == 0,
-            tostring(unconsolidated.n) .. " rows still unconsolidated")
+            unconsolidated == 0, tostring(unconsolidated) .. " rows still unconsolidated")
 
-        local obs_count = db.query(
-            "SELECT COUNT(*) AS n FROM " .. OBS_TBL
-            .. " WHERE scope = " .. db.escape_literal(SCOPE_C))[1]
+        local obs_count = count("SELECT COUNT(*) FROM " .. OBS_TBL .. " WHERE scope = ?", SCOPE_C)
         check("consolidate: at least 1 observation row created",
-            tonumber(obs_count.n) >= 1, "got " .. tostring(obs_count.n))
+            (obs_count or 0) >= 1, "got " .. tostring(obs_count))
 
         -- Reinforcement
-        local proof_before = db.query(
-            "SELECT COALESCE(MAX(proof_count), 0) AS max_pc FROM " .. OBS_TBL
-            .. " WHERE scope = " .. db.escape_literal(SCOPE_C))[1]
-        local max_before = tonumber(proof_before.max_pc) or 0
+        local max_before = count("SELECT COALESCE(MAX(proof_count), 0) FROM " .. OBS_TBL
+            .. " WHERE scope = ?", SCOPE_C) or 0
 
         memory.write({ scope = SCOPE_C, body = "PostgreSQL is our chosen persistence layer", importance = 1.0 })
         memory.write({ scope = SCOPE_C, body = "DB decision: use PostgreSQL", importance = 1.0 })
@@ -133,17 +114,27 @@ do
             type(result2) == "table" and #(result2.errors or {}) == 0,
             table.concat(result2.errors or {}, "; "))
 
-        local proof_after = db.query(
-            "SELECT COALESCE(MAX(proof_count), 0) AS max_pc FROM " .. OBS_TBL
-            .. " WHERE scope = " .. db.escape_literal(SCOPE_C))[1]
-        local max_after = tonumber(proof_after.max_pc) or 0
+        local max_after = count("SELECT COALESCE(MAX(proof_count), 0) FROM " .. OBS_TBL
+            .. " WHERE scope = ?", SCOPE_C) or 0
         check("consolidate: second process() produced ≥1 reinforced or synthesised",
             (tonumber(result2.reinforced) or 0) + (tonumber(result2.synthesised) or 0) >= 1
             or max_after >= max_before,   -- hash embedder: accept if proof_count didn't drop
             "before=" .. max_before .. " after=" .. max_after)
 
+        -- The closest observation is found where the vectors are stored (one scan for every
+        -- cluster), a row stored without its norm included: a memory saying what an
+        -- observation says reinforces exactly that one.
+        local o = db.first("SELECT id, body, proof_count FROM " .. OBS_TBL .. " WHERE scope = ? ORDER BY id LIMIT 1",
+            SCOPE_C)
+        db.run("UPDATE " .. OBS_TBL .. " SET emb_norm = NULL WHERE id = ?", o.id)
+        assert(memory.write({ scope = SCOPE_C, body = o.body, dedup_strategy = "append" }))
+        local result3 = consolidate.process(SCOPE_C)
+        check("consolidate: a memory repeating an observation reinforces it (its norm computed)",
+            result3.reinforced == 1 and result3.synthesised == 0
+            and count("SELECT proof_count FROM " .. OBS_TBL .. " WHERE id = ?", o.id) == o.proof_count + 1,
+            ("reinforced=%s synthesised=%s"):format(tostring(result3.reinforced), tostring(result3.synthesised)))
+
         -- consolidate.search()
-        local store = require("luamemo.store")
         local qvec, everr = require("luamemo.embed").embed("PostgreSQL database choice")
         assert(qvec, "embed failed: " .. tostring(everr))
 
@@ -170,11 +161,40 @@ do
         check("consolidate: store.search() returns ≥1 result",
             #search_results >= 1, tostring(#search_results))
 
-        local found_obs = false
-        for _, r in ipairs(search_results) do
-            if r.type == "observation" then found_obs = true break end
+        -- An observation repeating a result's text is left out (the default summarizer keeps a
+        -- member's body: the same text twice in one answer); one saying more is appended.
+        local shown, dup = {}, false
+        for _, r in ipairs(search_results) do if r.type ~= "observation" then shown[r.body] = true end end
+        for _, r in ipairs(search_results) do if r.type == "observation" and shown[r.body] then dup = true end end
+        check("consolidate: store.search() leaves out an observation repeating a result", not dup)
+        local qv = assert(require("luamemo.embed").embed("PostgreSQL database choice"))
+        local blob, norm = require("luamemo.vectors").pack(qv)
+        local now_us = require("luamemo.util").now_us()
+        db.run("INSERT INTO " .. OBS_TBL .. " (scope, body, proof_count, embedding, emb_norm, last_reinforced, "
+            .. "created_at) VALUES (?, ?, 3, ?, ?, ?, ?)", SCOPE_C, "The team standardised on PostgreSQL for every service",
+            db.blob(blob), norm, now_us, now_us)
+        local found_obs
+        for _, r in ipairs(memory.search({ scope = SCOPE_C, query = "what database did we choose?", limit = 10 }) or {}) do
+            if r.type == "observation" and r.body:find("standardised", 1, true) then found_obs = r break end
         end
-        check("consolidate: store.search() includes observation", found_obs)
+        check("consolidate: store.search() includes an observation that says more", found_obs ~= nil)
+        -- Its own id as observation_id, never id: memory_get / update / delete read that as a
+        -- memory id — acting on an observation reached an unrelated memory.
+        check("… with observation_id, no id (no memory has its number)", found_obs and found_obs.id == nil
+            and tonumber(found_obs.observation_id) ~= nil, found_obs and tostring(found_obs.id))
+        -- Observations have no kind, metadata, tier or time: a search filtered on one gets none
+        -- (they came back whatever the filter); min_score holds for them too.
+        local leaked = {}
+        for _, f in ipairs({ { kind = "decision" }, { min_score = 50 }, { metadata_filter = { source = "x" } },
+                             { since = "2099-01-01" }, { tier_max = 0 } }) do
+            local a = { scope = SCOPE_C, query = "what database did we choose?", limit = 10 }
+            for k, v in pairs(f) do a[k] = v end
+            for _, r in ipairs(memory.search(a) or {}) do
+                if r.type == "observation" then leaked[#leaked + 1] = next(f) end
+            end
+        end
+        check("… and none in a search filtered on kind / metadata / time / tier, or below min_score",
+            #leaked == 0, table.concat(leaked, ","))
 
         -- skip_observations=true
         local skip_results, skerr = memory.search({
@@ -187,10 +207,50 @@ do
             if r.type == "observation" then skip_obs = true break end
         end
         check("consolidate: skip_observations=true excludes observations", not skip_obs)
+
+        -- A deleted or rewritten memory leaves nothing in the observations: their text may be
+        -- the memory's own (the default summarizer), so it reached agents after the delete
+        -- (a confidential note) and beside the new text after an update.
+        local S2 = SCOPE_C .. ":forget"
+        local embed_mod = require("luamemo.embed")
+        local secret = assert(memory.write({ scope = S2, title = "ACME contract", body = "ACME pays 2.4M and leaves in Q3" }))
+        local cadence = assert(memory.write({ scope = S2, title = "release cadence", body = "we release every second Tuesday" }))
+        local embeds, real_embed = 0, embed_mod.embed
+        embed_mod.embed = function(...) embeds = embeds + 1; return real_embed(...) end
+        memory.search({ scope = S2, query = "release", limit = 5 })   -- consolidates both
+        embed_mod.embed = real_embed
+        check("consolidate: a new observation reuses its member's vector (one embedder call: the query)",
+            embeds == 1, embeds)
+        local function obs_bodies()
+            local t = {}
+            for _, r in ipairs(db.query("SELECT body FROM " .. OBS_TBL .. " WHERE scope = ?", S2) or {}) do t[#t + 1] = r.body end
+            return table.concat(t, " | ")
+        end
+        check("… an observation per memory (setup)", obs_bodies():find("ACME", 1, true) ~= nil
+            and obs_bodies():find("Tuesday", 1, true) ~= nil, obs_bodies())
+        memory.delete(secret.id)
+        check("consolidate: a deleted memory's observation goes with it", not obs_bodies():find("ACME", 1, true),
+            obs_bodies())
+        memory.update(cadence.id, { body = "we release every Friday now" })
+        check("… and a rewritten one's, the memory to be consolidated again", not obs_bodies():find("Tuesday", 1, true)
+            and db.value("SELECT consolidated_at IS NULL FROM " .. MEM_TBL .. " WHERE id = ?", cadence.id) == 1,
+            obs_bodies())
+        memory.search({ scope = S2, query = "release", limit = 5 })
+        check("… which the next search does, from its new text", obs_bodies():find("Friday", 1, true) ~= nil, obs_bodies())
+        -- Tier 0 (the hooks' raw transcript) is the digest's: a search doesn't distil it (its
+        -- observation got past the search's tier filter).
+        local raw = assert(memory.write({ scope = S2, title = "Periodic save", body = "USER: zebra crossing words",
+            tier = 0, importance = 0.4 }))
+        memory.search({ scope = S2, query = "zebra", limit = 5 })
+        check("consolidate: a search leaves tier-0 rows to the digest",
+            db.value("SELECT consolidated_at IS NULL FROM " .. MEM_TBL .. " WHERE id = ?", raw.id) == 1
+            and not obs_bodies():find("zebra", 1, true), obs_bodies())
+        db.run("DELETE FROM " .. MEM_TBL .. " WHERE scope = ?", S2)
+        db.run("DELETE FROM " .. OBS_TBL .. " WHERE scope = ?", S2)
     end
 
-    db.query("DELETE FROM " .. MEM_TBL .. " WHERE scope = " .. db.escape_literal(SCOPE_C))
-    db.query("DELETE FROM " .. OBS_TBL .. " WHERE scope = " .. db.escape_literal(SCOPE_C))
+    db.run("DELETE FROM " .. MEM_TBL .. " WHERE scope = ?", SCOPE_C)
+    db.run("DELETE FROM " .. OBS_TBL .. " WHERE scope = ?", SCOPE_C)
 end
 
 -- =========================================================================
@@ -201,12 +261,9 @@ header("Digest")
 local digest = require("luamemo.digest")
 
 memory.setup({
-    db_table           = "lm_memories",
     embedder_local     = "hash",
     embed_dim          = 384,
-    backend            = "auto",
     default_scope      = "smoke:digest",
-    auth_fn            = function() return true end,
     summarizer_adapter = "noop",
     consolidate_threshold            = 0.70,
     consolidate_reinforce_threshold  = 0.50,
@@ -221,18 +278,13 @@ local store  = require("luamemo.store")
 local SCOPE_D  = "smoke:digest"
 local REI_TBL  = "lm_reinforcements"
 
-db.query("DELETE FROM " .. MEM_TBL .. " WHERE scope = " .. db.escape_literal(SCOPE_D))
-db.query("DELETE FROM " .. REI_TBL .. " WHERE scope = " .. db.escape_literal(SCOPE_D))
+db.run("DELETE FROM " .. MEM_TBL .. " WHERE scope = ?", SCOPE_D)
+db.run("DELETE FROM " .. REI_TBL .. " WHERE scope = ?", SCOPE_D)
 
 do
-    -- Migration check
-    local rei_check = db.query([[
-        SELECT 1 FROM information_schema.tables
-         WHERE table_schema = 'public'
-           AND table_name   = 'lm_reinforcements'
-         LIMIT 1]])
+    -- Schema check
     check("digest: lm_reinforcements table exists",
-        rei_check and #rei_check > 0)
+        db.value("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lm_reinforcements'") ~= nil)
 
     -- configure + notify_write
     local ok2, err2 = pcall(function()
@@ -263,9 +315,7 @@ do
     local ok4, err4 = pcall(digest.record_event, mem_id, SCOPE_D, "mistake", 0.5, "smoke test note")
     check("digest: record_event executes without error", ok4, tostring(err4))
 
-    local rei_rows = db.query(
-        "SELECT event_type, note FROM " .. REI_TBL
-        .. " WHERE memory_id = " .. tostring(mem_id or 0))
+    local rei_rows = db.query("SELECT event_type, note FROM " .. REI_TBL .. " WHERE memory_id = ?", mem_id or 0)
     check("digest: record_event row in lm_reinforcements",
         rei_rows and #rei_rows >= 1)
     if rei_rows and #rei_rows >= 1 then
@@ -286,17 +336,13 @@ do
     local ok_rev = pcall(digest.record_event, rev_id, SCOPE_D, "reversal", 1.0, "direction changed")
     check("digest: record_event reversal succeeds", ok_rev)
 
-    local after_rev = rev_id and db.query(
-        "SELECT importance, tier FROM lm_memories WHERE id = " .. tostring(rev_id))
-    local after_imp = after_rev and after_rev[1] and tonumber(after_rev[1].importance)
+    local after_imp = rev_id and tonumber((db.value("SELECT importance FROM lm_memories WHERE id = ?", rev_id)))
     check("digest: reversal reduces importance",
         after_imp and after_imp < 0.8,
         "importance after reversal: " .. tostring(after_imp))
 
-    local rev_rei = rev_id and db.query(
-        "SELECT event_type FROM " .. REI_TBL
-        .. " WHERE memory_id = " .. tostring(rev_id)
-        .. " AND event_type = 'reversal'")
+    local rev_rei = rev_id and db.query("SELECT event_type FROM " .. REI_TBL
+        .. " WHERE memory_id = ? AND event_type = 'reversal'", rev_id)
     check("digest: reversal event written to lm_reinforcements",
         rev_rei and #rev_rei >= 1)
 
@@ -324,10 +370,8 @@ do
     end
 
     if #tier0_ids > 0 then
-        local id_list = table.concat(tier0_ids, ",")
-        local t0check = db.query(
-            "SELECT id, tier FROM " .. MEM_TBL
-            .. " WHERE id IN (" .. id_list .. ") AND tier = 0")
+        local t0check = db.query("SELECT id, tier FROM " .. MEM_TBL .. " WHERE " .. ids_in(tier0_ids)
+            .. " AND tier = 0", unpack(tier0_ids))
         check("digest: seeded rows are tier=0",
             t0check and #t0check == #tier0_ids,
             "expected " .. #tier0_ids .. " got " .. tostring(t0check and #t0check))
@@ -341,11 +385,8 @@ do
     end
 
     if ok7 and #tier0_ids > 0 then
-        local id_list = table.concat(tier0_ids, ",")
-        local stamped = db.query(
-            "SELECT id FROM " .. MEM_TBL
-            .. " WHERE id IN (" .. id_list .. ")"
-            .. "   AND consolidated_at IS NOT NULL")
+        local stamped = db.query("SELECT id FROM " .. MEM_TBL .. " WHERE " .. ids_in(tier0_ids)
+            .. " AND consolidated_at IS NOT NULL", unpack(tier0_ids))
         check("digest: consolidated_at stamped after run",
             stamped and #stamped > 0,
             "stamped=" .. tostring(stamped and #stamped))
@@ -373,11 +414,8 @@ do
     end
 
     if ok9 and #dry_ids > 0 then
-        local id_list = table.concat(dry_ids, ",")
-        local unstamped = db.query(
-            "SELECT id FROM " .. MEM_TBL
-            .. " WHERE id IN (" .. id_list .. ")"
-            .. "   AND consolidated_at IS NULL")
+        local unstamped = db.query("SELECT id FROM " .. MEM_TBL .. " WHERE " .. ids_in(dry_ids)
+            .. " AND consolidated_at IS NULL", unpack(dry_ids))
         check("digest: dry_run does not stamp consolidated_at",
             unstamped and #unstamped == #dry_ids,
             "unstamped=" .. tostring(unstamped and #unstamped)
@@ -386,10 +424,9 @@ do
 
     -- purge stale (grace_days=0)
     if #tier0_ids > 0 then
-        local id_list = table.concat(tier0_ids, ",")
-        db.query("UPDATE " .. MEM_TBL
-            .. " SET consolidated_at = NOW() - INTERVAL '1 second'"
-            .. " WHERE id IN (" .. id_list .. ")")
+        local params = { util.now_us() - 1000000 }
+        for _, id in ipairs(tier0_ids) do params[#params + 1] = id end
+        db.run("UPDATE " .. MEM_TBL .. " SET consolidated_at = ? WHERE " .. ids_in(tier0_ids), unpack(params))
         local ok11, res11 = pcall(digest.run, SCOPE_D)
         check("digest: run for purge succeeds", ok11, tostring(res11))
         if ok11 then
@@ -405,8 +442,8 @@ do
     })
     check("digest: store.write after wiring succeeds (notify_write hooked)", ok12, tostring(err12))
 
-    db.query("DELETE FROM " .. MEM_TBL .. " WHERE scope = " .. db.escape_literal(SCOPE_D))
-    db.query("DELETE FROM " .. REI_TBL .. " WHERE scope = " .. db.escape_literal(SCOPE_D))
+    db.run("DELETE FROM " .. MEM_TBL .. " WHERE scope = ?", SCOPE_D)
+    db.run("DELETE FROM " .. REI_TBL .. " WHERE scope = ?", SCOPE_D)
 end
 
 -- =========================================================================
@@ -415,9 +452,7 @@ end
 header("MCP Tools")
 
 memory.setup({
-    db_url           = os.getenv("MEMO_DB_URL"),
     embedder_local   = "hash",
-    backend          = "bruteforce",
     patterns_enabled = false,
 })
 
@@ -427,21 +462,19 @@ do
 
     local function status_handler(_)
         ensure_setup()
-        local ok, res = pcall(db.query, "SELECT COUNT(*) AS n FROM lm_memories")
-        if not ok then return nil, tostring(res) end
-        local scopes = db.query(
-            "SELECT scope, COUNT(*) AS n FROM lm_memories "
-            .. "GROUP BY scope ORDER BY n DESC LIMIT 20")
+        local scopes, serr = db.query(
+            "SELECT scope, COUNT(*) AS n, SUM(COUNT(*)) OVER () AS grand_total "
+            .. "FROM lm_memories GROUP BY scope ORDER BY n DESC LIMIT 20")
+        if not scopes then return nil, tostring(serr) end
         local cfg_ref = require("luamemo").config or {}
         return {
             connected  = true,
-            total_rows = tonumber(res[1].n),
+            total_rows = tonumber(scopes[1] and scopes[1].grand_total or 0),
             top_scopes = scopes,
             version    = require("luamemo").VERSION or "unknown",
             config = {
-                embedder     = cfg_ref.embedder_local,
+                embedder     = cfg_ref.embedder_local or cfg_ref.embedder_adapter,
                 embed_dim    = cfg_ref.embed_dim,
-                backend      = cfg_ref.backend,
                 patterns_en  = cfg_ref.patterns_enabled ~= false,
                 tier_min_mcp = 1,
             },
@@ -451,11 +484,11 @@ do
     local function reconnect_handler(_)
         ensure_setup()
         db.reset()
-        local ok, res = pcall(db.query, "SELECT COUNT(*) AS n FROM lm_memories")
+        local n, err = db.value("SELECT COUNT(*) FROM lm_memories")
         return {
-            success    = ok,
-            rows_after = ok and tonumber(res[1].n) or nil,
-            error      = (not ok) and tostring(res) or nil,
+            success    = n ~= nil,
+            rows_after = tonumber(n),
+            error      = (n == nil) and tostring(err) or nil,
         }
     end
 
@@ -486,7 +519,7 @@ do
         local rows, err = db.query(
             "SELECT id, body, importance, metadata, created_at "
             .. "FROM lm_memories WHERE scope = ? "
-            .. "ORDER BY created_at DESC LIMIT ?",
+            .. "ORDER BY created_at DESC, id DESC LIMIT ?",
             scope, limit)
         if not rows then return nil, err end
         local entries = {}
@@ -494,7 +527,7 @@ do
             local meta = (type(r.metadata) == "table") and r.metadata or {}
             entries[#entries + 1] = {
                 entry_id  = r.id,
-                timestamp = r.created_at,
+                timestamp = util.us_to_iso(r.created_at),
                 topic     = meta.topic or "general",
                 content   = r.body,
             }
@@ -504,7 +537,7 @@ do
 
     local AGENT = "smoke_agent_" .. tostring(os.time())
     local SCOPE_M = "diary:" .. AGENT
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(SCOPE_M))
+    db.run("DELETE FROM lm_memories WHERE scope = ?", SCOPE_M)
 
     -- memory_status
     local r, err = status_handler({})
@@ -566,6 +599,8 @@ do
         type(r) == "table" and r.entries[1] and r.entries[1].topic ~= nil)
     check("mcp: diary_read agent field preserved",
         type(r) == "table" and r.agent == AGENT)
+    check("mcp: diary_read timestamp is text",
+        type(r) == "table" and r.entries[1] and type(r.entries[1].timestamp) == "string")
 
     r = diary_read_handler({ agent_name = AGENT, last_n = 1 })
     check("mcp: diary_read last_n=1 → ≤1 entry",
@@ -574,7 +609,7 @@ do
     r, err = diary_read_handler({ agent_name = "" })
     check("mcp: diary_read empty agent_name → error", r == nil and err ~= nil)
 
-    db.query("DELETE FROM lm_memories WHERE scope = " .. db.escape_literal(SCOPE_M))
+    db.run("DELETE FROM lm_memories WHERE scope = ?", SCOPE_M)
 end
 
 -- =========================================================================

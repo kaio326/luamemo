@@ -1,19 +1,18 @@
 -- luamemo.cli.calibrate
 --
--- `memo calibrate` — host probe, corpus health, and codebase ingest.
--- Supersedes `memo init`.
+-- `memo calibrate` — host probe, embedder recommendation, and codebase ingest.
 --
 -- Runs in two modes depending on the flags passed:
 --
---   Probe mode (default, no server required):
---     Probes GPU/RAM/Docker/Ollama, asks two questions, and prints a
---     setup({}) snippet for the best-fit embedder. Same as old memo init.
---     If MEMO_URL is not set, the command stops after the probe.
+--   Probe mode (default):
+--     Probes GPU / RAM / Docker / Ollama / TEI / the in-process GGUF embedder and
+--     prints the best-fit embedder as MEMO_* settings — the bash wrapper records
+--     them in the project's .luamemorc (it reads them from --write PATH).
 --
 --   Scan mode (--scan flag, called by the bash wrapper internally):
 --     Scans the project for architectural knowledge and outputs one JSON
---     memory-write payload per line (NDJSON) to stdout. The bash wrapper
---     pipes each line to POST /write. All scan progress goes to stderr.
+--     memory per line (NDJSON) to stdout; the bash wrapper pipes it into
+--     `api write-many`. All scan progress goes to stderr.
 --
 -- Sources scanned (Phase 3):
 --   1. Agent instruction files (.github/copilot-instructions.md, AGENTS.md, …)
@@ -33,9 +32,8 @@
 --   --non-interactive   use flag-supplied answers, do not prompt
 --   --multilingual      treat content as multilingual
 --   --long              treat rows as long-form (>4k chars)
---   --hosted            permit hosted-API recommendations
 --   --allow-hash        permit the hash fallback
---   --write PATH        also write the config snippet to PATH
+--   --write PATH        also write the recommended settings (MEMO_*='value' lines) to PATH
 
 local json      = require("luamemo.json")
 local probe     = require("luamemo.cli.probe")
@@ -52,17 +50,16 @@ local read_file  = util.read_file
 local trim       = util.trim
 local shell_quote = util.shell_quote
 
-local function pread(cmd)
-    local f = io.popen(cmd .. " 2>/dev/null")
-    if not f then return "" end
-    local out = f:read("*a") or ""; f:close()
-    return out:gsub("%s+$", "")
-end
+-- The llama.cpp release the shim is built and tested against.
+local function llama_tag() return require("luamemo.embedders.native.bundle").LLAMA_TAG end
+
+local pread = util.sh   -- a command's output, stderr dropped, trailing whitespace trimmed
 
 local function truncate(s, n)
     if #s <= n then return s end
-    return s:sub(1, n) .. "\n[…truncated]"
+    return util.cut_utf8(s, n) .. "\n[…truncated]"
 end
+local function cut(s, n) return util.cut_utf8(s, n) end   -- titles: on a character
 
 -- ---------------------------------------------------------------------------
 -- NDJSON emitter
@@ -76,7 +73,7 @@ local function emit(scope, kind, title, body, importance, tags, meta)
     print(json.encode({
         scope          = scope,
         kind           = kind or "fact",
-        title          = trim(title):sub(1, 200),
+        title          = cut(trim(title), 200),
         body           = truncate(body, 4000),
         importance     = importance or 2,
         decay_rate     = 0,
@@ -246,7 +243,7 @@ local function scan_source_comments(root, scope)
                 .. "\n\n(source: " .. last_file .. ":" .. tostring(block_lnum) .. ")"
             io.stderr:write("  [comment] " .. last_file .. ":" .. tostring(block_lnum) .. "\n")
             emit(scope, "decision",
-                tag .. ": " .. trim(block_lines[1]):sub(1, 150),
+                tag .. ": " .. cut(trim(block_lines[1]), 150),
                 body, 3, { "calibrate", "source-comment", tag:lower() },
                 { source = last_file, line = block_lnum, calibrate = true })
         end
@@ -315,7 +312,7 @@ local function scan_git_commits(root, scope, since_sha, limit)
         if sha and subject and is_architectural(subject) then
             io.stderr:write("  [git] " .. sha:sub(1, 7) .. " " .. subject:sub(1, 60) .. "\n")
             emit(scope, "fact",
-                "git: " .. subject:sub(1, 180),
+                "git: " .. cut(subject, 180),
                 subject .. "\n\ncommit: " .. sha .. "\ndate: " .. date,
                 2, { "calibrate", "git-commit" },
                 { commit = sha, date = date, calibrate = true })
@@ -331,33 +328,18 @@ end
 -- Probe-mode helpers (identical to old init.lua)
 -- ---------------------------------------------------------------------------
 
-local function fmt_snippet(rec)
-    local lines = { 'require("luamemo").setup({' }
-    local order = {
-        "embedder_local", "embedder_adapter", "embedder_url",
-        "embedder_model", "embed_dim", "embed_max_chars", "embedder_headers",
-    }
-    for _, key in ipairs(order) do
-        local v = rec.setup_keys[key]
-        if v ~= nil then
-            if type(v) == "string" then
-                table.insert(lines, string.format("    %s = %q,", key, v))
-            elseif type(v) == "number" then
-                table.insert(lines, string.format("    %s = %d,", key, v))
-            elseif type(v) == "table" then
-                local parts = {}
-                for k, vv in pairs(v) do
-                    table.insert(parts, string.format("%s = %q", k, vv))
-                end
-                table.insert(lines, string.format("    %s = { %s },",
-                    key, table.concat(parts, ", ")))
-            end
-        end
-    end
-    table.insert(lines, "    corpus_health_check = true,")
-    table.insert(lines, '    auth_fn = function() return false end,  -- private by default')
-    table.insert(lines, "})")
-    return table.concat(lines, "\n")
+-- The recommendation as MEMO_* settings: { { NAME, value }, … } — gguf_ffi takes
+-- its model file as MEMO_GGUF_MODEL, an HTTP embedder its model as MEMO_EMBEDDER_MODEL.
+local function rec_settings(rec)
+    local s, out = rec.setup_keys, {}
+    local function add(name, v) if v ~= nil then out[#out + 1] = { name, tostring(v) } end end
+    add("MEMO_EMBEDDER", s.embedder_local)
+    add("MEMO_EMBEDDER_ADAPTER", s.embedder_adapter)
+    add("MEMO_EMBEDDER_URL", s.embedder_url)
+    add(s.embedder_local == "gguf_ffi" and "MEMO_GGUF_MODEL" or "MEMO_EMBEDDER_MODEL", s.embedder_model)
+    add("MEMO_EMBED_DIM", s.embed_dim)
+    add("MEMO_EMBED_MAX_CHARS", s.embed_max_chars)
+    return out
 end
 
 -- ---------------------------------------------------------------------------
@@ -375,7 +357,6 @@ local function parse_flags(argv)
         probe_only      = false,
         multilingual    = false,
         long            = false,
-        hosted          = false,
         allow_hash      = false,
         no_gguf         = false,
         write           = nil,
@@ -393,7 +374,6 @@ local function parse_flags(argv)
         elseif a == "--non-interactive" then  -- no-op: calibrate is always non-interactive
         elseif a == "--multilingual"    then f.multilingual = true
         elseif a == "--long"            then f.long = true
-        elseif a == "--hosted"          then f.hosted = true
         elseif a == "--allow-hash"      then f.allow_hash = true
         elseif a == "--no-gguf"         then f.no_gguf = true
         elseif a == "--write"           then f.write = argv[i+1]; i = i+1
@@ -445,6 +425,15 @@ function M.run(argv)
     local ollama = probe.ollama()
     local ram    = probe.ram_mb()
     local gguf   = probe.gguf()
+    -- Live readiness check (loads the model once) only when the gguf path is in play.
+    local gguf_state = (gguf.ok and not flags.no_gguf) and probe.gguf_ready() or { ready = false }
+    -- Embedding services count only if they answer a real embedding from this
+    -- host. Skipped when the gguf embedder is ready (it is preferred anyway).
+    local ollama_state, tei_state = { checked = false }, { checked = false }
+    if not gguf_state.ready then
+        if ollama.ok then ollama_state = probe.ollama_ready(ollama.value); ollama_state.checked = true end
+        if docker.ok then tei_state = probe.tei_ready(); tei_state.checked = true end
+    end
     local scan   = probe.scan_project(flags.root)
 
     io.write(string.format("  GPU:    %s\n",
@@ -453,14 +442,40 @@ function M.run(argv)
             or  ("none (" .. gpu.err .. ")")))
     io.write(string.format("  Docker: %s\n",
         docker.ok and ("ok, " .. docker.value) or ("none (" .. docker.err .. ")")))
-    io.write(string.format("  Ollama: %s\n",
-        ollama.ok and ("reachable at " .. ollama.value) or ("none (" .. ollama.err .. ")")))
+    local ollama_line
+    if not ollama.ok then
+        ollama_line = "none (" .. ollama.err .. ")"
+    elseif ollama_state.ready then
+        ollama_line = ("serving %s at %s (dim %d)"):format(ollama_state.model, ollama_state.url, ollama_state.dim)
+    elseif ollama_state.checked then
+        ollama_line = "reachable at " .. ollama.value .. " but not serving embeddings — " .. ollama_state.reason
+    else
+        ollama_line = "reachable at " .. ollama.value
+    end
+    io.write(string.format("  Ollama: %s\n", ollama_line))
+    local tei_line
+    if tei_state.ready then
+        tei_line = ("'%s' serving %s at %s (dim %d)"):format(tei_state.container, tei_state.model,
+            tei_state.url, tei_state.dim)
+    elseif tei_state.checked then
+        tei_line = "none (" .. tei_state.reason .. ")"
+    else
+        tei_line = docker.ok and "not checked (gguf embedder is ready)" or "none (docker not available)"
+    end
+    io.write(string.format("  TEI:    %s\n", tei_line))
     io.write(string.format("  RAM:    %s\n",
         ram.ok and (ram.value .. " MiB available") or ("unknown (" .. ram.err .. ")")))
-    io.write(string.format("  GGUF:   %s\n",
-        gguf.ok
-            and "capable (LuaJIT + C toolchain) — in-process embedder available"
-            or  ("not available (missing: " .. table.concat(gguf.missing, ", ") .. ")")))
+    local gguf_line
+    if not gguf.ok then
+        gguf_line = "not available (missing: " .. table.concat(gguf.missing, ", ") .. ")"
+    elseif gguf_state.ready then
+        gguf_line = "ready — in-process embedder works (model: " .. gguf_state.model .. ")"
+    elseif flags.no_gguf then
+        gguf_line = "capable (LuaJIT + C toolchain) — opted out with --no-gguf"
+    else
+        gguf_line = "capable (LuaJIT + C toolchain) but not set up yet — " .. gguf_state.reason
+    end
+    io.write(string.format("  GGUF:   %s\n", gguf_line))
 
     io.write("\nProject scan (root=" .. flags.root .. "):\n")
     if #scan.ext_census == 0 then
@@ -477,10 +492,9 @@ function M.run(argv)
     io.write("\n")
 
     -- Calibrate is always non-interactive: use scan hints + explicit flags.
-    -- Pass --multilingual / --long / --hosted / --allow-hash to override.
+    -- Pass --multilingual / --long / --allow-hash to override.
     local multilingual = flags.multilingual or scan.multilingual_hint or false
     local long         = flags.long   or false
-    local hosted       = flags.hosted or false
     local allow_hash   = flags.allow_hash or false
 
     local profile = {
@@ -491,10 +505,19 @@ function M.run(argv)
         ram_mb       = ram.ok and ram.value or 0,
         multilingual = multilingual,
         long_rows    = long,
-        allow_hosted = hosted,
         allow_hash   = allow_hash or flags.allow_hash,
-        gguf_capable = gguf.ok,
-        allow_gguf   = not flags.no_gguf,   -- --no-gguf opts out of the in-process default
+        gguf_capable   = gguf.ok,
+        allow_gguf     = not flags.no_gguf,   -- --no-gguf opts out of the in-process default
+        gguf_ready     = gguf_state.ready,
+        gguf_model     = gguf_state.ready and gguf_state.model or nil,
+        gguf_dim       = gguf_state.dim,
+        gguf_not_ready = gguf_state.reason,
+        ollama_ready   = ollama_state.ready
+            and { url = ollama_state.url, model = ollama_state.model, dim = ollama_state.dim } or nil,
+        ollama_not_ready = (ollama_state.checked and not ollama_state.ready) and ollama_state.reason or nil,
+        tei_ready      = tei_state.ready
+            and { url = tei_state.url, model = tei_state.model, dim = tei_state.dim,
+                  container = tei_state.container } or nil,
     }
 
     local rec, err = recommend.decide(profile)
@@ -510,35 +533,45 @@ function M.run(argv)
     if rec.embed_max_chars then
         io.write(string.format("  embed_max_chars: %d\n", rec.embed_max_chars))
     end
-    if rec.tei_image then
-        io.write(string.format("  tei image:       %s\n", rec.tei_image))
-    end
     io.write("\nRationale:\n")
     for _, r in ipairs(rec.rationale) do
         io.write("  - " .. r .. "\n")
     end
 
-    local snippet = fmt_snippet(rec)
-    io.write("\nSnippet (paste into your app startup):\n\n")
-    io.write(snippet .. "\n")
+    local recommended = rec_settings(rec)
+    io.write(flags.probe_only and "\nSettings (memo calibrate records them in .luamemorc):\n"
+        or "\nSettings (recorded in .luamemorc unless it already sets them):\n")
+    for _, kv in ipairs(recommended) do io.write("  ", kv[1], "=", kv[2], "\n") end
 
-    if rec.gguf then
-        io.write([[
-
-In-process embedder — one-time setup (detect + guide)
------------------------------------------------------
-The recommended embedder runs a GGUF model INSIDE your process via LuaJIT FFI —
-no sidecar, no vendor API, owned weights (survives provider changes). It needs a
-small native build + a model download, done once. This host has the prerequisites.
-
+    if rec.gguf_upgrade then
+        local step1
+        if gguf.shim then
+            step1 = "  1. The runtime (gguf_shim.so) is installed already — nothing to do here.\n"
+        elseif gguf.prebuilt then
+            step1 = "  1. Install the prebuilt runtime for " .. gguf.prebuilt.platform .. " (no compiler needed):\n"
+                .. "       memo gguf install\n"
+        else
+            step1 = [[
   1. Build llama.cpp (shared libs) and the shim:
-       git clone --depth 1 https://github.com/ggml-org/llama.cpp ~/llama.cpp
+       git clone --depth 1 --branch ]] .. llama_tag() .. [[ https://github.com/ggml-org/llama.cpp ~/llama.cpp
        cmake -B ~/llama.cpp/build -S ~/llama.cpp -DBUILD_SHARED_LIBS=ON \
              -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
              -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
              -DLLAMA_BUILD_TOOLS=OFF -DCMAKE_BUILD_TYPE=Release
        cmake --build ~/llama.cpp/build --target llama -j
        LLAMA_DIR=~/llama.cpp bash <luamemo>/embedders/native/build.sh
+]]
+        end
+        io.write([[
+
+Optional upgrade — in-process GGUF embedder (one-time setup)
+------------------------------------------------------------
+This host can run a GGUF embedding model INSIDE your process via LuaJIT FFI — no
+sidecar, no vendor API, owned weights (survives provider changes), and far better
+retrieval than hash. It is not set up yet, so calibrate configured the working
+embedder above; memo is usable now. Upgrade whenever you like:
+
+]] .. step1 .. [[
 
   2. Download the model (EmbeddingGemma-300M recommended; ~320 MB):
        mkdir -p ~/models && curl -sL -o ~/models/embeddinggemma-300M-Q8_0.gguf \
@@ -546,10 +579,18 @@ small native build + a model download, done once. This host has the prerequisite
      Want a different / newer open-weights model instead? Point MEMO_GGUF_MODEL
      at ANY llama.cpp-compatible GGUF embedding model — gemma is just the default.
 
-  3. Set MEMO_GGUF_MODEL=<path-to.gguf> and run your app / MCP server under `luajit`.
+  3. Check it: re-run `memo calibrate --probe-only` — the GGUF line must say "ready".
 
-Opt out: re-run `memo calibrate --no-gguf` to fall back to the next-best embedder
-(GPU/Docker sidecar, or --allow-hash for the semantically-blind FTS-only mode).
+  4. Switch this project:
+       memo config set MEMO_EMBEDDER gguf_ffi
+       memo config set MEMO_GGUF_MODEL <path-to.gguf>
+       memo config set MEMO_EMBED_DIM 768
+       memo config unset MEMO_EMBEDDER_URL        (and MEMO_EMBEDDER_ADAPTER, if set)
+     Then restart the MCP server in your client, and re-embed what is already
+     stored:  memo reembed --all
+     (the database moves to the new vector size once every scope is re-embedded).
+
+Hide this suggestion: re-run `memo calibrate --no-gguf`.
 ]])
     end
 
@@ -560,8 +601,8 @@ Opt out: re-run `memo calibrate --no-gguf` to fall back to the next-best embedde
                 .. flags.write .. ": " .. tostring(ferr) .. "\n")
             os.exit(1)
         end
-        f:write(snippet .. "\n"); f:close()
-        io.write("\nWrote: " .. flags.write .. "\n")
+        for _, kv in ipairs(recommended) do f:write(kv[1], "=", shell_quote(kv[2]), "\n") end
+        f:close()
     end
 
     if flags.probe_only then

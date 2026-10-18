@@ -1,14 +1,11 @@
 -- luamemo.async
 --
--- Minimal cooperative task scheduler for plain Lua over socket.select().
--- Zero new dependencies: luasocket is already required by luamemo.http
--- in the plain-Lua path, so socket.select() is always available.
+-- Minimal cooperative task scheduler over socket.select().
+-- Zero new dependencies: luasocket is already required by luamemo.http,
+-- so socket.select() is always available.
 --
 -- Intended use: fan-out N HTTP embedding calls in write_many() so the
 -- total latency approaches 1 × embed_latency instead of N × embed_latency.
---
--- In OpenResty this module is never invoked — resty.http is non-blocking
--- via cosockets and the scheduler would only add overhead.
 --
 -- API
 -- ---

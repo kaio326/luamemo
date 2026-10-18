@@ -30,10 +30,10 @@ local function _strip_git_prefix(path)
     return path:match("^[ab]/(.+)$") or path
 end
 
--- Clip a string to at most max_bytes while keeping it valid.
+-- Clip a string to at most max_bytes while keeping it valid UTF-8.
 local function _clip(s, max_bytes)
     if #s <= max_bytes then return s end
-    return s:sub(1, max_bytes) .. "…"
+    return require("luamemo.util").cut_utf8(s, max_bytes) .. "…"
 end
 
 -- ---------------------------------------------------------------------------

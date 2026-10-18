@@ -8,154 +8,73 @@ source = {
 }
 
 description = {
-    summary  = "Persistent semantic memory + codebase index for AI agents — works in any Lua 5.1+ environment",
+    summary  = "Private, local memory for AI agents — an MCP server, with the memo CLI to set it up and govern it",
     detailed = [[
-        luamemo is a persistent semantic memory store for AI agents
-        and conversational apps. It works in any Lua 5.1+ runtime:
-        plain Lua, LuaJIT, Lapis / OpenResty, CLI scripts, background
-        workers — no framework dependency.
+        luamemo gives AI coding agents a memory that lives on your machine. The
+        agent writes decisions, facts and plans as it works and finds them again
+        in later sessions, through the Model Context Protocol: Claude Code,
+        VS Code (Copilot agent mode), Cursor, Claude Desktop and other MCP
+        clients use it. The `memo` CLI sets it up and keeps the decisions that
+        belong to people: settings, backups, which devices join a team's memory
+        and which knowledge the team shares.
 
-        Features:
-          * Hybrid vector + full-text retrieval over PostgreSQL. The
-            candidate pool is the union of the vector-nearest rows AND the
-            top full-text matches, so lexical hits are found regardless of
-            vector distance (and FTS-only rows with no embedding are found).
-          * Natural-language temporal retrieval: queries like "last month",
-            "in June", "last spring", "in 2024", "recently", "yesterday"
-            are parsed into time windows and fused via RRF (Reciprocal Rank
-            Fusion) with the vector + FTS legs. Zero new external deps.
-          * Three-tier ANN search: pgvector HNSW (O(log N)), LSH index
-            (pure Lua, auto-activates at >10k rows per scope, ~O(N^0.9)),
-            and brute-force REAL[] (always available, zero extension dep).
-          * Codebase index (luamemo.index): indexes a whole repository into
-            queryable memory rows (file / symbol / dependency / diff), under
-            "codeindex:<project>" scopes. Pure-Lua pattern parsers for Lua,
-            Python and JavaScript/TypeScript; optional universal-ctags
-            enrichment for any other language when the `ctags` binary is
-            present (graceful fallback when absent). Cross-file dependency
-            graph mirrored into the knowledge graph for one-hop "who
-            calls / what does it call" traversal (index.explore). File rows
-            are stored FTS-only (no embedding) to bound embed cost.
-            `memo index ingest|update|search|status|invalidate|diff|explore`.
-          * Pluggable embedders: an in-process "gguf_ffi" embedder that runs
-            EmbeddingGemma via a LuaJIT-FFI shim over llama.cpp (bge-m3-class
-            recall on CPU, no sidecar; recommended by `memo calibrate` when the
-            host can build it), OpenAI-compatible HTTP endpoints (OpenAI or any
-            self-hosted vLLM / LM Studio / TEI), Ollama, Voyage, Cohere,
-            DeepSeek, Anthropic, generic HTTP, and a built-in pure-Lua "hash"
-            embedder with no external dependencies. The native shim's C source
-            and build script now ship in the LuaRocks package (previously
-            omitted) and locate their build output correctly regardless of
-            install layout.
-          * Learns from usage (opt-in, feedback_enabled): reinforcements +
-            retrieval-miss detection feed a pure-Lua learned reranker/projection;
-            a per-scope promotion harness (`memo learn <scope>`) trains and
-            gated-promotes weights (versioned in lm_learner_weights with rollback
-            + lm_promotion_runs audit) only when they beat a held-out gate.
-            Signal capture via `memo sense` / the memory_sense MCP tool. Base
-            models stay frozen; only small learned layers adapt.
-          * Self-maintaining: a debounced auto-digest piggybacks on writes
-            (auto_digest_enabled) so tier promotion / consolidation / decay run
-            without an external trigger. Hierarchical multi-scope search:
-            store.search{scopes={...}} unions scopes with tier-priority.
-          * Pluggable rerankers (Ollama, OpenAI, cross-encoder via TEI, and a
-            per-scope learned reranker trained from usage).
-          * Background summarizer + decay/importance scoring.
-          * Knowledge-graph adjunct for currently-valid facts with temporal
-            validity (table: lm_kg_facts).
-          * Encrypted secrets management: AES-256-CBC + HMAC-SHA256
-            implemented in pure Lua (luamemo.crypto) — no lua-openssl
-            required. execute_with_secret substitutes {secret} server-side
-            without ever returning the raw value. Secrets stored in a JSON
-            file on disk (not a DB table).
-          * Batch write_many() dedup: O(1) DB queries per batch regardless
-            of batch size; intra-batch cosine dedup + async parallel embedding
-            via luamemo.async (pure-Lua coroutine scheduler). Per-row
-            no_embed flag skips embedding for lexical-only rows.
-          * MCP server bundled (mcp/server.lua, 22 tools) so models can
-            read/write memory, execute secrets, query the codebase index
-            (index_search / index_outline / index_explore / index_status), AND
-            feed the learn-from-usage loop (memory_sense) directly through
-            Model Context Protocol. Direct DB access via
-            MEMO_DB_URL — no HTTP intermediary required. The server
-            self-locates its bundled modules from its own path (no LUA_PATH
-            needed).
-          * MCP prompts capability: built-in session_start prompt instructs
-            any MCP client to load context at session start, write decisions
-            during work, and summarise at the end. Includes proactive security
-            guidance: agents are instructed to recommend the terminal workflow
-            for storing secrets rather than asking users to type credentials
-            in chat.
-          * Session digest (`memo brief`): a tiny, fail-soft session-start
-            summary (memory count + codebase-map size + tool hints) designed
-            to be injected automatically by a SessionStart hook so an agent
-            knows what persistent context exists without being asked.
-          * luamemo.patterns: preference/habit extraction — scans write()
-            bodies for first-person signals and inserts synthetic companion
-            memories. Query-time person-name and quoted-phrase boosts.
-          * `memo` CLI: write, search, recent, get, update, delete,
-            summarize, promote, context, brief, consolidate, digest, sense,
-            learn, index (ingest/update/search/status/invalidate/diff/explore),
-            secret-store/list/delete/execute, migrate,
-            calibrate (host probe + codebase ingest), doctor (corpus health;
-            now bootstraps from the environment like every other subcommand —
-            --setup PATH is optional, not required), setup (first-run
-            SETUP_CHECK file for agent-guided onboarding), ping (DB + table +
-            embedder connectivity, now including local embedders via selftest).
-          * `memo calibrate`: probes host (GPU, Docker, Ollama, RAM),
-            recommends the best-fit embedder, auto-applies schema migrations
-            when the DB is incomplete (Phase 2.5), detects VS Code / Cursor /
-            Claude Desktop and offers to write MCP config (Phase 5) — the MCP
-            config phase now runs non-interactively when stdin isn't a
-            terminal instead of exiting silently. Auto-derived MEMO_DB_URL and
-            probe-recommended embedder vars (including MEMO_EMBED_MAX_CHARS,
-            now actually honoured by the CLI write/search path) are persisted
-            to .luamemorc (write-if-absent). Flags: --no-migrate (skip schema
-            check), --no-mcp (skip IDE detection), --keep-embedder (preserve
-            existing embedder config in .luamemorc).
-          * `memo setup`: creates a SETUP_CHECK file in the project root with
-            agent-readable first-run verification steps. Deleted automatically
-            by `memo calibrate` on successful completion.
-          * `memo doctor`: corpus health report with truncation counts,
-            p95 row size, and backend scale warnings.
-          * luamemo.cli.ping: connectivity check (DB + table + embedder).
-          * luamemo.cli.api: single-operation Lua dispatcher — CLI and
-            MCP server use direct lib calls; no HTTP server dependency.
-          * JSON handled by luamemo.json — a portable shim that uses
-            cjson.safe when available (always present in OpenResty) and
-            falls back to bundled dkjson (pure Lua, MIT) otherwise. This
-            means `luarocks install luamemo` never fails due to a missing
-            C compiler. lua-cjson is no longer a hard dependency.
+        No database server, no Docker, no account: each project's memory is one
+        SQLite file in ~/.local/share/luamemo. Runs on LuaJIT with two system
+        libraries, libsqlite3 and libsodium (Linux, macOS, Windows through WSL).
 
-        Benchmarks (R@10, LongMemEval n=500, bruteforce backend):
-          * hash embedder:         79.8%
-          * nomic-embed-text:      83.0%
-          * bge-m3 via TEI (GPU):  97.8%
+          * MCP server (mcp/server.lua, 26 tools): write, search (with the
+            knowledge-graph facts the query is about), recent, update, delete
+            (bulk deletes behind a preview + confirmation token), session
+            promotion, maintenance, feedback, the learned reranker, the codebase
+            map, the secrets vault.
+          * Hybrid search, exact at every size: every vector in scope is scored,
+            plus FTS5 full-text ranking (Postgres-style cover density), blended
+            and weighted by importance, age and tier; multi-scope search, time
+            filters, metadata filters, optional rerankers.
+          * Embedders: an in-process GGUF model (EmbeddingGemma via llama.cpp,
+            no service), Ollama, TEI, OpenAI / Voyage / Cohere / any
+            OpenAI-compatible endpoint, and a pure-Lua hash embedder.
+          * Codebase index (`memo index`): files, symbols, dependencies and
+            commit diffs, so an agent finds where code lives before grepping.
+            Pure-Lua parsers for Lua, Python, JS/TS; universal-ctags for others.
+          * Learns from use (opt-in): corrections, rules, praise and retrieval
+            misses train a per-scope learned reranker, promoted only when it
+            beats the current one on held-out data.
+          * Self-maintaining: tiers, consolidation, decay and summarization run
+            on writes.
+          * Secrets vault: keys encrypted with libsodium; agents use them via
+            secret_execute without ever seeing them; settings refer to them as
+            {secret:NAME}.
+          * Team memory on your LAN / VPN: an org central with protected
+            directives, admin-reviewed knowledge proposals and collective
+            learning; devices pair with a key and a spoken code over an
+            encrypted channel — no passwords, no tokens, no hosted service.
+          * `memo config`: every setting checked before it is written; settings
+            files are data, and one committed to a repository must be trusted.
+          * `memo backup`, `memo export` / `memo import` (JSON Lines).
+
+        Benchmarks (R@5, bge-m3): LongMemEval _s 96.4%, LoCoMo 84.6%,
+        ConvoMem 96.5%. Search over 1,000 memories: ~4 ms.
     ]],
     homepage   = "https://github.com/kaio326/luamemo",
     issues_url = "https://github.com/kaio326/luamemo/issues",
     license    = "MIT",
     maintainer = "Kaio Fernandes <contact@kaiofernandes.com>",
-    labels     = { "memory", "agents", "ai", "embeddings", "pgvector",
-                   "rag", "lapis", "openresty", "postgresql", "mcp",
-                   "tei", "bge-m3", "secrets", "lsh", "async", "temporal",
-                   "code-index", "code-search", "ctags" },
+    labels     = { "memory", "agents", "ai", "mcp", "embeddings", "rag",
+                   "sqlite", "luajit", "ffi", "libsodium", "secrets", "temporal",
+                   "code-index", "code-search", "ctags", "federation" },
 }
 
 dependencies = {
-    "lua >= 5.1",
-    -- lua-cjson is optional: luamemo.json tries it first (cjson is faster
-    -- and always present in OpenResty), then falls back to bundled dkjson.
-    -- Removing it from dependencies means `luarocks install luamemo` succeeds
-    -- on minimal Alpine images and CI runners without a C compiler.
-    -- HTTP: luasocket is the portable fallback; resty.http is preferred
-    -- inside OpenResty workers (non-blocking) and used automatically when
-    -- present. luasec (ssl.https) is needed only for HTTPS outside OpenResty.
+    -- LuaJIT only: its FFI reaches SQLite (the database) and libsodium (the
+    -- vault, federation) — system libraries; luamemo.native.loader names the
+    -- package to install when one is missing. LuaRocks provides "luajit" when
+    -- it runs under LuaJIT (rockspec format 3.0).
+    "luajit >= 2.1",
+    -- lua-cjson is optional: luamemo.json tries it first (faster), then falls
+    -- back to the bundled dkjson — so `luarocks install luamemo` needs no C
+    -- compiler for JSON. luasec (ssl.https) is needed only for HTTPS.
     "luasocket >= 3.0",
-    -- Database: pgmoon is the pure-Lua PostgreSQL driver used for all
-    -- direct-DB access (CLI tools, MCP server, scripts, plain-Lua apps).
-    -- Connection configured via MEMO_DB_URL or individual PG* env vars.
-    "pgmoon >= 1.13",
 }
 
 build = {
@@ -178,17 +97,13 @@ build = {
         ["luamemo.sensing.generate"]   = "luamemo/sensing/generate.lua",
         ["luamemo.sensing.extract"]    = "luamemo/sensing/extract.lua",
         ["luamemo.patterns"]           = "luamemo/patterns.lua",
-        ["luamemo.routes"]             = "luamemo/routes.lua",
-        ["luamemo.hooks"]              = "luamemo/hooks.lua",
         ["luamemo.kg"]                 = "luamemo/kg.lua",
-        ["luamemo.lsh"]                = "luamemo/lsh.lua",
         ["luamemo.rerank"]             = "luamemo/rerank.lua",
         ["luamemo.rerank_train"]       = "luamemo/rerank_train.lua",
         ["luamemo.projection_train"]   = "luamemo/projection_train.lua",
         ["luamemo.learner_store"]      = "luamemo/learner_store.lua",
         ["luamemo.promote"]            = "luamemo/promote.lua",
         ["luamemo.secrets"]            = "luamemo/secrets.lua",
-        ["luamemo.crypto"]             = "luamemo/crypto.lua",
         ["luamemo.summarizer"]         = "luamemo/summarizer.lua",
         ["luamemo.tune_weights"]       = "luamemo/tune_weights.lua",
         ["luamemo.util"]               = "luamemo/util.lua",
