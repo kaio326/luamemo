@@ -436,6 +436,10 @@ the two surfaces can't drift apart.
   `memory_search` / `memory_recent` of that scope then failed; a millisecond count gave a
   5-digit year an export couldn't read back. Times outside the years 1000–9999 are
   refused (writes, imports, facts), and a stored one no longer breaks a read.
+- With the lua-cjson a distribution packages (2.1.0 — Ubuntu's `lua-cjson`) every empty
+  list went out as `{}`: `"results": {}` for no results. That version can't write an
+  empty array; luamemo uses its bundled JSON code with it (lua-cjson 2.1.0.6 or newer,
+  as luarocks installs, is used as before).
 - `memory_update` with `scope: ""` moved the memory into the empty scope, where only its
   id found it; an empty scope or kind is now no change. `memo write-many` ignored a
   line's `tier` and `created_at` (`memo write` and `memory_write` took them): the three

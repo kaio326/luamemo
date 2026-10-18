@@ -2,10 +2,9 @@
 --
 -- Portable JSON shim.
 --
--- Tries cjson.safe first (often installed).  Falls back to the bundled
--- pure-Lua dkjson when
--- cjson is not available, so `luarocks install luamemo` never fails because
--- of a missing C compiler.
+-- Tries cjson.safe first (often installed) — one that can write an empty array. Falls
+-- back to the bundled pure-Lua dkjson when cjson is not available (or too old), so
+-- `luarocks install luamemo` never fails because of a missing C compiler.
 --
 -- Public API (identical regardless of backend):
 --   json.encode(value)          → string, raises on unencodable value
@@ -28,14 +27,16 @@ function M.list(t)
 end
 
 -- ── Try cjson.safe first ──────────────────────────────────────────────────
+-- Only a lua-cjson that can write an empty array (empty_array / array_mt: 2.1.0.6 and
+-- later): the 2.1.0 distributions package (Ubuntu's lua-cjson) writes every empty table as
+-- {} — "results": {} for no results. Without those, the bundled dkjson below does it right.
 local ok, cjson_safe = pcall(require, "cjson.safe")
-if ok and type(cjson_safe) == "table" then
+if ok and type(cjson_safe) == "table" and (cjson_safe.empty_array or cjson_safe.array_mt) then
     -- cjson.safe.decode already returns nil, err on bad JSON (never raises).
     M.encode = cjson_safe.encode
     M.decode = cjson_safe.decode
     M.null   = cjson_safe.null
-    M.empty_array = cjson_safe.empty_array
-        or (cjson_safe.array_mt and setmetatable({}, cjson_safe.array_mt)) or {}
+    M.empty_array = cjson_safe.empty_array or setmetatable({}, cjson_safe.array_mt)
     return M
 end
 
@@ -60,8 +61,8 @@ function M.decode(str)
     end
     -- (pcall: dkjson recurses per nesting level — ~5,000 levels overflowed the Lua stack
     -- and the error ended the MCP server; lua-cjson refuses past 1,000 instead)
-    local ok, val, _, err = pcall(dkjson.decode, str, 1, dkjson.null)
-    if not ok then return nil, "json.decode: " .. tostring(val):gsub("^.-:%d+: ", "") end
+    local pok, val, _, err = pcall(dkjson.decode, str, 1, dkjson.null)
+    if not pok then return nil, "json.decode: " .. tostring(val):gsub("^.-:%d+: ", "") end
     if err then
         return nil, err
     end

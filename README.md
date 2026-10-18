@@ -139,7 +139,8 @@ luamemo needs:
 | luasocket (luasec for `https://`) | | embedder and API calls, federation |
 | bash, jq, git | jq 1.6 or newer | `memo` and `memo calibrate` |
 
-Optional: `lua-cjson` (faster JSON — a pure-Lua fallback is bundled),
+Optional: `lua-cjson` 2.1.0.6 or newer (faster JSON — `luarocks install lua-cjson`; a
+pure-Lua fallback is bundled, and used with an older one),
 [universal-ctags](https://github.com/universal-ctags/ctags) (code-map symbols for
 languages beyond Lua, Python and JS/TS), and for the in-process GGUF embedder
 either nothing (`memo gguf install` downloads the release's prebuilt runtime for
