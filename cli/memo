@@ -1235,12 +1235,16 @@ _calibrate_org_central() {
     # Suggest an address devs can reach: the Tailscale IPv4 when present, else a
     # typical LAN address (192.168.*, then 10.* — Docker bridges usually sit in
     # 172.17–19.*), else whatever comes first.
+    # (|| true: under set -e a failed lookup ended `memo calibrate` here — hostname -I is
+    # Linux-only, macOS asks ipconfig; tailscale logged out fails too)
     local host=""
-    command -v tailscale >/dev/null 2>&1 && host=$(tailscale ip -4 2>/dev/null | head -1)
-    [[ -z "$host" ]] && host=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '
+    if command -v tailscale >/dev/null 2>&1; then host=$(tailscale ip -4 2>/dev/null | head -1) || true; fi
+    [[ -n "$host" ]] || host=$( { hostname -I 2>/dev/null \
+            || { ipconfig getifaddr en0 2>/dev/null; ipconfig getifaddr en1 2>/dev/null; }; } \
+        | tr ' ' '\n' | awk '
         /^192\.168\./ { if (!a) a = $0 } /^10\./ { if (!b) b = $0 } NF { if (!c) c = $0 }
-        END { print (a ? a : (b ? b : c)) }')
-    [[ -z "$host" ]] && host="<this machine's LAN / Tailscale IP>"
+        END { print (a ? a : (b ? b : c)) }') || true
+    [[ -n "$host" ]] || host="<this machine's LAN / Tailscale IP>"
     cat <<EOF
 
   Next:

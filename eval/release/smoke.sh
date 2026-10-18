@@ -16,8 +16,16 @@ SPEC="${1:?usage: smoke.sh ROCKSPEC|ROCK}"
 LUAROCKS="${LUAROCKS:-luarocks}"
 # LuaRocks may run on another Lua (Debian's: lua5.1): a LUA_PATH set for LuaJIT — the
 # test runner's — would hide its own modules.
-lr() { env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_1 -u LUA_CPATH_5_1 "$LUAROCKS" "$@"; }
 LUAJIT="${LUAJIT:-luajit}"
+# The rock is for Lua 5.1 (LuaJIT). Homebrew's LuaRocks defaults to Lua 5.4 — on macOS it is
+# pointed at the LuaJIT install (a tree for 5.4 is one LuaJIT never reads). The distributions'
+# LuaRocks is for 5.1 already (and, told so, would look for Lua 5.1's headers).
+LR_LUA=()
+if [[ "$(uname -s)" == Darwin ]]; then
+    LR_LUA=(--lua-version 5.1
+        --lua-dir "$(brew --prefix luajit 2>/dev/null || dirname "$(dirname "$(command -v "$LUAJIT")")")")
+fi
+lr() { env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_1 -u LUA_CPATH_5_1 "$LUAROCKS" ${LR_LUA[@]+"${LR_LUA[@]}"} "$@"; }
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 [[ "$SPEC" == /* ]] || SPEC="$PWD/$SPEC"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/luamemo-smoke.XXXXXX")

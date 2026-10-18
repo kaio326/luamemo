@@ -151,7 +151,7 @@ toolchain + cmake to build it (`luamemo/embedders/native/build.sh`).
 |---|---|
 | Debian, Ubuntu, WSL | `sudo apt install luajit luarocks libsqlite3-0 libsodium23 jq git` |
 | Fedora | `sudo dnf install luajit luarocks sqlite-libs libsodium jq git` |
-| macOS (Homebrew) | `brew install luajit luarocks sqlite libsodium jq` — on Apple Silicon Homebrew's libraries are outside the default search path: `export MEMO_LIB_SODIUM=/opt/homebrew/lib/libsodium.dylib` |
+| macOS (Homebrew) | `brew install luajit luarocks sqlite libsodium jq` — Homebrew's LuaRocks is for Lua 5.4: install the rock with `luarocks --lua-version 5.1 --lua-dir "$(brew --prefix luajit)" install luamemo` (luamemo finds Homebrew's libraries itself) |
 | Windows | WSL (Ubuntu), then as above. Keep the data on the Linux side (the default): a database on a Windows drive (`/mnt/c/…`) works but is about 47× slower. |
 
 Then install the rock — with the LuaRocks your system packages (Lua 5.1 or LuaJIT;
