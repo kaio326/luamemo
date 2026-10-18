@@ -28,7 +28,8 @@ fi
 lr() { env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_1 -u LUA_CPATH_5_1 "$LUAROCKS" ${LR_LUA[@]+"${LR_LUA[@]}"} "$@"; }
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 [[ "$SPEC" == /* ]] || SPEC="$PWD/$SPEC"
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/luamemo-smoke.XXXXXX")
+SMOKE_TMP="${TMPDIR:-/tmp}"
+WORK=$(mktemp -d "${SMOKE_TMP%/}/luamemo-smoke.XXXXXX")
 TREE="$WORK/tree" HOMEDIR="$WORK/home" PROJ="$WORK/project"
 mkdir -p "$HOMEDIR" "$PROJ/src"
 [[ "${SMOKE_KEEP:-}" == 1 ]] || trap 'rm -rf "$WORK"' EXIT
@@ -117,8 +118,10 @@ got 3 '.result.content[0].text' | grep -q "smoke deploy" && pass "memo mcp: memo
 [[ "$(got 4 .result.supportedVersions[0])" == "2026-07-28" ]] && pass "memo mcp: server/discover" \
     || fail "memo mcp: server/discover" "$(got 4 .)"
 out=$(cd "$PROJ" && "${RUN[@]}" memo mcp --print-config 2>&1)
-REAL_TREE=$(cd "$TREE" && pwd -P)   # (memo names itself by its real path: macOS's /var is /private/var)
-grep -q -e "\"$TREE/bin/memo\"" -e "\"$REAL_TREE/bin/memo\"" <<<"$out" \
+# (compared as real paths: macOS's /var is /private/var, and a TMPDIR ending in / doubles a slash)
+real_path() { (cd "$(dirname "$1")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$1")"); }
+named=$(sed -n 's/^ *"command": "\([^"]*\)".*/\1/p' <<<"$out" | head -1)
+[[ -n "$named" && "$(real_path "$named")" == "$(real_path "$TREE/bin/memo")" ]] \
     && pass "memo mcp --print-config names the installed memo" \
     || fail "memo mcp --print-config names the installed memo" "$out"
 
