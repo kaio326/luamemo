@@ -470,7 +470,7 @@ result({ fp = kk.fingerprint(assert(kk.ensure_identity("central"))) })]]).fp
 local LOG = os.tmpname()
 local srv = "package.path='./?/init.lua;'..package.path; require('luamemo.cli.serve').run({'--port','0'})"
 local out = sh(("MEMO_DB=%q MEMO_EMBEDDER=hash MEMO_ROLE=org MEMO_ORG_NAME=fedprope MEMO_FEDERATION_DIR=%q "
-    .. "timeout 600 %s -e %q >/dev/null 2>%q & echo \"PID=$!\""):format(central_db, CKDIR, lua_bin, srv, LOG))
+    .. "%s%s -e %q >/dev/null 2>%q & echo \"PID=$!\""):format(central_db, CKDIR, H.timeout(600), lua_bin, srv, LOG))
 SERVER_PID = tonumber(out:match("PID=(%d+)"))
 PORT = H.wait_port(LOG)
 check("central serving", PORT ~= nil)

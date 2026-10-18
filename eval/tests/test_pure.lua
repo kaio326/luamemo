@@ -375,8 +375,11 @@ do
     local base = os.tmpname(); os.remove(base)
     local p = base .. "-wp/sub/secret.txt"
     local ok_wp = util.write_private(p, "s3cret")
-    local mode = (io.popen("stat -c %a " .. p .. " 2>/dev/null"):read("*a") or ""):gsub("%s+$", "")
-    local dmode = (io.popen("stat -c %a " .. base .. "-wp/sub 2>/dev/null"):read("*a") or ""):gsub("%s+$", "")
+    local function st(path)   -- octal mode: GNU stat -c, else BSD / macOS stat -f
+        return (io.popen(("stat -c %%a %s 2>/dev/null || stat -f %%Lp %s"):format(path, path)):read("*a") or "")
+            :gsub("%s+$", "")
+    end
+    local mode, dmode = st(p), st(base .. "-wp/sub")
     local rf = io.open(p); local got = rf and rf:read("*a"); if rf then rf:close() end
     check("util.write_private: 0600 file in a 0700 dir, content written", ok_wp == true and mode == "600"
         and dmode == "700" and got == "s3cret")

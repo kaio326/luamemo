@@ -151,8 +151,8 @@ check("test certificates generated", made)
 if not made then return end
 local function serve(name)
     local port = 20000 + math.random(0, 20000)
-    os.execute(("timeout 120 openssl s_server -accept 127.0.0.1:%d -cert %q -key %q -www >/dev/null 2>&1 &")
-        :format(port, D .. "/" .. name .. ".pem", D .. "/" .. name .. ".key"))
+    os.execute(("%sopenssl s_server -accept 127.0.0.1:%d -cert %q -key %q -www >/dev/null 2>&1 &")
+        :format(H.timeout(120), port, D .. "/" .. name .. ".pem", D .. "/" .. name .. ".key"))
     return port
 end
 math.randomseed(os.time())

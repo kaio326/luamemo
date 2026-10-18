@@ -1,6 +1,7 @@
 # The full test suite and the rock's smoke test, on every push and pull request.
-# Linux is the reference; macOS runs too but may fail without blocking (the tests use a
-# few GNU tools — script -qec, stat -c — not yet ported).
+# Linux is the reference; macOS runs too but may fail without blocking (it is newer to
+# the suite: the runner and the tests pick GNU or BSD tools — timeout / gtimeout,
+# stat -c / -f, script -qec / -q — through eval/tests/_harness.lua).
 name: CI
 
 on:
@@ -52,7 +53,7 @@ jobs:
       - name: Install (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install luajit luarocks sqlite libsodium jq universal-ctags
+          brew install luajit luarocks sqlite libsodium jq universal-ctags coreutils   # coreutils: gtimeout
           luarocks --lua-dir="$(brew --prefix luajit)" --lua-version 5.1 install luasocket
           echo "MEMO_LIB_SODIUM=$(brew --prefix libsodium)/lib/libsodium.dylib" >> "$GITHUB_ENV"
           echo "MEMO_LIB_SQLITE3=$(brew --prefix sqlite)/lib/libsqlite3.dylib" >> "$GITHUB_ENV"

@@ -149,7 +149,7 @@ local old = rec.OldEditor or {}
 check("the record: name, version, protocol, capability names only",
     old.version == "1.2" and old.protocol == "2024-11-05" and json.encode(old.capabilities) == '["roots","sampling"]'
     and not (H.slurp(dir .. "/clients.json") or ""):find("listChanged", 1, true), json.encode(rec))
-local mode = H.sh(("stat -c %%a %q"):format(dir .. "/clients.json")):gsub("%s+$", "")
+local mode = H.mode(dir .. "/clients.json") or ""
 check("… in a 0600 file", mode == "600", mode)
 local doctor1 = H.sh(("%s ./cli/memo doctor 2>&1"):format(ENV))
 check("memo doctor warns about it, and says what is lost",

@@ -364,11 +364,11 @@ local CENV = ("env -u MEMO_DB HOME=%q XDG_CONFIG_HOME=%q XDG_DATA_HOME=%q MEMO_P
     LUA_ABS, REPO_PATH)
 local cmd = ("cd %q && %s %q calibrate --no-plugin --no-git --no-comments --allow-hash"):format(proj, CENV, MEMO)
 local before = H.slurp(home .. "/.cursor/mcp.json")
-local dry = sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | script -qec %q /dev/null"):format(cmd .. " --dry-run"))
+local dry = sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | %s"):format(H.pty(cmd .. " --dry-run")))
 check("--dry-run: no client config written (the entry is printed)", H.slurp(home .. "/.cursor/mcp.json") == before
     and H.slurp(proj .. "/.vscode/mcp.json") == nil and dry:find("[dry-run] No client config", 1, true) ~= nil,
     dry:sub(-1200))
-local out = sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | script -qec %q /dev/null"):format(cmd))
+local out = sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | %s"):format(H.pty(cmd)))
 local cur = json.decode(H.slurp(home .. "/.cursor/mcp.json") or "") or {}
 local cs = cur.mcpServers or {}
 check("Cursor: the old-style entry → one generic luamemo entry (memo mcp, the workspace), other servers kept",
@@ -390,13 +390,13 @@ check("… and which clients have started luamemo (none yet: open one, then memo
 local all = (H.slurp(home .. "/.cursor/mcp.json") or "") .. (H.slurp(proj .. "/.vscode/mcp.json") or "")
 check("no MEMO_* setting in any client config luamemo wrote", not all:find("MEMO_", 1, true), all)
 -- Again: nothing to do.
-local out2 = sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | script -qec %q /dev/null"):format(cmd))
+local out2 = sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | %s"):format(H.pty(cmd)))
 check("calibrate again: the entries are up to date", select(2, out2:gsub("luamemo entry up to date", "")) == 2,
     out2:match("MCP client configuration.-Most clients") or out2:sub(-1200))
 -- Claude Desktop, no entry yet: one for this project, its folder pinned (Desktop has no workspace).
 local empty = assert(io.open(home .. "/.config/Claude/claude_desktop_config.json", "w"))
 empty:write('{"mcpServers": {}}'); empty:close()   -- (an empty Lua table may encode as [])
-sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | script -qec %q /dev/null"):format(cmd))
+sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | %s"):format(H.pty(cmd)))
 cd = (json.decode(H.slurp(home .. "/.config/Claude/claude_desktop_config.json") or "") or {}).mcpServers or {}
 local real = (sh(("cd %q && pwd"):format(proj))):gsub("%s+$", "")
 check("Claude Desktop: luamemo-<scope> → memo mcp --project <this project>",
@@ -600,7 +600,7 @@ local id = tonumber(((json.decode(out) or {}).memory or {}).id)
 sh(("%s ./cli/memo update %d --body %s"):format(ENV, id or 0, q("now MEMO_TOKEN=abc123def456xyz")))
 check("an update is scrubbed too", require("luamemo.db").value("SELECT body FROM lm_memories WHERE id = ?", id)
     == "now MEMO_TOKEN=[redacted]")
-local _, c2 = sh(("%s timeout 20 ./cli/memo write --scope %s --title"):format(ENV, q(WS)))
+local _, c2 = sh(("%s %s./cli/memo write --scope %s --title"):format(ENV, H.timeout(20), q(WS)))
 check("a flag without its value → exit 2 with a message (it looped forever)", c2 == 2, c2)
 require("luamemo.db").run("DELETE FROM lm_memories WHERE scope = ?", WS)
 end)

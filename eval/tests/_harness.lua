@@ -43,8 +43,29 @@ function H.slurp(path)
     return s
 end
 
---- Octal permission bits of a path ("600").
-function H.mode(path) return (H.sh(("stat -c %%a %q"):format(path))):match("%d+") end
+--- Octal permission bits of a path ("600") — GNU stat -c, else BSD / macOS stat -f.
+function H.mode(path)
+    return (H.sh(("stat -c %%a %q 2>/dev/null || stat -f %%Lp %q"):format(path, path))):match("%d+")
+end
+
+-- The platform's tools differ: GNU (Linux) or BSD (macOS).
+local BSD = (H.sh("uname -s")) == "Darwin"
+
+--- "timeout N " to put before a command — GNU timeout, or Homebrew's gtimeout on macOS;
+--- "" when neither is installed (the command then runs with no limit).
+local _timeout
+function H.timeout(secs)
+    if _timeout == nil then _timeout = (H.sh("command -v timeout || command -v gtimeout")):match("[^\n]+") or false end
+    return _timeout and ("%s %d "):format(_timeout, secs) or ""
+end
+
+--- A shell command that runs `cmd` (a shell command line) on a pseudo-terminal, its input
+--- from this one's stdin: util-linux script -qec on Linux, BSD script -q on macOS.
+function H.pty(cmd)
+    local q = require("luamemo.util").shell_quote
+    if BSD then return ("script -q /dev/null sh -c %s"):format(q(cmd)) end
+    return ("script -qec %s /dev/null"):format(q(cmd))
+end
 
 --- A project's .luamemorc a test wrote by hand is used only once trusted (luamemo uses
 --- one memo wrote or its user trusted): trust it as it is, as `memo config trust` would

@@ -219,7 +219,7 @@ sh(("%s %s %q"):format(CENV, lua_bin, seed)); os.remove(seed)
 
 local LOG = TMP .. "/serve.log"
 local srv = "package.path='./?/init.lua;'..package.path; require('luamemo.cli.serve').run({'--port','0'})"
-local pid = tonumber((sh(("%s timeout 300 %s -e %q >/dev/null 2>%q & echo \"PID=$!\""):format(CENV, lua_bin, srv, LOG)))
+local pid = tonumber((sh(("%s %s%s -e %q >/dev/null 2>%q & echo \"PID=$!\""):format(CENV, H.timeout(300), lua_bin, srv, LOG)))
     :match("PID=(%d+)"))
 local port = H.wait_port(LOG)
 check("central serving", port ~= nil)
@@ -238,7 +238,7 @@ for _ = 1, 90 do
     end
     os.execute("sleep 1")
 end]])
-sh(("%s timeout 120 %s %q > %q 2>&1 &"):format(CENV, lua_bin, approver, TMP .. "/approver.log"))
+sh(("%s %s%s %q > %q 2>&1 &"):format(CENV, H.timeout(120), lua_bin, approver, TMP .. "/approver.log"))
 
 local dir = project("devp")
 os.execute(("mkdir -p %q"):format(dir .. "/.vscode"))
@@ -252,7 +252,7 @@ local CAF = TMP .. "/private-ca.pem"   -- (never read here: nothing in this flow
 local cf = assert(io.open(CAF, "w")); cf:write("placeholder\n"); cf:close()
 local cmd = ("cd %q && %s MEMO_ORG_IDENTITY=user:dev@corp.io MEMO_CA_FILE=%q %q calibrate --org-url "
     .. "http://127.0.0.1:%d --no-plugin --no-git --no-comments --allow-hash"):format(dir, DENV, CAF, MEMO, port)
-local out, code = sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | script -qec %q /dev/null"):format(cmd))
+local out, code = sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | %s"):format(H.pty(cmd)))
 check("interactive calibrate completes (the new database created on first use)", code == 0
     and out:find("[PASS] Database", 1, true) ~= nil and slurp(dev_db) ~= nil, out:sub(-1200))
 check("shows the central's fingerprint for the person to compare", cfp and out:find(cfp, 1, true) ~= nil
@@ -287,7 +287,7 @@ check("no secret anywhere in the output (only public values)", not out:find("key
 local dir2 = project("devp2")
 local cmd2 = ("cd %q && %s MEMO_ORG_IDENTITY=user:dev@corp.io %q calibrate --org-url http://127.0.0.1:%d "
     .. "--no-mcp --no-plugin --no-git --no-comments --allow-hash"):format(dir2, DENV, MEMO, port)
-local out2 = sh(("printf 'n\\nn\\nn\\n' | script -qec %q /dev/null"):format(cmd2))
+local out2 = sh(("printf 'n\\nn\\nn\\n' | %s"):format(H.pty(cmd2)))
 check("fingerprint rejected by the person → nothing configured", out2:find("Not pinned", 1, true)
     and not (slurp(dir2 .. "/.luamemorc") or ""):find("MEMO_ORG_URL", 1, true), out2:sub(-600))
 

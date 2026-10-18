@@ -87,7 +87,9 @@ ok(t3:find("index_search", 1, true) == nil, "omits index tool hint when no map")
 -- ---------------------------------------------------------------------------
 io.write("\n--- Test 4: database unavailable is fail-soft ---\n")
 local t0 = os.time()
-local function mode(p) return (sh("stat -c %a " .. p .. " 2>/dev/null"):gsub("%s+$", "")) end
+local function mode(p)   -- octal mode: GNU stat -c, else BSD / macOS stat -f
+    return (sh(("stat -c %%a %s 2>/dev/null || stat -f %%Lp %s"):format(p, p)):gsub("%s+$", ""))
+end
 local devnull_before = mode("/dev/null")
 local out4 = sh("MEMO_DB=/dev/null/nope.db "
     .. "MEMO_EMBEDDER=" .. embedder .. " MEMO_BRIEF_TIMEOUT=2 "

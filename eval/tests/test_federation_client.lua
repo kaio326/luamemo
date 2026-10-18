@@ -155,7 +155,7 @@ check("central identity created (the admin hands out its fingerprint)", type(FP)
 LOG = os.tmpname()
 local code_s = "package.path='./?/init.lua;'..package.path; require('luamemo.cli.serve').run({'--port','0'})"
 local out = sh(("MEMO_DB=%q MEMO_EMBEDDER=hash MEMO_ROLE=org MEMO_ORG_NAME=fedcli MEMO_FEDERATION_DIR=%q "
-    .. "timeout 900 %s -e %q >/dev/null 2>%q & echo \"PID=$!\""):format(central_db, CKDIR, lua_bin, code_s, LOG))
+    .. "%s%s -e %q >/dev/null 2>%q & echo \"PID=$!\""):format(central_db, CKDIR, H.timeout(900), lua_bin, code_s, LOG))
 SERVER_PID = tonumber(out:match("PID=(%d+)"))
 PORT = H.wait_port(LOG)
 check("central serving (memo serve)", PORT ~= nil)

@@ -37,7 +37,8 @@ local C = ffi.C
 local function die(msg) io.stderr:write("run.lua: " .. msg .. "\n"); os.exit(2) end
 local function setenv(k, v) C.setenv(k, v, 1) end
 local ts = ffi.new("lm_timespec[1]")
-local function now() C.clock_gettime(1, ts); return tonumber(ts[0].tv_sec) + tonumber(ts[0].tv_nsec) * 1e-9 end
+local MONOTONIC = ffi.os == "OSX" and 6 or 1   -- CLOCK_MONOTONIC (macOS numbers it 6)
+local function now() C.clock_gettime(MONOTONIC, ts); return tonumber(ts[0].tv_sec) + tonumber(ts[0].tv_nsec) * 1e-9 end
 
 --- Run a shell command → output (stderr included, trailing whitespace trimmed), exit code.
 local function sh(cmd)
@@ -170,8 +171,13 @@ setenv("LUA_PATH", child_path)
 setenv("LUA_CPATH", package.cpath)
 setenv("MEMO_TEST_TMP", tmp)
 
-io.write(("luamemo tests — %d file(s), %s, SQLite %s, temp %s\n\n")
-    :format(#files, opts.lua, require("luamemo.native.sqlite").version(), tmp))
+-- Each file runs under GNU timeout — macOS has none of its own: Homebrew's coreutils
+-- calls it gtimeout; without either the files run with no time limit.
+local timeout_cmd = (sh("command -v timeout || command -v gtimeout")):match("[^\n]+")
+
+io.write(("luamemo tests — %d file(s), %s, SQLite %s, temp %s\n%s\n")
+    :format(#files, opts.lua, require("luamemo.native.sqlite").version(), tmp,
+        timeout_cmd and "" or "(no timeout / gtimeout here: the files run with no time limit)\n"))
 
 -- ---------------------------------------------------------------------------
 -- Run
@@ -198,7 +204,8 @@ for _, f in ipairs(files) do
     local log = tmp .. "/" .. name .. ".log"
     setenv("MEMO_DB", tmp .. "/db/" .. name .. ".db")   -- a new database per file
     local t0 = now()
-    local _, rc = sh(("timeout %d %s %s > %s 2>&1"):format(opts.timeout, q(opts.lua), q(f), q(log)))
+    local limit = timeout_cmd and ("%s %d "):format(q(timeout_cmd), opts.timeout) or ""
+    local _, rc = sh(("%s%s %s > %s 2>&1"):format(limit, q(opts.lua), q(f), q(log)))
     local secs = now() - t0
     local p, n, fails, tail, skips = counts(log)
     total_p, total_f = total_p + p, total_f + n
