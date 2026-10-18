@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.5.0] — unreleased
+## [0.5.0] — 2026-10-18
 
 luamemo is now an MCP server with a local database: private memory for AI
 agents, set up and governed with the `memo` CLI. No database server, no
