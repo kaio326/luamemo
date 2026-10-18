@@ -66,8 +66,11 @@ ROCKDIR=$(ls -d "$TREE"/lib/luarocks/rocks-5.1/luamemo/*/ 2>/dev/null | head -1)
 mods=$("$LUAJIT" -e "local t = {} ; local f = assert(io.open('$ROCKDIR/luamemo-$VERSION-1.rockspec'))
 local env = {}; local c = assert(loadstring(f:read('*a'))); setfenv(c, env); c()
 for name in pairs(env.build.modules) do t[#t+1] = name end; table.sort(t); io.write(table.concat(t, ' '))" 2>&1)
-bad=$(cd "$WORK" && "${RUN[@]}" LUA_PATH="$TREE/share/lua/5.1/?.lua;$TREE/share/lua/5.1/?/init.lua;;" \
-    "$LUAJIT" -e "local bad = {}
+# (+ the trees LuaRocks itself knows — where the system's luasocket is when it isn't in
+# LuaJIT's own default path, as with Homebrew's; never the checkout)
+DEP_PATH=$(lr path --lr-path 2>/dev/null) DEP_CPATH=$(lr path --lr-cpath 2>/dev/null)
+bad=$(cd "$WORK" && "${RUN[@]}" LUA_PATH="$TREE/share/lua/5.1/?.lua;$TREE/share/lua/5.1/?/init.lua;$DEP_PATH;;" \
+    LUA_CPATH="$DEP_CPATH;;" "$LUAJIT" -e "local bad = {}
 for name in ('$mods'):gmatch('%S+') do
     local where = package.searchpath(name, package.path)
     local ok, err = pcall(require, name)
@@ -114,7 +117,9 @@ got 3 '.result.content[0].text' | grep -q "smoke deploy" && pass "memo mcp: memo
 [[ "$(got 4 .result.supportedVersions[0])" == "2026-07-28" ]] && pass "memo mcp: server/discover" \
     || fail "memo mcp: server/discover" "$(got 4 .)"
 out=$(cd "$PROJ" && "${RUN[@]}" memo mcp --print-config 2>&1)
-grep -q "\"$TREE/bin/memo\"" <<<"$out" && pass "memo mcp --print-config names the installed memo" \
+REAL_TREE=$(cd "$TREE" && pwd -P)   # (memo names itself by its real path: macOS's /var is /private/var)
+grep -q -e "\"$TREE/bin/memo\"" -e "\"$REAL_TREE/bin/memo\"" <<<"$out" \
+    && pass "memo mcp --print-config names the installed memo" \
     || fail "memo mcp --print-config names the installed memo" "$out"
 
 # ── What the rock copies ─────────────────────────────────────────────────────────

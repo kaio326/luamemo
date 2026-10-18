@@ -190,6 +190,12 @@ local function has_script() return (sh("command -v script")):find("script", 1, t
 section("E interactive", function()
 io.write("\n--- E: interactive join against a real central ---\n")
 if not has_script() then io.write("[INFO] `script` (util-linux) not found — skipped\n"); return end
+-- The answers are typed ahead into a pseudo-terminal; macOS's BSD script doesn't hand
+-- them to a question asked after the central's probe (the read gets nothing), while
+-- util-linux script does. The flow is plain bash; Linux runs this section.
+if (sh("uname -s")) == "Darwin" then
+    io.write("[INFO] macOS: BSD script doesn't deliver typed-ahead answers here — run on Linux\n"); return
+end
 local db = require("luamemo.db")
 local json = require("luamemo.json")
 local ORG = "org:fedcale"
