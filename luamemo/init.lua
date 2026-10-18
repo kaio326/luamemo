@@ -18,7 +18,7 @@ local M = {}
 -- Anything that needs to report luamemo's version (the MCP server's
 -- serverInfo, diagnostics, etc.) should read this instead of hardcoding its
 -- own copy, which silently goes stale the moment it does.
-M.VERSION = "0.5.0"
+M.VERSION = "0.5.1"
 
 -- Runtime state. ok is false until setup() completes a successful embedder
 -- probe. ensure_ready() retries the probe on demand so a slow-starting

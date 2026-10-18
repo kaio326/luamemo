@@ -1,6 +1,31 @@
 # Changelog
 
-## [0.5.0] — unreleased
+## [0.5.1] — unreleased
+
+### macOS
+
+- **luamemo finds Homebrew's libraries itself:** on Apple silicon Homebrew installs
+  outside the system's library search path, so after `brew install libsodium` luamemo
+  said libsodium was not found unless `MEMO_LIB_SODIUM` named it. It now also looks in
+  `/opt/homebrew/lib`, `/usr/local/lib` and `/opt/local/lib` (MacPorts).
+- **Install with Homebrew's LuaRocks:** it is for Lua 5.4 — `luarocks --lua-version 5.1
+  --lua-dir "$(brew --prefix luajit)" install luamemo` (README).
+- `memo` read a `.luamemorc` value with an escaped quote (`MEMO_X='it'\''s'`) as `it\'s`
+  under bash 3.2, macOS's own.
+- `memo calibrate` found no file types in a project on macOS (its scan used a GNU sed
+  pattern), and `memo calibrate --role org` stopped after the status, before the
+  "Next:" steps: the LAN address lookup (`hostname -I`) is Linux-only, and its failure
+  ended memo. macOS asks `ipconfig`; no lookup can end memo — nor, on Linux, a logged-out
+  `tailscale`.
+
+### Development
+
+- The test suite runs on macOS: the runner and the tests use GNU or BSD tools
+  (`timeout` / `gtimeout`, `stat -c` / `-f`, `script -qec` / `-q`) through
+  `eval/tests/_harness.lua`; the macOS CI job passes. A failed CI run uploads its
+  per-file test logs.
+
+## [0.5.0] — 2026-10-18
 
 luamemo is now an MCP server with a local database: private memory for AI
 agents, set up and governed with the `memo` CLI. No database server, no
