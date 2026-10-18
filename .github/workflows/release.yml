@@ -88,7 +88,8 @@ jobs:
           fetch-depth: 0
       - run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends luajit luarocks libsqlite3-0 libsodium23 lua-socket jq git
+          # lua-dkjson: `luarocks upload` needs a JSON library (0.5.1's upload failed without one)
+          sudo apt-get install -y --no-install-recommends luajit luarocks libsqlite3-0 libsodium23 lua-socket jq git lua-dkjson
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131   # v7.0.0 (Node 24)
         with:
           pattern: gguf-*
