@@ -241,10 +241,10 @@ _rc_expand() {
     printf '%s' "$out$rest"
 }
 _rc_value() {
-    local v="$1"
+    local v="$1" sq="'"   # (the quote from a variable: bash 3.2, macOS's, kept the \ of \' in it)
     if [[ "$v" == \'* ]]; then
         v="${v#\'}"; v="${v%"${v##*[![:space:]]}"}"; v="${v%\'}"
-        printf '%s' "${v//\'\\\'\'/\'}"
+        printf '%s' "${v//\'\\\'\'/$sq}"
     elif [[ "$v" == \"* ]]; then
         v="${v#\"}"; v="${v%"${v##*[![:space:]]}"}"; v="${v%\"}"
         v=$(_rc_expand "$v")

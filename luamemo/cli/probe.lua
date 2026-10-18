@@ -157,7 +157,8 @@ function M.scan_project(root)
     local out = read_cmd(string.format(
         "find %s -type f -not -path '*/node_modules/*' -not -path '*/.git/*' " ..
         "-not -path '*/.venv/*' -not -path '*/__pycache__/*' 2>/dev/null " ..
-        "| sed -n 's/.*\\.\\([A-Za-z0-9]\\+\\)$/\\1/p' | sort | uniq -c | sort -rn | head -20",
+        -- (POSIX: \+ is GNU sed's; macOS's found no extension at all)
+        "| sed -n 's/.*\\.\\([A-Za-z0-9][A-Za-z0-9]*\\)$/\\1/p' | sort | uniq -c | sort -rn | head -20",
         shq(root)))
     local ext_census = {}
     if out then

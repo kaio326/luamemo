@@ -384,7 +384,7 @@ do
     check("util.write_private: 0600 file in a 0700 dir, content written", ok_wp == true and mode == "600"
         and dmode == "700" and got == "s3cret")
     check("util.write_private: no temp file left behind",
-        (io.popen("ls " .. base .. "-wp/sub | wc -l"):read("*a") or ""):gsub("%s+$", "") == "1")
+        tonumber((io.popen("ls " .. base .. "-wp/sub | wc -l"):read("*a"))) == 1)   -- (macOS pads the count)
     -- A dotfiles manager's symlink (~/.luamemorc → dotfiles/.luamemorc) is written through
     -- with follow_link: it was replaced by a plain file, and the dotfiles copy went stale.
     -- Without it the link is replaced and its target left alone.

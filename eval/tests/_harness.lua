@@ -59,6 +59,15 @@ function H.timeout(secs)
     return _timeout and ("%s %d "):format(_timeout, secs) or ""
 end
 
+--- The system part of a test's narrowed PATH: /usr/bin:/bin, and where jq lives when it is
+--- elsewhere (Homebrew on macOS: /opt/homebrew/bin) — memo and the hooks need it.
+function H.sys_path()
+    local p = "/usr/bin:/bin"
+    local jq_dir = (H.sh("command -v jq")):match("^(/.*)/[^/]+$")
+    if jq_dir and jq_dir ~= "/usr/bin" and jq_dir ~= "/bin" then p = p .. ":" .. jq_dir end
+    return p
+end
+
 --- A shell command that runs `cmd` (a shell command line) on a pseudo-terminal, its input
 --- from this one's stdin: util-linux script -qec on Linux, BSD script -q on macOS.
 function H.pty(cmd)

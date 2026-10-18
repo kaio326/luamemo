@@ -50,7 +50,8 @@ if [[ -x "$TREE/bin/memo" ]]; then pass "the rock installs into a fresh tree"; e
 
 # Only the tree and the system: no checkout, no user settings, no MEMO_*.
 LUAJIT_DIR=$(dirname "$(command -v "$LUAJIT")")
-RUN=(env -i HOME="$HOMEDIR" PATH="$TREE/bin:$LUAJIT_DIR:/usr/local/bin:/usr/bin:/bin" MEMO_LUA="$LUAJIT")
+JQ_DIR=$(dirname "$(command -v jq)")   # memo needs jq (Homebrew's on macOS: /opt/homebrew/bin)
+RUN=(env -i HOME="$HOMEDIR" PATH="$TREE/bin:$LUAJIT_DIR:$JQ_DIR:/usr/local/bin:/usr/bin:/bin" MEMO_LUA="$LUAJIT")
 ROCKDIR=$(ls -d "$TREE"/lib/luarocks/rocks-5.1/luamemo/*/ 2>/dev/null | head -1)
 
 # ── Every module loads, from the tree ───────────────────────────────────────────

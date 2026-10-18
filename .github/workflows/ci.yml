@@ -70,7 +70,22 @@ jobs:
             print("SQLite", require("luamemo.native.sqlite").version())'
 
       - name: Test suite
-        run: luajit eval/tests/run.lua --timeout 900
+        env:
+          TMPDIR: ${{ runner.temp }}/t   # the run's logs, kept by run.lua when a file fails
+        run: |
+          mkdir -p "$TMPDIR"
+          luajit eval/tests/run.lua --timeout 900
+
+      # A failed run's per-file logs (test data only — run.lua prints no credential): the
+      # job output shows the first lines of each failure, these hold the rest.
+      - name: Test logs
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f   # v6.0.0 (Node 24)
+        with:
+          name: test-logs-${{ matrix.os }}${{ matrix.cjson && '-cjson' || '' }}
+          path: ${{ runner.temp }}/t/luamemo-tests.*/*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Rock smoke test
         run: |

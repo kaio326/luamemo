@@ -94,6 +94,19 @@ function M.load(name)
         local lib, where = try(soname, "system")
         if lib then return lib, where end
     end
+    -- macOS: Homebrew (/opt/homebrew on Apple silicon, /usr/local on Intel) and MacPorts
+    -- install outside the loader's default search — a `brew install libsodium` was not found.
+    if ffi.os == "OSX" then
+        for _, dir in ipairs({ "/opt/homebrew/lib", "/usr/local/lib", "/opt/local/lib" }) do
+            for _, soname in ipairs(spec.names.OSX) do
+                local p = dir .. "/" .. soname
+                if exists(p) then
+                    local lib, where = try(p, "system")
+                    if lib then return lib, where end
+                end
+            end
+        end
+    end
 
     return nil, ("native: %s not found (tried %s). Install it — %s — or set %s to its path.")
         :format(spec.file, table.concat(tried, ", "), spec.install, spec.env)

@@ -123,7 +123,9 @@ check("from a subfolder memo finds the project's .luamemorc (and its value wins)
 local lua_dir = sh(("cd %q && %s %q -e %q"):format(sub, WENV, LUA_ABS,
     "package.path=" .. ("%q"):format(REPO .. "/?.lua;" .. REPO .. "/?/init.lua;") .. "..package.path "
     .. "io.write(require('luamemo.settings').project_dir())"))
-check("… and luamemo.settings (the MCP server) finds the same one", lua_dir == proj, lua_dir)
+-- (the same directory: macOS's /tmp is /private/tmp, which Lua reports and bash's pwd doesn't)
+check("… and luamemo.settings (the MCP server) finds the same one",
+    lua_dir == proj or lua_dir == require("luamemo.util").real_dir(proj), lua_dir)
 local p2, v2 = where(home .. "/notes")
 check("~/.luamemorc is the user file, never a project: under home, no project file → this folder",
     p2 == home .. "/notes/.luamemorc" and v2 == "0.66", tostring(p2) .. " " .. tostring(v2))
@@ -147,7 +149,7 @@ H.trust_rc(proj .. "/.luamemorc", home .. "/.config/luamemo")   -- memo runs wit
 local u = assert(io.open(home .. "/.luamemorc", "w"))
 u:write(("MEMO_DB=%s\nMEMO_SCOPE=user-scope\nMEMO_EMBEDDER=hash\n"):format(q(base .. "-user.db"))); u:close()
 -- No MEMO_* in the environment at all: as a client's generic entry starts it.
-local CLEAN = ("env -i HOME=%q PATH=%q"):format(home, LUA_ABS:match("^(.*)/[^/]*$") .. ":/usr/bin:/bin")
+local CLEAN = ("env -i HOME=%q PATH=%q"):format(home, LUA_ABS:match("^(.*)/[^/]*$") .. ":" .. H.sys_path())
 local MEMO = ("bash %q mcp"):format(REPO .. "/cli/memo")
 local function session(cwd, extra, env)
     return H.mcp_session(env or CLEAN, { cwd = cwd, cmd = MEMO .. (extra or "") })
@@ -173,7 +175,7 @@ r = s.call("memory_recent", { scope = "proj-scope", limit = 5 })
 s.close()
 check("outside any project: ~/.luamemorc (the project's file beat it above)",
     w2.memory and w2.memory.scope == "user-scope" and #(r.results or {}) == 0, json.encode({ w2, r }))
-s = session(other, nil, ("env -i HOME=%q PATH=%q"):format(other, LUA_ABS:match("^(.*)/[^/]*$") .. ":/usr/bin:/bin"))
+s = session(other, nil, ("env -i HOME=%q PATH=%q"):format(other, LUA_ABS:match("^(.*)/[^/]*$") .. ":" .. H.sys_path()))
 local n1 = s.call("memory_search", { query = "x" })
 local n2 = s.call("memory_status", {})
 s.close()
@@ -229,7 +231,7 @@ end
 decoy("luamemo/init.lua", "luamemo"); decoy("luamemo/cli/api.lua", "api")
 decoy("cjson/safe.lua", "cjson"); decoy("socket.lua", "socket")
 local ENV = ("env -i HOME=%q PATH=%q MEMO_DB=%q MEMO_EMBEDDER=hash"):format(home,
-    LUA_DIR .. ":/usr/bin:/bin", base .. ".db")
+    LUA_DIR .. ":" .. H.sys_path(), base .. ".db")
 for _, c in ipairs({ "brief", "search anything", "recent", "config list", "ping" }) do
     sh(("cd %q && %s bash %q %s </dev/null"):format(proj, ENV, REPO .. "/cli/memo", c))
 end
@@ -242,7 +244,7 @@ sh(("cd %q && printf '%%s\\n%%s\\n' %s %s | %s %q %q"):format(proj, q(init), q(c
 local hooks = json.decode(H.slurp(REPO .. "/hooks/hooks.json") or "{}") or {}
 local hook = (((hooks.hooks or {}).SessionStart or {})[1] or {}).hooks
 sh(("cd / && env -i HOME=%q PATH=%q CLAUDE_PROJECT_DIR=%q CLAUDE_PLUGIN_ROOT=%q sh -c %s"):format(home,
-    LUA_DIR .. ":/usr/bin:/bin", proj, REPO, q(hook and hook[1].command or "true")))
+    LUA_DIR .. ":" .. H.sys_path(), proj, REPO, q(hook and hook[1].command or "true")))
 local ran = sh(("ls -A %q"):format(marks))
 check("memo, memo mcp, the server and the session-start hook load none of the project's Lua files",
     ran == "", "ran: " .. ran)
@@ -347,7 +349,10 @@ if not (sh("command -v script")):find("script", 1, true) then
 end
 local base = os.tmpname(); os.remove(base)
 local home, proj = base .. "-home", base .. "-proj"
-os.execute(("mkdir -p %q %q %q %q"):format(home .. "/.cursor", home .. "/.config/Claude", proj .. "/.vscode",
+-- Claude Desktop's config, where calibrate looks for it on this platform
+local CLAUDE_DIR = home .. ((sh("uname -s")) == "Darwin" and "/Library/Application Support/Claude" or "/.config/Claude")
+local CLAUDE_CFG = CLAUDE_DIR .. "/claude_desktop_config.json"
+os.execute(("mkdir -p %q %q %q %q"):format(home .. "/.cursor", CLAUDE_DIR, proj .. "/.vscode",
     home .. "/.local/share"))
 local MEMO = REPO .. "/cli/memo"
 local function put(path, t) local f = assert(io.open(path, "w")); f:write(json.encode(t)); f:close() end
@@ -358,7 +363,7 @@ put(home .. "/.cursor/mcp.json", { mcpServers = {
     other = { command = "other-server", args = { "--x" } } } })
 -- Claude Desktop: a luamemo entry the user made themselves.
 local mine = { command = MEMO, args = { "mcp", "--project", "/somewhere/else" } }
-put(home .. "/.config/Claude/claude_desktop_config.json", { mcpServers = { ["luamemo-repo-app"] = mine } })
+put(CLAUDE_CFG, { mcpServers = { ["luamemo-repo-app"] = mine } })
 local CENV = ("env -u MEMO_DB HOME=%q XDG_CONFIG_HOME=%q XDG_DATA_HOME=%q MEMO_PROJECT= MEMO_EMBEDDER=hash "
     .. "MEMO_SCOPE=repo:app MEMO_LUA=%q LUA_PATH=%q"):format(home, home .. "/.config", home .. "/.local/share",
     LUA_ABS, REPO_PATH)
@@ -378,7 +383,7 @@ check("Cursor: the old-style entry → one generic luamemo entry (memo mcp, the 
 local vs = (json.decode(H.slurp(proj .. "/.vscode/mcp.json") or "") or {}).servers or {}
 check("VS Code: .vscode/mcp.json created with the stdio entry", vs.luamemo and vs.luamemo.type == "stdio"
     and vs.luamemo.command == MEMO and vs.luamemo.env == nil, json.encode(vs))
-local cd = (json.decode(H.slurp(home .. "/.config/Claude/claude_desktop_config.json") or "") or {}).mcpServers or {}
+local cd = (json.decode(H.slurp(CLAUDE_CFG) or "") or {}).mcpServers or {}
 local kept = cd["luamemo-repo-app"] or {}
 check("Claude Desktop: an entry of the user's own is kept", kept.command == mine.command
     and table.concat(kept.args or {}, " ") == table.concat(mine.args, " ") and kept.env == nil
@@ -394,10 +399,10 @@ local out2 = sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | %s"):format(H.pty(
 check("calibrate again: the entries are up to date", select(2, out2:gsub("luamemo entry up to date", "")) == 2,
     out2:match("MCP client configuration.-Most clients") or out2:sub(-1200))
 -- Claude Desktop, no entry yet: one for this project, its folder pinned (Desktop has no workspace).
-local empty = assert(io.open(home .. "/.config/Claude/claude_desktop_config.json", "w"))
+local empty = assert(io.open(CLAUDE_CFG, "w"))
 empty:write('{"mcpServers": {}}'); empty:close()   -- (an empty Lua table may encode as [])
 sh(("printf 'y\\ny\\ny\\ny\\ny\\ny\\ny\\ny\\n' | %s"):format(H.pty(cmd)))
-cd = (json.decode(H.slurp(home .. "/.config/Claude/claude_desktop_config.json") or "") or {}).mcpServers or {}
+cd = (json.decode(H.slurp(CLAUDE_CFG) or "") or {}).mcpServers or {}
 local real = (sh(("cd %q && pwd"):format(proj))):gsub("%s+$", "")
 check("Claude Desktop: luamemo-<scope> → memo mcp --project <this project>",
     cd["luamemo-repo-app"] and json.encode(cd["luamemo-repo-app"].args) == json.encode({ "mcp", "--project", real }),
@@ -492,9 +497,9 @@ local function hook(path)
         .. "CLAUDE_TRANSCRIPT_PATH=%q CLAUDE_SESSION_ID=hooktest bash %q"):format(proj, path, LUA_ABS, REPO_PATH,
         HSCOPE, tr, REPO .. "/hooks/claude/pre_compact.sh"))
 end
-local _, c1 = hook("/usr/bin:/bin")
+local _, c1 = hook(H.sys_path())
 check("no memo installed → the hook does nothing (exit 0)", c1 == 0 and saved() == 0, saved())
-local _, c2 = hook(bin .. ":/usr/bin:/bin")
+local _, c2 = hook(bin .. ":" .. H.sys_path())
 local body = db.value("SELECT body FROM lm_memories WHERE scope = ?", HSCOPE) or ""
 check("with memo installed the hook saves the last messages into the project's database", c2 == 0 and saved() == 1
     and body:find("staging gate", 1, true) ~= nil, body)
@@ -523,7 +528,7 @@ w:close()
 local function cc_hook(script, session)
     local input = json.encode({ session_id = session, transcript_path = cc, hook_event_name = "Hook" })
     return sh(("cd %q && printf '%%s' %s | env -u MEMO_DB -u MEMO_SCOPE MEMO_PROJECT= PATH=%q MEMO_LUA=%q "
-        .. "LUA_PATH=%q XDG_CACHE_HOME=%q bash %q"):format(proj, q(input), bin .. ":/usr/bin:/bin", LUA_ABS,
+        .. "LUA_PATH=%q XDG_CACHE_HOME=%q bash %q"):format(proj, q(input), bin .. ":" .. H.sys_path(), LUA_ABS,
         REPO_PATH, proj .. "/.cache", REPO .. "/hooks/claude/" .. script))
 end
 local function bodies(scope)
@@ -579,7 +584,7 @@ local sf = assert(io.open(spy .. "/memo", "w"))
 sf:write('#!/bin/sh\nprintf "%s\\n" "$@" > "$0.args"; cat > "$0.stdin"\n'); sf:close()
 os.execute(("chmod +x %q"):format(spy .. "/memo"))
 local input = json.encode({ session_id = "cc-spy", transcript_path = cc })
-sh(("printf '%%s' %s | env PATH=%q bash %q"):format(q(input), spy .. ":/usr/bin:/bin",
+sh(("printf '%%s' %s | env PATH=%q bash %q"):format(q(input), spy .. ":" .. H.sys_path(),
     REPO .. "/hooks/claude/pre_compact.sh"))
 local args, stdin = H.slurp(spy .. "/memo.args") or "", H.slurp(spy .. "/memo.stdin") or ""
 check("… the conversation goes to memo on stdin (--body -), not on its command line",
