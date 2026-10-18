@@ -77,12 +77,17 @@ check("host_is_local: literals", ng.host_is_local("100.100.100.100") and not ng.
 check("host_is_local: localhost resolves locally", (ng.host_is_local("localhost")))
 check("host_is_public: private refused (SSRF policy)", not ng.host_is_public("192.168.1.1")
     and not ng.host_is_public("fd7a:115c:a1e0::1") and ng.host_is_public("1.1.1.1"))
--- Leading zeros are octal to the resolver luasocket connects through: judged by
--- the address the connection really uses, never by the decimal reading. (glibc reads
--- 0177.0.0.1 as 127.0.0.1; macOS's resolver may not resolve it at all — then neither
--- public nor local: refused either way.)
-check("octal-looking IPv4 is not a decimal literal (0177.0.0.1 is never public, 010.0.0.1 never local)",
-    ng.classify("0177.0.0.1") == nil and not ng.host_is_public("0177.0.0.1") and not ng.host_is_local("010.0.0.1"))
+-- Leading zeros are octal to glibc's resolver (0177.0.0.1 = 127.0.0.1, 010.0.0.1 =
+-- 8.0.0.1) and decimal to macOS's: such a host is never read as a literal here, it is
+-- judged by the address the resolver — the one luasocket connects through — gives.
+local function judged_by_resolver(h)
+    local ips = ng.resolve(h)
+    local pub, loc = (ng.host_is_public(h)) == true, (ng.host_is_local(h)) == true
+    if not ips then return not pub and not loc end
+    return pub == ng.is_public(ips[1]) and loc == ng.is_local(ips[1])
+end
+check("octal-looking IPv4 is not a decimal literal: judged by the address it resolves to",
+    ng.classify("0177.0.0.1") == nil and judged_by_resolver("0177.0.0.1") and judged_by_resolver("010.0.0.1"))
 check("embedded loopback / private IPv4 is neither public nor local", not ng.host_is_public("::127.0.0.1")
     and not ng.host_is_local("::127.0.0.1") and not ng.host_is_public("64:ff9b::a00:1"))
 local function pu(u) return table.concat({ tostring(ng.parse_url(u)), select(2, ng.parse_url(u)) }, "|") end

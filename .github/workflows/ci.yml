@@ -88,6 +88,7 @@ jobs:
           retention-days: 7
 
       - name: Rock smoke test
+        if: ${{ !cancelled() }}   # (also after a failed suite: its own result is worth seeing)
         run: |
           v=$(luajit -e 'package.path="./?.lua;./?/init.lua;"..package.path io.write(require("luamemo").VERSION)')
           luajit eval/release/rockspec.lua "$v" --check

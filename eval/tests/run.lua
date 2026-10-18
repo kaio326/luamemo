@@ -122,7 +122,9 @@ end
 -- The children's environment (set here, inherited — nothing secret on a command line)
 -- ---------------------------------------------------------------------------
 local real_home = os.getenv("HOME") or ""
-local tmp = (sh("mktemp -d -t luamemo-tests.XXXXXX"))
+-- (the template spelled out: macOS's mktemp -t ignores TMPDIR)
+local tmp = (sh(("mktemp -d %s"):format(q(((os.getenv("TMPDIR") or ""):gsub("/+$", "")) ~= "" and
+    ((os.getenv("TMPDIR"):gsub("/+$", "")) .. "/luamemo-tests.XXXXXX") or "/tmp/luamemo-tests.XXXXXX"))))
 if tmp == "" or not tmp:match("^/") then die("mktemp failed") end
 for _, d in ipairs({ "home", "xdg-config", "xdg-data", "xdg-cache", "project", "db" }) do
     os.execute("mkdir -p " .. q(tmp .. "/" .. d))
