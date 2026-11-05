@@ -50,7 +50,11 @@ local function world(opts)
     function w.ours(event)
         for _, c in ipairs(w.commands(event)) do if c:find("luamemo-agent", 1, true) then return c end end
     end
-    function w.notes_dir() return w.claude .. "/projects/" .. w.proj:gsub("[^%w]", "-") .. "/memory" end
+    -- (Claude Code names the project's directory after its real path — on macOS /tmp is /private/tmp)
+    function w.notes_dir()
+        local real = H.sh(("cd %q && pwd -P"):format(w.proj))
+        return w.claude .. "/projects/" .. real:gsub("[^%w]", "-") .. "/memory"
+    end
     return w
 end
 
