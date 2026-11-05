@@ -1,12 +1,37 @@
 {
-  "_note": "SessionStart hook: injects a tiny luamemo digest into session context so the agent knows what persistent memory + codebase map exist without being asked. memo reads the settings itself (the project's .luamemorc, found from the project directory up, over ~/.luamemorc) — the hook only starts it there, and wraps its output as hookSpecificOutput.additionalContext (plain stdout is NOT reliably injected). memo is run through bash: a git checkout of the plugin may not keep its executable bit. memo brief is hard-capped by timeout and fail-soft, so the hook never blocks or errors the session.",
+  "_note": "SessionStart: injects a tiny luamemo digest (memo brief) into the session's context so the agent knows what persistent memory + codebase map exist without being asked. The script (hooks/claude/session_start.sh) wraps it as hookSpecificOutput.additionalContext (plain stdout is NOT reliably injected); memo reads the settings itself (the project's .luamemorc, found from the project directory up, over ~/.luamemorc) — the hook only starts it there. LUAMEMO_ANY_PROJECT=1: the plugin is luamemo's own, so a project without a .luamemorc of its own still gets the brief (memo finds a global ~/.luamemorc); the script run by `memo agent install` does not set it. memo is run through bash: a git checkout of the plugin may not keep its executable bit. memo brief is hard-capped by timeout and fail-soft, so the hook never blocks or errors the session.",
+  "_note2": "UserPromptSubmit: what the user says (a correction, a standing rule) reaches memory without the agent having to remember to call memory_sense — the script sends the prompt to `memo sense` in the background and prints nothing. PreToolUse: in a project that has a .luamemorc, a write under ~/.claude/projects/*/memory/ is denied with a pointer to the luamemo tools (Claude Code's file memory is invisible to luamemo); other projects are untouched. All three run through bash (an exec bit may not survive a checkout) and never block or fail the session.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'cd \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null; d=$(bash \"$CLAUDE_PLUGIN_ROOT/cli/memo\" brief 2>/dev/null); [ -n \"$d\" ] && printf \"%s\" \"$d\" | jq -Rs \"{hookSpecificOutput:{hookEventName:\\\"SessionStart\\\",additionalContext:.}}\" || true'"
+            "command": "LUAMEMO_ANY_PROJECT=1 bash \"$CLAUDE_PLUGIN_ROOT/hooks/claude/session_start.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PLUGIN_ROOT/hooks/claude/user_prompt.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PLUGIN_ROOT/hooks/claude/block_file_memory.sh\"",
+            "timeout": 5
           }
         ]
       }

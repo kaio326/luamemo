@@ -28,4 +28,33 @@ function M.build_memory_lines(memories, body_clip)
     return lines
 end
 
+--- The instruction a summarizer model is given for a batch of memories — one text for every backend (Ollama,
+--- the in-process model), so what differs between them is the model, not the prompt. Asks for JSON
+--- `{ "title": …, "body": … }`.
+function M.summary_prompt(memories, body_clip)
+    local lines = {
+        "Summarise the following memories into a single concise note.",
+        "Preserve concrete facts (names, IDs, dates, decisions).",
+        "Output JSON: { \"title\": \"...\", \"body\": \"...\" }.",
+        "",
+        "Memories:",
+    }
+    for _, line in ipairs(M.build_memory_lines(memories, body_clip or 1500)) do
+        lines[#lines + 1] = line
+    end
+    return table.concat(lines, "\n")
+end
+
+--- The adapter a config means: its summarizer_adapter, with `auto` resolved — the shared language model
+--- (MEMO_GEN_MODEL, luamemo.llm) when one is configured and the runtime loads, else noop. ONE place decides, so
+--- the summarizer, consolidate's merge and the digest's synthesis cannot disagree.
+function M.adapter_name(cfg)
+    local name = cfg and cfg.summarizer_adapter
+    if name == nil or name == "" then return "noop" end
+    if name == "auto" then
+        return require("luamemo.llm").available(cfg) and "gguf" or "noop"
+    end
+    return name
+end
+
 return M

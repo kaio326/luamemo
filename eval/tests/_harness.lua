@@ -17,9 +17,11 @@ function H.new(label)
     function T.check(name, cond, detail)
         if cond then T.pass(name) else T.fail(name .. (detail and (" — " .. tostring(detail)) or "")) end
     end
-    function T.section(name, fn)
+    -- `after` (optional) runs when the block ends, crashed or not: put back what the block stubbed.
+    function T.section(name, fn, after)
         local ok, err = pcall(fn)
         if not ok then T.fail(name .. " crashed: " .. tostring(err)) end
+        if after then pcall(after) end
     end
     function T.finish()
         io.write(("\n=== %s results: %d passed, %d failed ===\n"):format(label, T.passed, T.failed))
@@ -28,12 +30,128 @@ function H.new(label)
     return T
 end
 
+-- pcall's results kept whole (a nil in the middle of them does not cut them short), and given back — or raised again
+local function packed(ok, ...) return { ok = ok, n = select("#", ...), ... } end
+local function unpacked(res)
+    if not res.ok then error(res[1], 0) end
+    return unpack(res, 1, res.n)
+end
+
+--- Run fn(...) with luamemo's clock `delta_us` microseconds in the past (util.now_us), then put the clock back — also
+--- when fn raises (the error is raised again after) → fn's results.
+function H.at_age(delta_us, fn, ...)
+    local util = require("luamemo.util")
+    local real = util.now_us
+    return H.with(util, "now_us", function() return real() - delta_us end, fn, ...)
+end
+
+--- Run fn(...) with tbl[key] replaced by `stub`, then put the original back — also when fn raises (the error is
+--- raised again after) → fn's results. For a stub of a module function, a config value, a clock.
+function H.with(tbl, key, stub, fn, ...)
+    local real = tbl[key]
+    tbl[key] = stub
+    local res = packed(pcall(fn, ...))
+    tbl[key] = real
+    return unpacked(res)
+end
+
+--- Run fn(...) with tbl[key] (a function of luamemo.db taking the SQL first: run, first, value, query …) replaced so that
+--- a statement containing `fragment` (plain text; "" is every statement) goes to `handler(real, sql, ...)` — what it
+--- returns is the statement's result: `nil, "why"` to make it fail, `real(sql, ...)` after a side effect to count it or
+--- to race it — and every other statement to the original. The original is put back after, also when fn raises
+--- → fn's results.
+function H.on_sql(tbl, key, fragment, handler, fn, ...)
+    local real = tbl[key]
+    return H.with(tbl, key, function(sql, ...)
+        if tostring(sql):find(fragment, 1, true) then return handler(real, sql, ...) end
+        return real(sql, ...)
+    end, fn, ...)
+end
+
+--- Run fn(...) with the statements of luamemo.db's `key` function (run, query, …) that contain `fragment` failing ("boom")
+--- and what fn writes to io.stderr kept → fn's first result, the lines written to stderr (one entry per write).
+function H.failing_sql(key, fragment, fn, ...)
+    local db, lines, res = require("luamemo.db"), {}, nil
+    local args = { ... }
+    H.with(io, "stderr", { write = function(_, ...) lines[#lines + 1] = table.concat({ ... }) end }, function()
+        res = H.on_sql(db, key, fragment, function() return nil, "boom" end, fn, unpack(args))
+    end)
+    return res, lines
+end
+
+--- Run fn(...) with a trigger in place that makes a statement fail, then drop it — also when fn raises (the error is
+--- raised again after) → fn's results. `body` is the trigger from its timing on: "BEFORE DELETE ON lm_memories BEGIN
+--- SELECT RAISE(ABORT, 'no'); END". Temporary (this connection only) unless `shared` is true, for a test that runs
+--- another process on the same database.
+function H.with_trigger(name, body, fn, shared, ...)
+    local db = require("luamemo.db")
+    assert(db.run(("CREATE %sTRIGGER %s %s"):format(shared and "" or "TEMP ", name, body)))
+    local res = packed(pcall(fn, ...))
+    db.run("DROP TRIGGER IF EXISTS " .. name)
+    return unpacked(res)
+end
+
+--- Are two values equal, tables by content (key order does not matter)? For metadata read back from the database.
+function H.same(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then return a == b end
+    for k, v in pairs(a) do if not H.same(v, b[k]) then return false end end
+    for k in pairs(b) do if a[k] == nil then return false end end
+    return true
+end
+
+--- Hold an flock(2) on `path` from a process of its own for up to `seconds`, as a running `memo maintain` holds its
+--- lock → release(), held. release() ends that process (the kernel then drops the lock: nothing is cleaned up after
+--- it); held says whether the lock was taken.
+function H.hold_flock(path, seconds)
+    local script, ready = os.tmpname(), os.tmpname()
+    os.remove(ready)
+    local f = assert(io.open(script, "w"))
+    f:write(([[
+local ffi = require("ffi")
+ffi.cdef("int open(const char *path, int flags, ...); int flock(int fd, int operation); unsigned int sleep(unsigned int seconds);")
+local f = assert(io.open(%q, "a")); f:close()
+assert(ffi.C.flock(ffi.C.open(%q, 2), 6) == 0)
+local r = assert(io.open(%q, "w")); r:write("1"); r:close()
+ffi.C.sleep(%d)
+]]):format(path, path, ready, seconds or 30))
+    f:close()
+    local out = H.sh(("%s %q >/dev/null 2>&1 & echo \"PID=$!\""):format(H.lua_bin(), script))
+    local pid = tonumber(out:match("PID=(%d+)"))
+    for _ = 1, 50 do
+        if H.slurp(ready) then break end
+        os.execute("sleep 0.1")
+    end
+    local held = H.slurp(ready) ~= nil
+    return function()
+        if pid then
+            os.execute("kill " .. pid .. " 2>/dev/null")
+            for _ = 1, 50 do   -- (the lock is let go when the process is gone: wait for that, not for the signal)
+                if os.execute("kill -0 " .. pid .. " 2>/dev/null") ~= 0 then break end
+                os.execute("sleep 0.1")
+            end
+        end
+        os.remove(script); os.remove(ready)
+    end, held
+end
+
 --- Run a shell command → output (stderr included, trailing whitespace trimmed), exit code.
 function H.sh(cmd)
     local p = io.popen(cmd .. " 2>&1; echo \"@@EXIT=$?\"")
     local out = p:read("*a"); p:close()
     local code = tonumber(out:match("@@EXIT=(%d+)%s*$"))
     return (out:gsub("@@EXIT=%d+%s*$", ""):gsub("%s+$", "")), code
+end
+
+--- Write `text` to `path` (the file is replaced) → true. A failure raises: a test fixture that was not written is a broken test.
+function H.write_file(path, text)
+    local f = assert(io.open(path, "w"))
+    f:write(text); f:close()
+    return true
+end
+
+--- The directory of the Lua interpreter the tests run under (a narrowed PATH must still find it) — "/usr/bin" when unknown.
+function H.lua_dir()
+    return (H.sh("command -v " .. H.lua_bin())):match("^(.*)/[^/]+$") or "/usr/bin"
 end
 
 function H.slurp(path)
@@ -132,6 +250,43 @@ end
 --- Path of throwaway database `name`.
 function H.db_path(name)
     return tmp_dir() .. "/" .. name .. ".db"
+end
+
+--- Path of a throwaway file or directory `name` next to the throwaway databases (the run's temporary directory, so a
+--- crashed test leaves its leftovers where the runner cleans up). The caller removes it.
+function H.tmp_path(name)
+    return tmp_dir() .. "/" .. name
+end
+
+--- luamemo.setup for the run's database with the hash embedder (no model, no probe) and the preference companions off,
+--- `base` (a test file's own defaults) and then `extra` on top. luamemo.setup merges onto the config before it, so a
+--- test that changes a setting names it back; the embedder's model is the one thing that is cleared each time.
+function H.setup(extra, base)
+    local lm = require("luamemo")
+    local cfg = { db = assert(os.getenv("MEMO_DB"), "run it with eval/tests/run.lua (MEMO_DB)"), embedder_local = "hash",
+                  embed_dim = 384, skip_embed_probe = true, patterns_enabled = false }
+    for _, layer in ipairs({ base or {}, extra or {} }) do
+        for k, v in pairs(layer) do cfg[k] = v end
+    end
+    if type(lm.config) == "table" then lm.config.embedder_model = nil end
+    lm.setup(cfg)
+end
+
+--- A query's first value as a number — `SELECT count(*) …`. A statement that fails raises (a check "== 0" must not
+--- pass because the question could not be asked); no row at all is 0, so ask for a count, not for a column.
+function H.count(sql, ...)
+    local v, err = require("luamemo.db").value(sql, ...)
+    if err then error("H.count: " .. tostring(err), 2) end
+    return tonumber(v) or 0
+end
+
+--- How many rows of a scope the fold has archived (hidden, waiting for their review), and how many are still visible
+--- at a tier (never folded, or given back).
+function H.folded(scope)
+    return H.count("SELECT count(*) FROM lm_memories WHERE scope = ? AND json_type(metadata, '$.lm_fold') IS NOT NULL", scope)
+end
+function H.visible(scope)
+    return H.count("SELECT count(*) FROM lm_memories WHERE scope = ? AND tier >= 1 AND json_type(metadata, '$.lm_fold') IS NULL", scope)
 end
 
 --- Create database `name` (a new file, the schema applied). Removed by H.drop_dbs().

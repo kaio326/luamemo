@@ -23,33 +23,16 @@ as of 0.23.x). The reference target is HuggingFace's
 
 ## docker-compose stub
 
-Append to your `docker-compose.yml`:
-
-```yaml
-services:
-  tei-reranker:
-    # CPU image; for GPU use ghcr.io/huggingface/text-embeddings-inference:1.5
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
-    container_name: lapis-tei-reranker
-    environment:
-      MODEL_ID: BAAI/bge-reranker-v2-m3
-      MAX_CLIENT_BATCH_SIZE: 32
-      MAX_BATCH_TOKENS: 16384
-    ports:
-      - "127.0.0.1:8082:80"   # use 8082 if 8080 is taken (e.g. by a portfolio/nginx app)
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:80/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-```
+The reference is the shipped file, [`docker-compose.yml`](docker-compose.yml)
+(service `tei-reranker`: image `turing-1.7`, or `cpu-1.7` without a GPU;
+`MAX_BATCH_TOKENS: "4096"`; port 8082). Use it as it is, or copy that service
+into your own compose file.
 
 Pull and start:
 
 ```bash
-docker compose up -d tei-reranker
-docker compose logs -f tei-reranker   # wait for "Ready"
+docker compose -f eval/sidecars/docker-compose.yml up -d tei-reranker
+docker compose -f eval/sidecars/docker-compose.yml logs -f tei-reranker   # wait for "Ready"
 ```
 
 ## Quick sanity check
@@ -92,6 +75,9 @@ the API key with `memo secret-store cohere` and set
 
 ## Bench results (Phase 16.3, 2026-05-06)
 
+(Measured in May 2026 on the previous PostgreSQL store; the current numbers are
+in [`eval/README.md`](../README.md) and `eval/baselines.json`.)
+
 Bench executed. `bge-m3` (TEI, port 8081) + `bge-reranker-v2-m3`
 (TEI, port 8082), n=200, `longmemeval_s`.
 
@@ -128,38 +114,12 @@ numbers.
 > separate from any host project's `docker-compose.yml` so the
 > bench-only sidecars do not pollute production deployments.
 
-Reference YAML for the embed sidecar (matches the standalone file):
-
-```yaml
-services:
-  tei-embed:
-    # GPU build for Turing-class cards (RTX 2060/Quadro RTX, sm_75).
-    # For Ampere/Ada use `:1.7`; for Hopper use `:hopper-1.7`;
-    # for CPU-only fallback use `:cpu-1.7` and drop `deploy.resources`.
-    image: ghcr.io/huggingface/text-embeddings-inference:turing-1.7
-    container_name: lapis-tei-embed
-    environment:
-      MODEL_ID: BAAI/bge-m3
-      DTYPE: float16            # halves VRAM; required for 6 GB GPUs
-      MAX_CLIENT_BATCH_SIZE: "32"
-      MAX_BATCH_TOKENS: "4096"  # bench fits in ~2 GB VRAM with fp16
-    ports:
-      - "127.0.0.1:8081:80"     # 8082 is reserved for tei-reranker
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:80/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 180s
-```
+The reference for the embed sidecar is that file (service `tei-embed`: image
+`turing-1.7` for Turing cards, `1.7` for Ampere/Ada, `hopper-1.7` for Hopper,
+`cpu-1.7` without a GPU — drop `deploy.resources` then; `DTYPE: float16`, which
+halves VRAM; port 8081). Its `MAX_BATCH_TOKENS: "7168"` and `AUTO_TRUNCATE: "true"`
+matter: with a lower `MAX_BATCH_TOKENS` TEI hangs, without an error, on any input
+longer than that many tokens (LongMemEval sessions reach ~7k).
 
 Pull and start (standalone compose):
 
@@ -210,8 +170,9 @@ memo reembed --all                                # if the project already has m
 - **Image size:** ~1.6 GB (CPU), ~3.0 GB (GPU `turing-1.7`).
 - **Model weights:** `bge-m3` is ~2.2 GB (`pytorch_model.bin`,
   no safetensors published upstream).
-- **VRAM:** ~2.0 GB resident on GPU with `DTYPE=float16` and
-  `MAX_BATCH_TOKENS=4096`.
+- **VRAM:** ~2.0 GB resident on GPU with `DTYPE=float16` (measured with
+  `MAX_BATCH_TOKENS=4096`; the shipped file uses 7168, which is the ceiling on
+  a 6 GB card).
 - **Latency:** GPU ~5–20 ms per single embed; CPU ~80–250 ms.
 - **First-boot:** ~2 min weight download + ~10 s GPU init.
 
@@ -223,20 +184,21 @@ docker compose -f eval/sidecars/docker-compose.yml up -d tei-embed
 # wait for "Ready" in `docker compose logs tei-embed`
 
 # bench: bge-m3 via TEI, baseline (no rerank) — MEMO_DB: a scratch database
-MEMO_DB=bench TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
+MEMO_NO_MAINTENANCE=1 MEMO_DB=bench TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
   luajit eval/longmemeval_run.lua --embedder tei \
     --corpus eval/data/longmemeval_s.json --n 200 \
     --out eval/results/longmemeval_tei_bge-m3_s_n200.json
 
 # bench: bge-m3 via TEI + noop rerank
-MEMO_DB=bench TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
+MEMO_NO_MAINTENANCE=1 MEMO_DB=bench TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 \
   luajit eval/longmemeval_run.lua --embedder tei \
     --corpus eval/data/longmemeval_s.json --n 200 \
     --rerank --rerank-adapter noop --rerank-top-n 20 \
     --out eval/results/longmemeval_tei_bge-m3_s_n200_rerank-noop.json
 ```
 
-**Result (closed 2026-05-05):** `bge-m3` via TEI lifts R@5 from
+**Result (closed 2026-05-05, measured on the previous PostgreSQL store; the
+current numbers are in [`eval/README.md`](../README.md)):** `bge-m3` via TEI lifts R@5 from
 81.5% → 93.5% (+12 pp) and R@1 from 62% → 80% (+18 pp) over the
 `nomic-embed-text` baseline at n=200. See
 [`eval/results/longmemeval.md`](../results/longmemeval.md) Phase

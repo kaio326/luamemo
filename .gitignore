@@ -1,7 +1,12 @@
 # Local eval artefacts and downloaded datasets
 eval/data/
-eval/results/
+# (the results' Markdown analyses are published; their JSON stays local)
+eval/results/*
+!eval/results/*.md
 eval/*.json
+# … but the eval kit's dataset list and baselines are source (memo eval)
+!eval/datasets.json
+!eval/baselines.json
 eval/tmp/
 *.log
 *.swp

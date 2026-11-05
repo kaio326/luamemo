@@ -1,0 +1,314 @@
+{
+  "_comment": "The published numbers `memo eval run` compares against: a run's summary.json, same shape. results[benchmark][embedder label] — compared only when n is the same.",
+  "command": "memo eval run --tier standard --embedder hash|gguf|ollama|tei; memo eval run membench longmemeval_s --embedder hash",
+  "luamemo": "0.5.2",
+  "machine": "Linux x86_64 (WSL2); gguf on the CPU, ollama / TEI on an RTX 2060",
+  "measured": "2026-10-22",
+  "results": {
+    "codemap": {
+      "gguf:embeddinggemma-300M-Q8_0": {
+        "bytes_on_miss_mean": 1192.333333,
+        "bytes_to_hit_mean": 291.027027,
+        "bytes_to_hit_median": 172,
+        "bytes_to_hit_p90": 735,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 72.756757,
+        "grep_bytes_to_hit_mean": 86125.447368,
+        "grep_bytes_to_hit_median": 60005,
+        "grep_miss_rate": 0.05,
+        "miss_rate": 0.075,
+        "mrr": 0.656458,
+        "n_questions": 40,
+        "recall@1": 0.525,
+        "recall@10": 0.925,
+        "recall@5": 0.825
+      },
+      "hash": {
+        "bytes_on_miss_mean": 1387.727273,
+        "bytes_to_hit_mean": 294.482759,
+        "bytes_to_hit_median": 172,
+        "bytes_to_hit_p90": 620,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 73.62069,
+        "grep_bytes_to_hit_mean": 86125.447368,
+        "grep_bytes_to_hit_median": 60005,
+        "grep_miss_rate": 0.05,
+        "miss_rate": 0.275,
+        "mrr": 0.504792,
+        "n_questions": 40,
+        "recall@1": 0.4,
+        "recall@10": 0.725,
+        "recall@5": 0.7
+      }
+    },
+    "convomem": {
+      "gguf:embeddinggemma-300M-Q8_0": {
+        "bytes_on_miss_mean": 4641,
+        "bytes_to_hit_mean": 2227.010456,
+        "bytes_to_hit_median": 2211,
+        "bytes_to_hit_p90": 2217,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 556.752614,
+        "miss_rate": 0.035109,
+        "mrr": 0.940409,
+        "n_questions": 2478,
+        "recall@1": 0.918483,
+        "recall@10": 0.964891,
+        "recall@5": 0.964891
+      },
+      "hash": {
+        "bytes_on_miss_mean": 4640.885057,
+        "bytes_to_hit_mean": 2486.029695,
+        "bytes_to_hit_median": 2211,
+        "bytes_to_hit_p90": 4420,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 621.507424,
+        "miss_rate": 0.035109,
+        "mrr": 0.892319,
+        "n_questions": 2478,
+        "recall@1": 0.830105,
+        "recall@10": 0.964891,
+        "recall@5": 0.964891
+      },
+      "ollama:nomic-embed-text": {
+        "bytes_on_miss_mean": 4645.678161,
+        "bytes_to_hit_mean": 2259.688833,
+        "bytes_to_hit_median": 2213,
+        "bytes_to_hit_p90": 2219,
+        "embed_max_chars": 8000,
+        "est_tokens_to_hit_mean": 564.922208,
+        "miss_rate": 0.035109,
+        "mrr": 0.935297,
+        "n_questions": 2478,
+        "recall@1": 0.910008,
+        "recall@10": 0.964891,
+        "recall@5": 0.964891
+      },
+      "tei:BAAI/bge-m3": {
+        "bytes_on_miss_mean": 4638.758621,
+        "bytes_to_hit_mean": 2208.842744,
+        "bytes_to_hit_median": 2210,
+        "bytes_to_hit_p90": 2215,
+        "embed_max_chars": 24000,
+        "est_tokens_to_hit_mean": 552.210686,
+        "miss_rate": 0.035109,
+        "mrr": 0.944781,
+        "n_questions": 2478,
+        "recall@1": 0.926957,
+        "recall@10": 0.964891,
+        "recall@5": 0.964891
+      }
+    },
+    "locomo": {
+      "gguf:embeddinggemma-300M-Q8_0": {
+        "bytes_on_miss_mean": 21835.525547,
+        "bytes_to_hit_mean": 4676.010276,
+        "bytes_to_hit_median": 2220,
+        "bytes_to_hit_p90": 11092,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 1169.002569,
+        "miss_rate": 0.068983,
+        "mrr": 0.702244,
+        "n_questions": 1986,
+        "recall@1": 0.589627,
+        "recall@10": 0.931017,
+        "recall@5": 0.846425
+      },
+      "hash": {
+        "bytes_on_miss_mean": 21879.034682,
+        "bytes_to_hit_mean": 5982.754878,
+        "bytes_to_hit_median": 2222,
+        "bytes_to_hit_p90": 15521,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 1495.68872,
+        "miss_rate": 0.17422,
+        "mrr": 0.565414,
+        "n_questions": 1986,
+        "recall@1": 0.452669,
+        "recall@10": 0.82578,
+        "recall@5": 0.688822
+      },
+      "ollama:nomic-embed-text": {
+        "bytes_on_miss_mean": 21660.582609,
+        "bytes_to_hit_mean": 4910.130979,
+        "bytes_to_hit_median": 2223,
+        "bytes_to_hit_p90": 12383,
+        "embed_max_chars": 8000,
+        "est_tokens_to_hit_mean": 1227.532745,
+        "miss_rate": 0.115811,
+        "mrr": 0.648707,
+        "n_questions": 1986,
+        "recall@1": 0.532226,
+        "recall@10": 0.884189,
+        "recall@5": 0.792548
+      },
+      "tei:BAAI/bge-m3": {
+        "bytes_on_miss_mean": 21884.506579,
+        "bytes_to_hit_mean": 4618.790076,
+        "bytes_to_hit_median": 2219,
+        "bytes_to_hit_p90": 11077,
+        "embed_max_chars": 24000,
+        "est_tokens_to_hit_mean": 1154.697519,
+        "miss_rate": 0.076536,
+        "mrr": 0.69934,
+        "n_questions": 1986,
+        "recall@1": 0.584592,
+        "recall@10": 0.923464,
+        "recall@5": 0.845921
+      }
+    },
+    "longmemeval_oracle": {
+      "gguf:embeddinggemma-300M-Q8_0": {
+        "bytes_to_hit_mean": 2233.854,
+        "bytes_to_hit_median": 2239,
+        "bytes_to_hit_p90": 2256,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 558.4635,
+        "miss_rate": 0,
+        "mrr": 1,
+        "n_questions": 500,
+        "recall@1": 1,
+        "recall@10": 1,
+        "recall@5": 1
+      },
+      "hash": {
+        "bytes_to_hit_mean": 2234.542,
+        "bytes_to_hit_median": 2240,
+        "bytes_to_hit_p90": 2256,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 558.6355,
+        "miss_rate": 0,
+        "mrr": 1,
+        "n_questions": 500,
+        "recall@1": 1,
+        "recall@10": 1,
+        "recall@5": 1
+      },
+      "ollama:nomic-embed-text": {
+        "bytes_to_hit_mean": 2236.18,
+        "bytes_to_hit_median": 2241,
+        "bytes_to_hit_p90": 2259,
+        "embed_max_chars": 8000,
+        "est_tokens_to_hit_mean": 559.045,
+        "miss_rate": 0,
+        "mrr": 1,
+        "n_questions": 500,
+        "recall@1": 1,
+        "recall@10": 1,
+        "recall@5": 1
+      },
+      "tei:BAAI/bge-m3": {
+        "bytes_to_hit_mean": 2233.164,
+        "bytes_to_hit_median": 2238,
+        "bytes_to_hit_p90": 2255,
+        "embed_max_chars": 24000,
+        "est_tokens_to_hit_mean": 558.291,
+        "miss_rate": 0,
+        "mrr": 1,
+        "n_questions": 500,
+        "recall@1": 1,
+        "recall@10": 1,
+        "recall@5": 1
+      }
+    },
+    "longmemeval_s": {
+      "hash": {
+        "bytes_on_miss_mean": 22065.674699,
+        "bytes_to_hit_mean": 5069.856115,
+        "bytes_to_hit_median": 2250,
+        "bytes_to_hit_p90": 13401,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 1267.464029,
+        "miss_rate": 0.166,
+        "mrr": 0.631501,
+        "n_questions": 500,
+        "recall@1": 0.542,
+        "recall@10": 0.834,
+        "recall@5": 0.736
+      }
+    },
+    "membench": {
+      "hash": {
+        "bytes_on_miss_mean": 3364.12971,
+        "bytes_to_hit_mean": 894.161938,
+        "bytes_to_hit_median": 516.5,
+        "bytes_to_hit_p90": 2194,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 223.540485,
+        "miss_rate": 0.162353,
+        "mrr": 0.559727,
+        "n_questions": 8500,
+        "recall@1": 0.426588,
+        "recall@10": 0.837647,
+        "recall@5": 0.729882
+      }
+    },
+    "personalization": {
+      "gguf:embeddinggemma-300M-Q8_0": {
+        "bytes_to_hit_mean": 582.555556,
+        "bytes_to_hit_median": 511.5,
+        "bytes_to_hit_p90": 573,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 145.638889,
+        "miss_rate": 0,
+        "mrr": 0.963889,
+        "n_questions": 36,
+        "recall@1": 0.944444,
+        "recall@10": 1,
+        "recall@5": 1
+      },
+      "hash": {
+        "bytes_on_miss_mean": 5271,
+        "bytes_to_hit_mean": 1117.205882,
+        "bytes_to_hit_median": 564,
+        "bytes_to_hit_p90": 2495,
+        "embed_max_chars": 0,
+        "est_tokens_to_hit_mean": 279.301471,
+        "miss_rate": 0.055556,
+        "mrr": 0.702368,
+        "n_questions": 36,
+        "recall@1": 0.583333,
+        "recall@10": 0.944444,
+        "recall@5": 0.888889
+      },
+      "ollama:nomic-embed-text": {
+        "bytes_to_hit_mean": 711.361111,
+        "bytes_to_hit_median": 514,
+        "bytes_to_hit_p90": 1090,
+        "embed_max_chars": 8000,
+        "est_tokens_to_hit_mean": 177.840278,
+        "miss_rate": 0,
+        "mrr": 0.881481,
+        "n_questions": 36,
+        "recall@1": 0.805556,
+        "recall@10": 1,
+        "recall@5": 1
+      },
+      "tei:BAAI/bge-m3": {
+        "bytes_to_hit_mean": 568.083333,
+        "bytes_to_hit_median": 510.5,
+        "bytes_to_hit_p90": 572,
+        "embed_max_chars": 24000,
+        "est_tokens_to_hit_mean": 142.020833,
+        "miss_rate": 0,
+        "mrr": 0.965278,
+        "n_questions": 36,
+        "recall@1": 0.944444,
+        "recall@10": 1,
+        "recall@5": 1
+      }
+    },
+    "session": {
+      "—": {
+        "brief_bytes": 338,
+        "instructions_bytes": 1944,
+        "n_tools": 27,
+        "n_tools_core": 16,
+        "session_bytes": 18301,
+        "session_core_bytes": 13354,
+        "tools_bytes": 16019,
+        "tools_core_bytes": 11072
+      }
+    }
+  }
+}

@@ -8,7 +8,10 @@
 machine (GPU, RAM, Docker, a running Ollama or TEI, the in-process GGUF
 embedder), picks the best embedder that **answers a real embedding here**, and
 writes its settings into the project's `.luamemorc`. When it can't find a
-working one, it says what to start. Afterwards `memo ping` checks the embedder,
+working one, it says what to start. It writes a setting only when the project
+doesn't have it yet: to change an embedder already recorded, use `memo config
+set` (see [Switching embedders](#switching-embedders)) — re-running calibrate
+leaves it as it is. Afterwards `memo ping` checks the embedder,
 and `memo doctor` reports how well it fits your memories (how many were cut to
 fit, row sizes).
 
@@ -21,7 +24,7 @@ embedder setting.
 ## Why this matters
 
 `hash` is feature hashing: fast, deterministic, nothing to install, no network —
-and **semantically blind**. It sees `"docker deploy"` and `"docker compose up"`
+and **semantically blind**. It sees `"deploy the app"` and `"ship to production"`
 as nearly unrelated; a real embedder puts them side by side. That shows up in
 the agent's prompt:
 
@@ -39,7 +42,7 @@ Every other lever multiplies the embedder's quality.
 | Embedder | Runs | Quality | Setup |
 |---|---|---|---|
 | `hash` | in-process, pure Lua | lexical only | none (the default) |
-| `gguf_ffi` (EmbeddingGemma) | in-process, CPU (GPU optional) | semantic, bge-m3 class | a one-time build + a 320 MB model |
+| `gguf_ffi` (EmbeddingGemma) | in-process, CPU (GPU optional) | semantic, bge-m3 class | a one-time runtime (prebuilt or built) + a ~300 MB model |
 | Ollama `nomic-embed-text` | a local service | semantic, English-tuned, 2,048-token context | `ollama pull nomic-embed-text` |
 | TEI `bge-m3` | a local service (GPU or CPU) | the best measured; 8,192 tokens, 100+ languages | one `docker run` |
 | OpenAI, Voyage, Cohere, OpenAI-compatible | hosted | semantic | an API key in the vault |
@@ -54,8 +57,20 @@ On LongMemEval `_s` (n = 200), switching `nomic-embed-text` → `bge-m3` lifted
 
 A GGUF embedding model runs inside luamemo's own process through LuaJIT's FFI and
 a small C shim over llama.cpp — no HTTP service, no vendor API, weights you keep.
-The default model is **EmbeddingGemma-300M** (768 dimensions); any
-llama.cpp-compatible GGUF embedding model works.
+The default model is **EmbeddingGemma 2** (768 dimensions, 8K-token context; it needs
+the llama.cpp of luamemo 0.5.2 or newer) with its task prompts (`MEMO_EMBED_PROMPTS=auto`).
+**EmbeddingGemma-300M**, the default before, is still found and works as it did (2K
+context, no prompts); any llama.cpp-compatible GGUF embedding model works. Measured on
+the same suites (R@1 / miss rate; [eval/README.md](eval/README.md#results)):
+
+| | EmbeddingGemma 2 + prompts | EmbeddingGemma-300M |
+|---|---|---|
+| LoCoMo | 61.2 % / 6.6 % | 59.0 % / 6.9 % |
+| ConvoMem | 93.6 % / 3.5 % | 92.0 % / 3.5 % |
+| Code map | 55.0 % / 12.5 % | 52.5 % / 7.5 % |
+
+Without its prompts EmbeddingGemma 2 is worse than the 300M model (LoCoMo R@1 48.6 %).
+It costs about 2.5× the CPU time to embed a long text.
 
 `memo calibrate` picks it only once it actually works on the machine (the
 runtime installed, model present, a test embedding succeeds). Until then it
@@ -72,31 +87,43 @@ the llama.cpp release luamemo is tested against:
 
 ```bash
 # 1. the runtime: memo gguf install — or llama.cpp (shared libraries) and the shim
-git clone --depth 1 --branch b9976 https://github.com/ggml-org/llama.cpp ~/llama.cpp
+git clone --depth 1 --branch b11829 https://github.com/ggml-org/llama.cpp ~/llama.cpp
 cmake -B ~/llama.cpp/build -S ~/llama.cpp -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=OFF -DLLAMA_CURL=OFF \
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
       -DLLAMA_BUILD_TOOLS=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build ~/llama.cpp/build --target llama -j
 LLAMA_DIR=~/llama.cpp bash <luamemo>/luamemo/embedders/native/build.sh
 
-# 2. the model (~320 MB)
-mkdir -p ~/models && curl -sL -o ~/models/embeddinggemma-300M-Q8_0.gguf \
-  https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf
+# 2. the model (~300 MB)
+mkdir -p ~/models && curl -sL -o ~/models/embeddinggemma-2-Q8_0.gguf \
+  https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main/embeddinggemma-2-Q8_0.gguf
 
 # 3. check: the GGUF line must say "ready"
 memo calibrate --probe-only
 
 # 4. switch the project, then re-embed what is stored
 memo config set MEMO_EMBEDDER gguf_ffi
-memo config set MEMO_GGUF_MODEL ~/models/embeddinggemma-300M-Q8_0.gguf
+memo config set MEMO_GGUF_MODEL ~/models/embeddinggemma-2-Q8_0.gguf
 memo config set MEMO_EMBED_DIM 768
+memo config set MEMO_EMBED_MAX_CHARS 24000
+memo config set MEMO_EMBED_PROMPTS auto
 memo config unset MEMO_EMBEDDER_URL
 memo reembed --all
 ```
 
-`MEMO_GGUF_NGL` offloads layers to a GPU when llama.cpp is built with CUDA;
-`MEMO_GGUF_NCTX` sets the context (2,048). `--no-gguf` keeps calibrate from
-suggesting it.
+`MEMO_GGUF_NGL` offloads layers to a GPU when llama.cpp is built with CUDA
+(`-DGGML_CUDA=ON`; `-1` offloads them all); `MEMO_GGUF_NCTX` sets the context
+(unset: the model's trained length, at most 8,192 — EmbeddingGemma 2 reads 8K, the 300M model 2K). `--no-gguf`
+keeps calibrate from suggesting it.
+
+On a GPU, storing pays off and searching doesn't. Measured on an RTX 2060: a
+900-token memory embeds in 0.07 s instead of 1.8 s on 12 CPU cores. A short query
+takes 50–80 ms instead of 20–30 ms, because each GPU call has a fixed overhead.
+The GPU's vectors differ slightly from the CPU's (cosine ≈ 0.9995): re-embed
+(`memo reembed --all`) after switching. Under WSL, build against NVIDIA's CUDA
+toolkit only. A distribution's `nvidia-cuda-toolkit` package can pull in Linux
+driver libraries (`libcuda1`) that shadow the Windows driver's in
+`/usr/lib/wsl/lib`.
 
 ---
 
@@ -120,7 +147,8 @@ memo ping --embedder
 
 ```bash
 docker run -d --name tei-embed --gpus all -p 127.0.0.1:8081:80 \
-  -e MODEL_ID=BAAI/bge-m3 -e DTYPE=float16 -e MAX_BATCH_TOKENS=4096 \
+  -e MODEL_ID=BAAI/bge-m3 -e DTYPE=float16 \
+  -e MAX_BATCH_TOKENS=7168 -e AUTO_TRUNCATE=true \
   ghcr.io/huggingface/text-embeddings-inference:1.7
 
 memo config set MEMO_EMBEDDER_ADAPTER tei
@@ -130,9 +158,12 @@ memo config set MEMO_EMBED_DIM 1024
 ```
 
 Turing GPUs (RTX 20xx, sm_75) use the `:turing-1.7` image; CPU-only hosts
-`:cpu-1.7` without `--gpus`. With fp16 it needs ~2 GB of VRAM; on WSL2 with a
-GPU, `--dtype float16` and a bounded `--max-batch-tokens` avoid out-of-memory
-crashes. A reference compose file is in
+`:cpu-1.7` without `--gpus`. With fp16 it needs ~2 GB of VRAM. `MAX_BATCH_TOKENS`
+must be at least the token count of the longest input, or TEI stalls the request
+without an error: 7168 is the ceiling on a 6 GB GPU (raise it to 8192 on 8 GB or
+more), and `AUTO_TRUNCATE=true` cuts the tail of a longer input instead of
+hanging. Lower it only together with a lower `MEMO_EMBED_MAX_CHARS`. A reference
+compose file is in
 [eval/sidecars/](eval/sidecars/docker-compose.yml) ([notes](eval/sidecars/tei.md)).
 calibrate finds a running TEI container by itself.
 
@@ -214,7 +245,7 @@ dimension, and a vector of another size is refused with the fix:
 
 ```
 this database holds 384-dimension vectors and the embedder gave 768 — use the
-database's embedder, or move the database to this one with `memo reembed` (every scope)
+database's embedder, or move the database to this one with `memo reembed --all`
 ```
 
 To switch, change the settings, then:

@@ -260,7 +260,7 @@ function M.for_query(scopes, query, limit)
     if scopes == nil then   -- a search of every scope: every scope's facts but the code maps'
         scopes = {}
         for _, r in ipairs(db.query("SELECT DISTINCT scope FROM " .. TBL
-                .. " WHERE valid_until IS NULL AND scope NOT GLOB 'codeindex:*'") or {}) do
+                .. " WHERE valid_until IS NULL AND " .. policy.NOT_CODEINDEX_SQL) or {}) do
             scopes[#scopes + 1] = r.scope
         end
     end
@@ -292,7 +292,7 @@ function M.for_query(scopes, query, limit)
     local found = {}
     for _, scope in ipairs(scopes) do
         -- (a code map's scope holds its dependency edges, not facts: never scanned here)
-        if type(scope) == "string" and scope ~= "" and not scope:match("^codeindex:") then
+        if type(scope) == "string" and scope ~= "" and not policy.is_codeindex(scope) then
             local had = {}
             for _, chunk in ipairs(chunks) do
                 for _, r in ipairs(db.query(chunk.sql, scope, unpack(chunk.params)) or {}) do

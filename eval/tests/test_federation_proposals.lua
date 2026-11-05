@@ -18,8 +18,8 @@
 --      use of its own memory reaches the org copy; signals mode proposes nothing
 --   E. CLI: memo org proposals (dev), memo org review + status + the admin's
 --      session brief line (org)
--- Uses the run's database (MEMO_DB) as the dev's, a second SQLite file for the
--- central. Run: luajit eval/tests/run.lua --only federation_proposals
+-- Uses the run's database (MEMO_DB) as the dev's; the central is the mock of
+-- eval/tests/_org.lua (a second SQLite file, served). Run: luajit eval/tests/run.lua --only federation_proposals
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 local H = require("eval.tests._harness")
@@ -78,22 +78,14 @@ local keys    = require("luamemo.federation.keys")
 local REPO, CIX, USERS, ORG = "repo:fedprop", "codeindex:fedprop", "user:fedprop", "org:fedprop"
 local ORGE = "org:fedprope"
 local function q1(sql) return db.first(sql) or {} end
-local function n(sql) return tonumber(q1(sql).n) or 0 end
+local n = H.count   -- (a query that fails raises: a check "== 0" cannot pass because the question was not asked)
 local function ago(secs) return util.now_us() - math.floor(secs * 1000000) end
 local DAY = 86400
 
 -- org_propose_scopes: this dev database holds other projects' memories too —
 -- only the test project may propose.
-local BASE = { embedder_local = "hash", embed_dim = 384, skip_embed_probe = true, patterns_enabled = false,
-               org_share = "triples", org_propose = true, org_proposals = true,
-               org_propose_scopes = { "repo:fedprop" } }
-local function setup(extra)
-    local c = {}
-    for k, v in pairs(BASE) do c[k] = v end
-    for k, v in pairs(extra or {}) do c[k] = v end
-    if type(luamemo.config) == "table" then luamemo.config.embedder_model = nil end
-    luamemo.setup(c)
-end
+local BASE = { org_share = "triples", org_propose = true, org_proposals = true, org_propose_scopes = { "repo:fedprop" } }
+local function setup(extra) H.setup(extra, BASE) end
 local function as_dev(extra)
     local e = { role = "dev", org_url = "http://127.0.0.1:1", org_fingerprint = "0000-0000-0000-0000-0000",
                 org_identity = "user:dev@corp.io" }
@@ -239,10 +231,7 @@ check("private rows are never candidates", (function()
 check("org rows can't be marked", select(2, props.set_private(q1("SELECT id FROM lm_memories WHERE scope = '" .. ORG .. "'").id, true)) ~= nil)
 check("org_propose_scopes / opts.scopes limit which projects may propose",
     #props.candidates(ORG, { scopes = { "repo:someother" } }) == 0 and #props.candidates(ORG, { scopes = { "user:x" } }) == 0)
-local saved = props.MAX_CHECK
-props.MAX_CHECK = 0
-local b4 = props.outgoing(ORG, "inst1")
-props.MAX_CHECK = saved
+local b4 = H.with(props, "MAX_CHECK", 0, props.outgoing, ORG, "inst1")
 check("status checks / withdrawals per push are bounded", b4 == nil or (#b4.check == 0 and #b4.withdraw == 0))
 require("luamemo.federation.client").forget(ORG)
 check("leaving the org (forget) drops what was proposed to it — the memories stay",
@@ -339,10 +328,9 @@ check("changed content → a fresh pending item", ch.status == "pending" and ch.
 local P3 = ch.proposal
 
 -- Near-duplicate merge (embedding similarity).
-local saved = k.MERGE_SIM
-k.MERGE_SIM = 0.5
-local nd = k.ingest(A, { propose = { item("iA:p:4", T2, B2 .. " It also includes an error code field.") } }).results[1]
-k.MERGE_SIM = saved
+local nd = H.with(k, "MERGE_SIM", 0.5, function()
+    return k.ingest(A, { propose = { item("iA:p:4", T2, B2 .. " It also includes an error code field.") } }).results[1]
+end)
 check("near-identical wording merges into the pending item", nd.status == "pending" and nd.proposal == P3
     and tonumber(k.get(P3).support) == 2, nd.proposal)
 
@@ -423,61 +411,23 @@ end)
 
 -- ---------------------------------------------------------------------------
 -- D. End to end: a real central served over the encrypted channel.
-local SUFFIX  = ("%d_%04d"):format(os.time(), math.random(0, 9999))
-local CDB     = "lm_fedprop_" .. SUFFIX
-local CKDIR   = os.tmpname(); os.remove(CKDIR)
-local DKDIR   = os.tmpname(); os.remove(DKDIR)
-local central_db = H.db_path(CDB)
-local PORT, FP, SERVER_PID
-local PRELUDE = [[
-package.path = "./?.lua;./?/init.lua;" .. package.path
-local luamemo = require("luamemo")
-luamemo.setup({ embedder_local = "hash", embed_dim = 384, skip_embed_probe = true, patterns_enabled = false,
-                role = "org", org_name = "fedprope" })
-local db, json = require("luamemo.db"), require("luamemo.json")
-local k = require("luamemo.federation.knowledge")
-local devs = require("luamemo.federation.devs")
-local function result(v) io.write("\n@@RESULT@@" .. json.encode(v or {}) .. "\n") end
-]]
-local function central(code)
-    local path = os.tmpname()
-    local f = assert(io.open(path, "w")); f:write(PRELUDE, "\n", code, "\n"); f:close()
-    local out = sh(("MEMO_DB=%q MEMO_FEDERATION_DIR=%q %s %q"):format(central_db, CKDIR, lua_bin, path))
-    os.remove(path)
-    local body = out:match("@@RESULT@@([^\n]*)")
-    if not body then error("central helper failed: " .. out:sub(1, 600), 0) end
-    return json.decode(body)
-end
+local Org = require("eval.tests._org")
+local DKDIR   = H.tmp_path("fedprop_dev_keys_" .. os.time())
+local org, org_err
+local function central(code) return org:call(code) end
 local client = require("luamemo.federation.client")
-local function dev(extra)
-    keys.set_dir(DKDIR)
-    local e = { role = "dev", org_url = "http://127.0.0.1:" .. tostring(PORT), org_fingerprint = FP,
-                org_identity = "user:dev@corp.io" }
-    for kk, v in pairs(extra or {}) do e[kk] = v end
-    setup(e)
-    client._reset_session()
-end
+local function dev(extra) org:as_dev(extra, DKDIR, BASE) end
 
 local up = false
 section("D setup", function()
 io.write("\n--- D: end to end ---\n")
-H.create_db(CDB)
-FP = central([[local kk = require("luamemo.federation.keys")
 -- An ordinary org memory the dev's "Soft delete" note duplicates (reaches the dev with the pull).
-assert(luamemo.store.write({ scope = "org:fedprope", title = "Soft delete", tier = 1, importance = 0.6,
-    body = "Users are soft-deleted by api/users.lua (deleted_at is set)." }))
-result({ fp = kk.fingerprint(assert(kk.ensure_identity("central"))) })]]).fp
-local LOG = os.tmpname()
-local srv = "package.path='./?/init.lua;'..package.path; require('luamemo.cli.serve').run({'--port','0'})"
-local out = sh(("MEMO_DB=%q MEMO_EMBEDDER=hash MEMO_ROLE=org MEMO_ORG_NAME=fedprope MEMO_FEDERATION_DIR=%q "
-    .. "%s%s -e %q >/dev/null 2>%q & echo \"PID=$!\""):format(central_db, CKDIR, H.timeout(600), lua_bin, srv, LOG))
-SERVER_PID = tonumber(out:match("PID=(%d+)"))
-PORT = H.wait_port(LOG)
-check("central serving", PORT ~= nil)
-if not PORT then return end
+org, org_err = Org.start({ name = "fedprope", seed = [[assert(store.write({ scope = "org:fedprope", title = "Soft delete", tier = 1,
+    importance = 0.6, body = "Users are soft-deleted by api/users.lua (deleted_at is set)." }))]] })
+check("central serving", org ~= nil, org_err)
+if not org then return end
 dev()
-local pr = assert(client.pair())
-check("device paired + approved", central(("result({ ok = devs.approve(%q, 'test') ~= nil })"):format(pr.code)).ok == true)
+check("device paired + approved", org:pair(client) == true)
 local s1, e1 = client.pull()
 check("first pull (learns the org scope)", s1 and s1.org_scope == ORGE, e1)
 up = s1 ~= nil
@@ -543,9 +493,9 @@ local COMMON = ("HOME=%q MEMO_PROJECT= MEMO_EMBEDDER=hash MEMO_LUA=%q LUA_PATH=%
     :format(TMPD, lua_bin, abs .. (os.getenv("LUA_PATH") or ";"))
 local DEVENV = ("%s MEMO_DB=%q MEMO_ORG_URL=http://127.0.0.1:%d MEMO_ORG_FINGERPRINT=%q MEMO_FEDERATION_DIR=%q "
     .. "MEMO_ORG_IDENTITY=user:dev@corp.io MEMO_ORG_PROPOSE_SCOPES=repo:fedprop"):format(COMMON, assert(db.path()),
-    PORT, FP, DKDIR)
+    org.port, org.fp, DKDIR)
 local ORGENV = ("%s MEMO_DB=%q MEMO_ROLE=org MEMO_ORG_NAME=fedprope MEMO_FEDERATION_DIR=%q")
-    :format(COMMON, central_db, CKDIR)
+    :format(COMMON, org.db_path, org.keydir)
 local function run(env, args) return sh(("cd %q && %s %q org %s"):format(TMPD, env, MEMO, args)) end
 local o1, c1 = run(DEVENV, "proposals")
 check("dev: memo org proposals lists them with their org copies", c1 == 0 and o1:find("approved", 1, true)
@@ -575,11 +525,11 @@ end
 
 -- ---------------------------------------------------------------------------
 pcall(function()
-    if SERVER_PID then os.execute("kill " .. SERVER_PID .. " 2>/dev/null") end
+    if org then org:stop() end
     as_dev()
     wipe()
 end)
 H.drop_dbs()
 keys.set_dir(nil)
-os.execute(("rm -rf %q %q"):format(CKDIR, DKDIR))
+os.execute(("rm -rf %q"):format(DKDIR))
 finish()

@@ -112,6 +112,11 @@ else fail "memo write / search in the project's database (from a subfolder)" "$o
 out=$(cd "$PROJ" && "${RUN[@]}" memo calibrate --probe-only --allow-hash --no-mcp --no-plugin 2>&1); rc=$?
 if [[ $rc -eq 0 ]]; then pass "memo calibrate --probe-only"; else fail "memo calibrate --probe-only" "$out"; fi
 
+# memo eval: in the rock; the kit it runs is an optional download, not installed here.
+out=$(cd "$PROJ" && "${RUN[@]}" memo eval status --json 2>&1)
+[[ "$(jq -r '.luamemo + " " + (.kit.installed | tostring)' <<<"$out" 2>/dev/null)" == "$VERSION false" ]] \
+    && pass "memo eval status (no kit installed — it is an optional download)" || fail "memo eval status" "$out"
+
 # ── memo mcp: the server from the rock ───────────────────────────────────────────
 req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
@@ -143,7 +148,8 @@ for f in mcp/server.lua mcp/instructions.md hooks/claude/pre_compact.sh hooks/cl
     [[ -f "$ROCKDIR/$f" ]] || fail "the rock ships $f"
 done
 [[ -f "$ROCKDIR/luamemo/embedders/native/gguf_shim.so" ]] && fail "no built gguf_shim.so in the rock"
-pass "the rock ships mcp/, hooks/, the GGUF shim's source (no built .so checked above)"
+[[ -e "$ROCKDIR/eval" ]] && fail "no eval/ in the rock (the eval kit is a release asset)"
+pass "the rock ships mcp/, hooks/, the GGUF shim's source (no built .so, no eval/ checked above)"
 
 echo ""
 if [[ $FAILS -eq 0 ]]; then echo "smoke: all checks passed ($VERSION)"; exit 0; fi

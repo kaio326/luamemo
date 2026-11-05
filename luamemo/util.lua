@@ -89,6 +89,10 @@ end
 --- Current time in integer microseconds since the epoch (UTC).
 function M.now_us() return _now_us() end
 
+--- A day, in seconds and in those microseconds.
+M.DAY_S  = 86400
+M.DAY_US = M.DAY_S * 1000000
+
 -- Days from 1970-01-01 to y-m-d (proleptic Gregorian; H. Hinnant's days_from_civil).
 local function days_from_civil(y, m, d)
     y = (m <= 2) and (y - 1) or y
@@ -414,6 +418,30 @@ end
 function M.is_dir(p)
     if type(p) ~= "string" or p == "" then return false end
     local r = os.execute("test -d " .. M.shell_quote(p))
+    return r == 0 or r == true
+end
+
+--- The values of a list that are numbers, as whole numbers (ids from a caller or from stored metadata): what is not one
+--- is left out.
+function M.ints(list)
+    local out = {}
+    for _, v in ipairs(list or {}) do
+        local n = tonumber(v)
+        if n then out[#out + 1] = math.floor(n) end
+    end
+    return out
+end
+
+--- A memory's tier as a whole number of 0..3 (0 raw conversation … 3 core): a value that is no number is an ordinary
+--- memory's, 1; one out of range is clamped.
+function M.clamp_tier(x)
+    return math.max(0, math.min(3, math.floor(tonumber(x) or 1)))
+end
+
+--- Is the path a symbolic link (the link itself, whatever it points at)?
+function M.is_symlink(p)
+    if type(p) ~= "string" or p == "" then return false end
+    local r = os.execute("test -L " .. M.shell_quote(p))
     return r == 0 or r == true
 end
 

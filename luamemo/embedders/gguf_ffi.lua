@@ -2,16 +2,16 @@
 --
 -- Embeds text IN-PROCESS via LuaJIT FFI over gguf_shim.so (llama.cpp + ANY
 -- llama.cpp-compatible GGUF embedding model) — no HTTP, no sidecar, no vendor
--- API. The recommended default model is EmbeddingGemma-300M, but it is fully
--- swappable: point embedder_model at any open-weights GGUF embedding model as
--- more capable ones appear. Achieves "win 1" (drop the embedder service) and
--- hosts fast inline learning ("win 2").
+-- API. The recommended default model is EmbeddingGemma 2 (the 300M model before
+-- it still works), but it is fully swappable: point embedder_model at any
+-- open-weights GGUF embedding model as more capable ones appear. Achieves
+-- "win 1" (drop the embedder service) and hosts fast inline learning ("win 2").
 --
 -- Config (cfg or env; MEMO_GEMMA_* accepted as back-compat aliases):
 --   embedder_model / MEMO_GGUF_MODEL   path to the .gguf  (required)
 --   gguf_shim_path / MEMO_GGUF_SHIM    path to gguf_shim.so (default: ./native/)
 --   embed_dim                          Matryoshka truncation dim (<= model dim; renormalised)
---   gguf_n_ctx / MEMO_GGUF_NCTX        context length (default 2048)
+--   gguf_n_ctx / MEMO_GGUF_NCTX        context length (unset: the model's trained length, at most 8192)
 
 local ffi     = require("luamemo.native.loader").ffi
 local ffishim = require("luamemo.embedders.native.ffi_shim")
@@ -43,12 +43,16 @@ local function ensure_handle(cfg)
     if not model or model == "" then
         error("gguf_ffi: model path required (cfg.embedder_model or MEMO_GGUF_MODEL)")
     end
-    local n_ctx = tonumber((cfg and cfg.gguf_n_ctx) or env("NCTX")) or 2048
+    -- 0: the context the model was trained with, at most 8192 (the shim reads it)
+    local n_ctx = tonumber((cfg and cfg.gguf_n_ctx) or env("NCTX")) or 0
     -- GPU offload for the embedder: 0 = CPU (default), N = N layers, -1 = all.
     -- No-op on a CPU-only libllama; MEMO_GGUF_NGL activates it after a CUDA build.
     local n_gpu = tonumber((cfg and cfg.gguf_n_gpu) or env("NGL")) or 0
     local h = lib.lmembed_load(model, n_ctx, n_gpu)
-    if h == nil then error("gguf_ffi: failed to load model: " .. model) end
+    if h == nil then
+        error("gguf_ffi: failed to load model: " .. model .. " (a missing or damaged file — or a model newer than "
+            .. "the runtime's llama.cpp: EmbeddingGemma 2 needs b11829 or newer; memo gguf install, or rebuild)")
+    end
     _handle = h
     _dim    = lib.lmembed_dim(h)
     _outbuf = ffi.new("float[?]", _dim)
@@ -64,7 +68,7 @@ function M.embed(text, cfg)
         local lib = ffishim.load(cfg)
         local h   = ensure_handle(cfg)
         local n   = lib.lmembed_embed(h, text or "", _outbuf, _dim)
-        if n < 0 then error("embed failed") end
+        if n < 0 then error(ffishim.stale(lib) and ("embed failed — " .. ffishim.STALE) or "embed failed") end
         -- (a shim built before lmembed_last_truncated existed can't tell)
         pcall(function() truncated = lib.lmembed_last_truncated(h) == 1 end)
 

@@ -1,166 +1,151 @@
 -- luamemo.digest
--- Hippocampus Digest: idle-triggered tier promotion + reinforcement processing.
+-- Hippocampus Digest: tier promotion + reinforcement processing.
 --
 -- Design:
---   * `notify_write(scope)` is called on every write to update an idle clock.
---   * A per-scope idle timer table tracks the last-write epoch. When no write
---     has arrived for `digest_idle_seconds` (default 30 min), `run(scope)` fires.
---   * The background coroutine poll requires the caller to drive the scheduler
---     (luamemo.async); in plain Lua scripts the caller can call `run()` directly.
+--   * A write claims the scope's digest slot (`claim`, at most once per `auto_digest_interval`) and
+--     luamemo.maintenance starts a background `memo maintain` that calls `run(scope)`.
 --   * `run(scope, opts)` is also callable explicitly (CLI, MCP tool, test harness).
 --
 -- Public API:
 --   digest.configure(cfg)                -- called by luamemo.store after setup
---   digest.notify_write(scope)           -- call on every write
---   digest.run(scope [, opts])           -- explicit trigger; returns summary table
+--   digest.claim(scope)                  -- take the scope's auto-digest slot if due (MEMO_AUTO_DIGEST_INTERVAL;
+--                                           luamemo.maintenance reads it and runs the digest)
+--   digest.run(scope [, opts])           -- explicit trigger; returns summary table (opts: no_llm — never ask a model,
+--                                           dry_run, threshold, deadline — see Public: run below)
 --   digest.record_event(memory_id, scope, event_type, delta, note)
 --                                        -- log a reinforcement event
+--   digest.apply_event_effect(memory_id, scope, event_type, delta)
+--                                        -- the row effect of an event, without logging it (the org central applies a
+--                                           pushed event once)
 --
--- Config keys consumed:
---   digest_idle_seconds       (default 1800 = 30 min)
---   digest_grace_days         (default 7) — days before ephemeral rows are deleted
---   digest_escalate_alpha     (default 0.4) — sigmoid slope for mistake escalation
---   digest_promote_tier2_at   (default 3) — min proof_count for tier-1 → tier-2
---   digest_promote_tier3_at   (default 5) — min proof_count for mistake → tier-3
+-- Config keys consumed (their defaults are in luamemo.settings; a day count for the folded rows' grace is luamemo.fold's):
+--   digest_escalate_alpha     -- sigmoid slope for mistake escalation (a mistake is a "mistake" or a "direct_command" event)
+--   digest_promote_tier2_at   -- min proof_count of an observation for the memories it holds to go tier-1 → tier-2
+--   digest_promote_tier3_at   -- how many mistake events (direct commands count) a tier-2 memory needs for tier-3
+--   consolidate_threshold     -- the cosine at which the tier-0 rows are grouped into clusters (unset: the dedup threshold;
+--                                opts.threshold overrides it for the digest's own grouping, step 2, only)
+--   (consolidate_reinforce_threshold — how close an observation must be to a cluster to count as matching it, step 3a —
+--   is read by consolidate.would_reinforce / process, from consolidate's own config, not by this module)
 --
 -- Digest pipeline (per scope):
---   1. Fetch unconsolidated tier-0 memories.
---   2. Cluster by cosine similarity (reuses consolidate clustering).
---   3. For each cluster:
---      a. overlaps existing observation → reinforce via consolidate
---      b. has a mistake-type reinforcement → escalate importance, promote tier
---      c. otherwise → synthesise via summarizer, store as tier=1
+--   1. Fetch up to 500 unconsolidated tier-0 memories that have a vector, highest importance first (a note stored
+--      without one is left as it is until it is re-embedded: consolidate.process cannot make an observation from it,
+--      and a fold with none behind it would end in a delete). consolidate.process, step 3b, takes every unconsolidated
+--      row of the scope that has a vector (consolidate.UNPROCESSED_SQL): the tier-0 rows beyond these 500 are consolidated by it too, into observations, but not
+--      archived here — they are reviewed as rows consolidated before folds were recorded (luamemo.fold,
+--      MEMO_DIGEST_GRACE_DAYS after). The unconsolidated rows of higher tiers are consolidated the same way but stay
+--      as they are: never archived, never reviewed.
+--   2. Cluster them with util.cluster at MEMO_CONSOLIDATE_THRESHOLD (the grouping consolidate.process makes of the scope;
+--      opts.threshold changes this grouping only — which cluster is escalated and which rows are archived together —
+--      not the one process makes the observations from).
+--   3. In three steps (a and c over those clusters, b one call that works on the scope's rows itself):
+--      a. a cluster with a mistake-type reinforcement (a mistake or a direct command) behind it that no observation is
+--         close enough to — the threshold consolidate.process reinforces at, judged on the cluster's best (first, highest-
+--         importance) member; process judges the first of its own id-ordered rows, which is the same one for a cluster
+--         of near-identical notes and may differ at the edges — → escalate importance, promote tier (the member stays
+--         visible at it) — all clusters, before any observation is made out of their rows; a failed lookup of the
+--         observations escalates
+--      b. consolidate.process, ONCE: reinforces the observation that matches, or synthesises a new one (a model, unless
+--         opts.no_llm). If it raises, or reports that it did nothing (`failed`: not configured, the rows could not be
+--         read), nothing is archived and the next run tries again. It marks a cluster consolidated only once an
+--         observation holds it, and only the notes unchanged since it read them
+--      c. archive the processed tier-0 rows that are consolidated (luamemo.fold: hidden, a review date): a cluster whose
+--         observation could not be made, or a note changed meanwhile, is left for the next run
 --   4. Promote tier-1 with proof_count >= tier2_at and trend != 'stale' → tier 2.
---   5. Promote tier-2 + mistake events with proof_count >= tier3_at → tier 3.
---   6. Stamp consolidated_at on all processed tier-0 rows.
---   7. After grace_days, delete tier-0 rows with non-null consolidated_at.
+--   5. Promote tier-2 memories with at least tier3_at mistake events (direct commands count) → tier 3.
+--   6. Review the archived rows that are due (luamemo.fold; stops at opts.deadline): delete, correct the observation,
+--      or restore.
 
 local M = {}
 
 local db          = require("luamemo.db")
 local util        = require("luamemo.util")
+local settings    = require("luamemo.settings")   -- (same_memory: one definition of "the same memory")
 local vectors     = require("luamemo.vectors")
 local consolidate = require("luamemo.consolidate")
+local fold        = require("luamemo.fold")
+local maintenance = require("luamemo.maintenance")   -- (it requires this module only inside its functions: no cycle)
 -- Federation: never mutate a dev's org replica; never create or alter org
 -- directives (tier 3) on the central. No-op when role=solo.
 local policy      = require("luamemo.federation.policy")
+local feedback    = require("luamemo.feedback")   -- (the event-type lists; it requires nothing of luamemo's but db, util, settings)
+local EVENT_TYPES = require("luamemo.federation.common").EVENT_TYPES   -- (the one list of valid reinforcement events)
+
+-- A reinforcement event's memory id as an integer (0: none) and its delta clamped to [-1, 1] (0.5 when it is none).
+-- Total: tonumber("nan") is a NaN, which math.min / math.max pass through — it is no number here, for the id and the delta.
+local function _norm_event(memory_id, delta)
+    local id, d = tonumber(memory_id), tonumber(delta)
+    if id == nil or id ~= id then id = 0 end
+    if d == nil or d ~= d then d = 0.5 end
+    return math.floor(id), math.max(-1.0, math.min(1.0, d))
+end
 
 -- ---------------------------------------------------------------------------
 -- Config
 -- ---------------------------------------------------------------------------
 local _cfg = {}
 
-local DEFAULTS = {
-    digest_idle_seconds     = 1800,
-    digest_grace_days       = 7,
-    digest_escalate_alpha   = 0.4,
-    digest_promote_tier2_at = 3,
-    digest_promote_tier3_at = 5,
-    auto_digest_interval    = 3600,   -- min seconds between lazy auto-digests per scope
-    consolidate_threshold   = 0.80,   -- clustering similarity (run's default threshold)
-}
-
+-- (the numbers are read where they are used, settings.number(_cfg, key): the config's own, else the setting's default.
+-- The grouping similarity has no number of its own: unset, it is the dedup threshold — settings.same_memory.)
 function M.configure(cfg)
-    cfg = cfg or {}
-    for k, default in pairs(DEFAULTS) do
-        _cfg[k] = cfg[k] ~= nil and cfg[k] or default
-    end
+    _cfg = cfg or {}
 end
 
--- ---------------------------------------------------------------------------
--- Idle timer
--- ---------------------------------------------------------------------------
-local _last_write = {}   -- scope → os.time() of last write
-
-function M.notify_write(scope)
-    if scope and scope ~= "" then
-        _last_write[scope] = os.time()
-    end
-end
-
--- Check whether a scope is idle long enough to trigger a digest.
--- Returns true if the scope has had at least one write AND has been quiet
--- for >= digest_idle_seconds. Never fires for scopes that never had a write.
--- (In-memory; only meaningful inside a long-lived process such as the MCP server.)
-function M.should_run(scope)
-    local t = _last_write[scope]
-    if not t then return false end
-    return (os.time() - t) >= (_cfg.digest_idle_seconds or 1800)
-end
-
--- Lazy, debounced auto-trigger for STATELESS callers (the CLI): piggyback a
--- maintenance digest on an ordinary operation, but at most once per
--- auto_digest_interval per scope. State lives in lm_digest_state so the debounce
--- survives across process invocations. The claim is a single atomic upsert whose
--- WHERE guard means only ONE concurrent caller wins the slot — a race can't double
--- run the digest. Fail-soft; returns the digest result, or false if not due /
--- unavailable. This is how the loop keeps maintaining itself without any external
--- trigger (agent or cron) having to remember.
-local _running = false
-function M.maybe_run(scope, opts)
-    if _running then return false end
-    if not scope or scope == "" then return false end
-    if policy.replica(scope) then return false end   -- replicas mirror the central
-    local interval = math.floor(tonumber(_cfg.auto_digest_interval) or 3600)
-    if interval < 0 then interval = 0 end
-
-    -- Atomic "claim the slot if due" — inserts on first sight, else updates only
-    -- when the cursor is older than the interval. RETURNING tells us if we won it.
-    local now = util.now_us()
-    local claim = db.first(
-        "INSERT INTO lm_digest_state (scope, last_digested_at) VALUES (?, ?) "
-        .. "ON CONFLICT (scope) DO UPDATE SET last_digested_at = excluded.last_digested_at "
-        .. "WHERE lm_digest_state.last_digested_at <= ? RETURNING scope",
-        scope, now, now - interval * 1000000)
-    if not claim then return false end   -- not due, or lost the race
-
-    _running = true
-    local ok, res = pcall(M.run, scope, opts or {})
-    _running = false
-    return ok and res or false
+--- The scope's auto-digest slot, if it is due → true when this caller won it (and so must see the digest through).
+--- Lazy and debounced, for STATELESS callers (the CLI) as much as the MCP server: a write piggybacks the digest, at
+--- most once per auto_digest_interval per scope, the state in lm_digest_state so the debounce survives across
+--- processes. Atomic (luamemo.maintenance.claim), so of any number of callers at most one wins per interval — a race
+--- can't double-run the digest. The work itself is done beside the agent (luamemo.maintenance.after_write starts a
+--- background `memo maintain`): a digest may ask a language model for an observation's wording, which takes a minute.
+function M.claim(scope)
+    if policy.maintenance_skip(scope) then return false end   -- no scope; a replica mirrors the central; the code index is not memory
+    return maintenance.claim_slot("digest", scope)
 end
 
 -- ---------------------------------------------------------------------------
 -- Importance-escalation / diminishment helpers
 -- ---------------------------------------------------------------------------
 
--- Sigmoid-like escalation: asymptotes toward 1.0 as reinforcement_count grows.
---   After 1 mistake: ≈ 0.29. After 3: ≈ 0.55. After 8: ≈ 0.82. After 15: ≈ 0.92.
-local function _escalate(current, reinforcement_count)
-    local x = math.max(0, tonumber(reinforcement_count) or 0)
-    local alpha = tonumber(_cfg.digest_escalate_alpha) or 0.4
-    local new = 1.0 - 1.0 / (1.0 + x * alpha)
-    -- Only move upward; never lower importance via mistake escalation.
-    return math.max(tonumber(current) or 0.0, new)
+-- The relevance (0–1) that a number of mistakes behind a memory stands for: sigmoid-like, asymptotes toward 1.0.
+--   (at the default alpha, 0.4) After 1 mistake: ≈ 0.29. After 3: ≈ 0.55. After 8: ≈ 0.76. After 15: ≈ 0.86.
+local function _relevance(mistakes)
+    local x = math.max(0, tonumber(mistakes) or 0)
+    return 1.0 - 1.0 / (1.0 + x * settings.number(_cfg, "digest_escalate_alpha"))
 end
 
 -- Soft diminishment for reversals: moves importance halfway toward 0.3
 -- (the tier-1/tier-0 boundary), scaled by delta strength.
 --   delta = 1.0 → moves halfway: new = current - (current - 0.3) * 0.5
 --   delta = 0.5 → moves quarter:  new = current - (current - 0.3) * 0.25
--- Result is clamped to [0.0, 1.0].
-local function _diminish(current, delta)
+-- importance's own 0–10 scale: a 5 falls to 3.8 on one reversal (delta 0.5), not to 1.0. It never raises
+-- (a memory already under 0.3 stays where it is).
+local function _lower_importance(current, delta)
     local c = tonumber(current) or 0.5
-    local d = math.min(math.abs(tonumber(delta) or 0.5), 1.0)
+    local d = math.abs(delta)   -- (delta is _norm_event's: a number in [-1, 1])
     local new = c - (c - 0.3) * d * 0.5
-    return math.max(0.0, math.min(1.0, new))
+    return math.max(0.0, math.min(c, new))
 end
 
 -- Miss reinforcement: retrieval failed to surface a memory that was needed, so
--- nudge its importance UP toward 1.0 (scaled by delta) — the direct remedy that
--- makes it rank higher / surface next time, independent of the learned models.
--- Only ever moves upward (never diminishes a proven-relevant memory).
---   delta = 1.0 → new = current + (1 - current) * 0.5   (halfway to ceiling)
---   delta = 0.5 → new = current + (1 - current) * 0.25
-local function _reinforce_relevance(current, delta)
+-- raise its importance (scaled by delta) — the direct remedy that makes it rank
+-- higher / surface next time, independent of the learned models. Only ever moves upward.
+-- On importance's own 0–10 scale (an ordinary memory is 1.0):
+--   below 1.0: toward 1.0   delta 0.5 → new = current + (1 - current) * 0.25
+--   from 1.0:  proportional delta 0.5 → new = current * 1.25   (1 → 1.25 → 1.56 …)
+-- up to MISS_CEILING, so repeated misses cannot pin one memory above everything else; a memory
+-- already above the ceiling is left as it is.
+local MISS_CEILING = 7.0
+local function _raise_importance(current, delta)
     local c = tonumber(current) or 0.5
-    local d = math.min(math.abs(tonumber(delta) or 0.5), 1.0)
-    local new = c + (1.0 - c) * d * 0.5
-    return math.max(c, math.min(1.0, new))
+    local d = math.abs(delta)   -- (delta is _norm_event's: a number in [-1, 1])
+    local new
+    if c < 1.0 then new = math.min(1.0, c + (1.0 - c) * d * 0.5)
+    else new = math.min(c * (1.0 + d * 0.5), math.max(c, MISS_CEILING)) end
+    return math.max(c, new)
 end
 
--- The digest's own 0–1 relevance (_escalate / _diminish / _reinforce_relevance
--- stay within 0–1) → tier, for escalation and reversal. (Write-time tiers use
+-- The digest's own 0–1 relevance (_relevance) → tier, for the mistake
+-- escalation of a digested cluster. (Write-time tiers, and a reversal's, use
 -- util.importance_to_tier on importance's 0–10 scale.)
 local function _tier_from_relevance(v)
     v = tonumber(v) or 0
@@ -175,27 +160,33 @@ end
 -- Log a discrete reinforcement event for a memory.
 --
 -- For "reversal" events the memory's importance is also immediately diminished
--- and its tier is updated to match.  The raw secret value of the change is
--- recorded in lm_reinforcements so the digest pipeline can later detect
--- contradictions and evolve the related observation.
+-- and its tier is updated to match; a "miss" raises only its importance, in proportion (up to a ceiling of 7), so
+-- retrieval finds it next time.  The event (type, delta, note) is recorded in
+-- lm_reinforcements; the digest later counts the mistakes among them (escalation, tier 3).
 -- ---------------------------------------------------------------------------
 function M.record_event(memory_id, scope, event_type, delta, note)
     if not memory_id or not scope then return end
-    local valid_types = {
-        direct_command = true, mistake = true,
-        reversal = true, praise = true, miss = true,
-    }
-    if not valid_types[event_type] then return end
+    if not EVENT_TYPES[event_type] then return end
 
-    local mid = math.floor(tonumber(memory_id) or 0)
-    if mid == 0 then return end  -- guard against invalid / zero FK
+    local mid, clamped_delta = _norm_event(memory_id, delta)
+    if mid <= 0 then return end  -- guard against invalid / zero FK
 
-    local clamped_delta = math.max(-1.0, math.min(1.0, tonumber(delta) or 0.5))
-
-    -- fire-and-forget; errors silently discarded (e.g. the memory is gone)
-    db.run("INSERT INTO lm_reinforcements (memory_id, scope, event_type, delta, note, created_at) "
-        .. "VALUES (?, ?, ?, ?, ?, ?)", mid, scope, event_type, clamped_delta, note, util.now_us())
+    -- fire-and-forget: an event that cannot be stored (the memory is gone) is not an error, and has no effect either — an
+    -- effect nothing records would be one the digest and the learners can never count
+    if not db.run("INSERT INTO lm_reinforcements (memory_id, scope, event_type, delta, note, created_at) "
+        .. "VALUES (?, ?, ?, ?, ?, ?)", mid, scope, event_type, clamped_delta, note, util.now_us()) then return end
     M.apply_event_effect(mid, scope, event_type, clamped_delta)
+end
+
+-- Raise or lower a memory's importance and tier, as the federation allows: a replica row or a directive is never changed
+-- and other org rows are capped at tier 2 on the central. `tier_now`, `imp_now`: the tier and importance the row had when
+-- it was read — the write only happens if it still has both (a change made meanwhile by someone else is not overwritten:
+-- a miss raises the importance and leaves the tier alone). The id is a memory's: both callers have it from a row or have
+-- checked it. → how many rows it changed (0: the row had changed since it was read), nil when it was not allowed or failed.
+local function _set_importance_tier(scope, mem_id, tier_now, imp_now, new_imp, new_tier)
+    if not policy.feedback_may_mutate(scope, tier_now) then return end
+    return (db.run("UPDATE lm_memories SET importance = ?, tier = ? WHERE id = ? AND tier = ? AND importance = ?",
+        new_imp, math.floor(policy.cap_tier(scope, new_tier)), mem_id, tier_now, imp_now))
 end
 
 -- ---------------------------------------------------------------------------
@@ -204,30 +195,26 @@ end
 -- so the org central can apply it exactly once for an idempotent pushed event
 -- (insert ON CONFLICT DO NOTHING → apply only when the row was new).
 --   Reversal: importance diminishment + tier demotion.
---   Miss: importance BUMP + tier promotion so the memory that retrieval failed
---   to surface becomes more findable next time.
+--   Miss: importance BUMP (the tier is left alone) so the memory that retrieval
+--   failed to surface becomes more findable next time.
 -- Federation: replica rows and org directives are never changed; other org
 -- rows are capped at tier 2 on the central.
 -- ---------------------------------------------------------------------------
 function M.apply_event_effect(memory_id, scope, event_type, delta)
-    local mid = math.floor(tonumber(memory_id) or 0)
-    if mid == 0 then return end
-    local clamped_delta = math.max(-1.0, math.min(1.0, tonumber(delta) or 0.5))
+    local mid, clamped_delta = _norm_event(memory_id, delta)
+    if mid <= 0 then return end
     if event_type == "reversal" or event_type == "miss" then
+        -- (importance and tier are NOT NULL columns)
         local mem = db.first("SELECT importance, tier FROM lm_memories WHERE id = ?", mid)
-        if mem and policy.feedback_may_mutate(scope, mem.tier) then
-            local cur_imp = tonumber(mem.importance) or 0.5
-            local cur_tier = tonumber(mem.tier) or 1
+        if mem then
             local new_imp = (event_type == "miss")
-                and _reinforce_relevance(cur_imp, clamped_delta)
-                or  _diminish(cur_imp, clamped_delta)
+                and _raise_importance(mem.importance, clamped_delta)
+                or _lower_importance(mem.importance, clamped_delta)
             -- A miss raises importance (ranking) and never demotes; a reversal
-            -- demotes to what its lowered relevance supports — never raises.
-            local new_tier = (event_type == "miss") and cur_tier
-                or math.min(cur_tier, _tier_from_relevance(new_imp))
-            new_tier = policy.cap_tier(scope, new_tier)
-            db.run("UPDATE lm_memories SET importance = ?, tier = ? WHERE id = ?",
-                new_imp, math.floor(new_tier), mid)
+            -- demotes to what its lowered importance supports — never raises.
+            local new_tier = (event_type == "miss") and mem.tier
+                or math.min(mem.tier, util.importance_to_tier(new_imp))
+            _set_importance_tier(scope, mid, mem.tier, mem.importance, new_imp, new_tier)
         end
     end
 end
@@ -236,130 +223,176 @@ end
 -- Private helpers
 -- ---------------------------------------------------------------------------
 
--- Fetch tier-0 memories that have not yet been consolidated for a scope.
+-- Fetch tier-0 memories that have not yet been consolidated for a scope — those with a vector: consolidate.process
+-- only reads rows that have one, so a note stored without (the embedder was down, the text too long) would be folded
+-- here with no observation made from it, and the review would later delete it as "no observation holds it". It stays
+-- as it is until it is re-embedded (memo reembed). → rows, or nil + why (the run reports it and does nothing else with
+-- the scope's notes: an empty answer would be taken for "nothing to digest").
 local function _fetch_tier0(scope)
-    local rows, err = db.query("SELECT id, scope, title, body, importance, decay_rate, tier, created_at, embedding "
-        .. "FROM lm_memories WHERE scope = ? AND tier = 0 AND consolidated_at IS NULL "
-        .. "ORDER BY importance DESC, created_at ASC LIMIT 500", scope)
-    if not rows then
-        if util.log then util.log("digest: fetch tier-0 error: " .. tostring(err)) end
-        return {}
-    end
+    local rows, err = db.query("SELECT id, importance, tier, embedding "
+        .. "FROM lm_memories WHERE scope = ? AND tier = 0 AND " .. consolidate.UNPROCESSED_SQL .. " "
+        .. "ORDER BY importance DESC, created_at ASC, id ASC LIMIT 500", scope)
+    if not rows then return nil, "fetch tier-0 error: " .. tostring(err) end
     for _, r in ipairs(rows) do r.embedding = vectors.unpack(r.embedding) end
     return rows
 end
 
--- Greedy single-linkage clustering (delegates to util.cluster).
-local function _cluster(memories, threshold)
-    return util.cluster(memories, threshold)
-end
-
 -- Fetch mistake-event counts for a set of memory IDs via a single aggregate
--- query.  Returns a table keyed by memory_id (as string) → count (number).
--- Only 'mistake' and 'direct_command' events are counted.
+-- query.  Returns a table keyed by memory_id (as string) → count (number), or nil + why: a count that could not be read
+-- is not "no mistakes" (the cluster would be archived without the escalation its mistakes call for).
 local function _fetch_mistake_counts(ids)
     if #ids == 0 then return {} end
-    local rows = db.query("SELECT memory_id, COUNT(*) AS n FROM lm_reinforcements "
+    local rows, err = db.query("SELECT memory_id, COUNT(*) AS n FROM lm_reinforcements "
         .. "WHERE memory_id IN (" .. db.placeholders(#ids) .. ") "
-        .. "AND event_type IN ('mistake', 'direct_command') GROUP BY memory_id", unpack(ids, 1, #ids))
+        .. "AND event_type IN " .. feedback.MISTAKE_SQL .. " GROUP BY memory_id", unpack(ids, 1, #ids))
+    if not rows then return nil, "mistake counts error: " .. tostring(err) end
     local by_id = {}
-    for _, r in ipairs(rows or {}) do
+    for _, r in ipairs(rows) do
         by_id[tostring(r.memory_id)] = tonumber(r.n) or 0
     end
     return by_id
 end
 
--- Stamp consolidated_at on a list of memory IDs.
-local function _stamp_consolidated(ids)
-    if #ids == 0 then return end
-    local params = { util.now_us() }
-    for _, id in ipairs(ids) do params[#params + 1] = id end
-    db.run("UPDATE lm_memories SET consolidated_at = ? WHERE id IN (" .. db.placeholders(#ids) .. ")",
-        unpack(params, 1, #params))
-end
 
--- UPDATE lm_memories SET tier = <to> WHERE id IN ids AND tier = <from> → rows changed
-local function _set_tier(ids, from, to)
-    if #ids == 0 then return 0 end
-    local params = { to }
-    for _, id in ipairs(ids) do params[#params + 1] = id end
-    params[#params + 1] = from
-    return db.run("UPDATE lm_memories SET tier = ? WHERE id IN (" .. db.placeholders(#ids) .. ") AND tier = ?",
-        unpack(params, 1, #params)) or 0
-end
-
--- Promote tier-0/1 rows based on proof_count and mistake history.
--- Returns counts of tier-1→2 and tier-2→3 promotions.
+-- Promote by proof and by mistake history; each step is ONE statement, the ids never pass through Lua (a statement's
+-- variables and LuaJIT's unpack both stop at a few thousand: an observation that absorbed that many memories would
+-- otherwise make this raise and stop the review that follows). Returns the counts of tier-1→2 and tier-2→3 promotions,
+-- and a list of what went wrong (a statement that failed: one observation with malformed evidence_ids fails the first).
 local function _promote(scope)
-    local promoted2, promoted3 = 0, 0
-    if policy.replica(scope) then return 0, 0 end
-    local tier2_at = tonumber(_cfg.digest_promote_tier2_at) or 3
-    local tier3_at = tonumber(_cfg.digest_promote_tier3_at) or 5
+    -- (a replica scope never gets here: run returns on maintenance_skip first)
+    local tier2_at = settings.number(_cfg, "digest_promote_tier2_at")
+    local tier3_at = settings.number(_cfg, "digest_promote_tier3_at")
+    local errors = {}
 
     -- Tier-1 → tier-2: memories whose consolidated observation has enough proof
     -- (proof_count >= tier2_at, trend != stale).
-    local obs_rows = db.query("SELECT id AS obs_id, proof_count, freshness_trend, evidence_ids "
-        .. "FROM lm_observations WHERE scope = ? AND proof_count >= ? AND freshness_trend != 'stale'",
-        scope, tier2_at)
-    for _, obs in ipairs(obs_rows or {}) do
-        local ev_ids = {}
-        for _, v in ipairs(type(obs.evidence_ids) == "table" and obs.evidence_ids or {}) do
-            if tonumber(v) then ev_ids[#ev_ids + 1] = math.floor(tonumber(v)) end
-        end
-        promoted2 = promoted2 + _set_tier(ev_ids, 1, 2)
-    end
+    local promoted2, err2 = db.run("UPDATE lm_memories SET tier = 2 WHERE scope = ? AND tier = 1 AND id IN ("
+        .. "SELECT CAST(e.value AS INTEGER) FROM lm_observations o, json_each(o.evidence_ids) e "
+        .. "WHERE o.scope = ? AND o.proof_count >= ? AND o.freshness_trend != 'stale')", scope, scope, tier2_at)
+    if promoted2 == nil then errors[#errors + 1] = "promote tier 2: " .. tostring(err2) end
 
     -- Tier-2 → tier-3: memories with enough mistake-escalated reinforcements.
     -- Never on a protected org scope: there the core tier is directive-only.
+    local promoted3 = 0
     if not policy.protected(scope) then
-        local mistake_rows = db.query("SELECT memory_id, COUNT(*) AS n FROM lm_reinforcements "
-            .. "WHERE scope = ? AND event_type IN ('mistake', 'direct_command') "
-            .. "GROUP BY memory_id HAVING COUNT(*) >= ?", scope, tier3_at)
-        local promote3_ids = {}
-        for _, mr in ipairs(mistake_rows or {}) do
-            local mid = math.floor(tonumber(mr.memory_id) or 0)
-            if mid > 0 then promote3_ids[#promote3_ids + 1] = mid end
-        end
-        promoted3 = promoted3 + _set_tier(promote3_ids, 2, 3)
+        local err3
+        promoted3, err3 = db.run("UPDATE lm_memories SET tier = 3 WHERE scope = ? AND tier = 2 AND id IN ("
+            .. "SELECT memory_id FROM lm_reinforcements WHERE scope = ? AND event_type IN " .. feedback.MISTAKE_SQL
+            .. " GROUP BY memory_id HAVING COUNT(*) >= ?)", scope, scope, tier3_at)
+        if promoted3 == nil then errors[#errors + 1] = "promote tier 3: " .. tostring(err3) end
     end
 
-    return promoted2, promoted3
+    return promoted2 or 0, promoted3 or 0, errors
 end
 
--- Delete tier-0 rows whose consolidated_at is older than grace_days,
--- relative to `before_us` (the start of the current run). Using the
--- run-start time instead of now prevents rows stamped during this run
--- from being deleted: those rows have consolidated_at >= run_start > cutoff.
-local function _purge_stale(scope, before_us)
-    local grace = math.max(0, math.floor(tonumber(_cfg.digest_grace_days) or 7))
-    local cutoff_us = before_us - grace * 86400 * 1000000
-    -- Federation: a bulk delete never touches rows the role must keep
-    -- (replicas; directives + approved org knowledge on the central).
-    local excl = policy.maintenance_exclusion_sql()
-    return db.run("DELETE FROM lm_memories WHERE scope = ? AND tier = 0 AND consolidated_at IS NOT NULL "
-        .. "AND consolidated_at < ?" .. (excl and (" AND " .. excl) or ""), scope, cutoff_us) or 0
+-- Each cluster of the scope's unconsolidated rows as a plan entry: { size, ids, best, best_id, mistake_n } — `best` the
+-- cluster's first member: the rows are fetched highest importance first and util.cluster keeps the order, so it is the
+-- highest-importance one (consolidate.process pivots on the first of its own id-ordered rows: the same vector for a
+-- cluster of near-identical notes, not always); mistake_n the mistake / direct-command events behind the cluster (the
+-- counts of every row in one query). → the plan, or nil + why when the counts could not be read.
+local function _plan(clusters)
+    local plan, all_ids = {}, {}
+    for _, cluster in ipairs(clusters) do
+        local ids = {}
+        for _, m in ipairs(cluster) do
+            ids[#ids + 1] = math.floor(tonumber(m.id) or 0)
+            all_ids[#all_ids + 1] = ids[#ids]
+        end
+        plan[#plan + 1] = { size = #ids, ids = ids, best = cluster[1], best_id = ids[1], mistake_n = 0 }
+    end
+    local counts, err = _fetch_mistake_counts(all_ids)
+    if not counts then return nil, err end
+    for _, c in ipairs(plan) do
+        for _, id in ipairs(c.ids) do c.mistake_n = c.mistake_n + (counts[tostring(id)] or 0) end
+    end
+    return plan
+end
+
+-- A cluster with mistakes behind it that no observation is close enough to (by the threshold consolidate.process
+-- reinforces at, on the cluster's best member's vector): raise the importance of its best member and bump its tier with the mistake count
+-- (the tier comes from _relevance(mistakes), a 0–1 value, through the relevance thresholds — at the default alpha 2
+-- mistakes → 1, 4 → 2, 15 → 3; never below where it is — and not from the row's importance, which is on a 0–10 scale;
+-- the importance is raised to that relevance only if it is lower). A cluster the consolidation will reinforce into an observation is not
+-- escalated. The observations are asked BEFORE the consolidation makes one out of each cluster's own rows, in one pass
+-- for all the clusters that have mistakes. If that lookup fails every asked cluster is escalated: a mistake is not left
+-- unmarked for want of an answer (escalation only raises, so a later run does no harm).
+local function _escalate_clusters(scope, plan)
+    local asked, vecs = {}, {}
+    for _, c in ipairs(plan) do
+        if c.mistake_n > 0 then
+            asked[#asked + 1] = c
+            vecs[#asked] = type(c.best.embedding) == "table" and c.best.embedding or false
+        end
+    end
+    if #asked == 0 then return end
+    local ok, matched = pcall(consolidate.would_reinforce, scope, vecs)
+    for i, c in ipairs(asked) do
+        if not (ok and matched[i]) then
+            local rel = _relevance(c.mistake_n)
+            local function escalate(row)   -- → rows changed (0: the row changed since it was read)
+                return _set_importance_tier(scope, c.best_id, row.tier, row.importance,
+                    math.max(tonumber(row.importance) or 0.0, rel), math.max(row.tier, _tier_from_relevance(rel)))
+            end
+            if escalate(c.best) == 0 then
+                -- the row changed since it was read (an event raised its importance): read it as it is now and try once
+                -- more — left at tier 0 the cluster would be archived, and its mistaken note deleted at the review. (A
+                -- second race on the same row in that moment is not chased: the note is then archived like its copies.)
+                local cur = db.first("SELECT importance, tier FROM lm_memories WHERE id = ?", c.best_id)
+                if cur then escalate(cur) end
+            end
+        end
+    end
+end
+
+-- Archive the processed tier-0 rows (luamemo.fold: hidden, kept through the grace period, then reviewed against the
+-- observation that holds them before they are deleted) — the rows still as the digest read them (fold.archive,
+-- digest mode): at tier 0 (a member this run just promoted stays visible at its new tier), in this scope, and
+-- consolidated (a note rewritten while the consolidation ran was not made into an observation: it waits for the next
+-- run). A cluster whose rows could not be archived is not processed: the next run looks at it.
+local function _archive_clusters(scope, plan, summary)
+    for _, c in ipairs(plan) do
+        local archived, aerr = fold.archive(c.ids, "observation", nil, nil, scope)
+        if archived == nil then
+            summary.errors[#summary.errors + 1] = "archive error: " .. tostring(aerr)
+        else
+            summary.processed = summary.processed + c.size
+        end
+    end
 end
 
 -- ---------------------------------------------------------------------------
 -- Public: run
 -- ---------------------------------------------------------------------------
 -- Runs the full digest pipeline for a scope. Returns a summary table:
---   { processed, promoted2, promoted3, deleted, errors }
+--   { processed, promoted2, promoted3, deleted, errors, skipped }
+-- (processed: the rows of the clusters the run took — a member it escalated stays visible at its new tier and counts too;
+-- with dry_run, the rows it would take. skipped: why the scope is not maintained — "no scope", an org replica, the code
+-- index — and then nothing else was done. deleted: the folded memories the review deleted. errors: what went wrong, one
+-- string each — the notes or their mistake counts that could not be read ("fetch tier-0 error: …" / "mistake counts
+-- error: …": nothing was clustered, consolidated or archived), the consolidation ("consolidate error: …": nothing was
+-- archived), a cluster that could not be archived ("archive error: …"), a promotion statement ("promote tier 2: …" /
+-- "promote tier 3: …"; the other one still runs), the review ("review: …"); the promotion and the review run after a
+-- failed consolidation, so errors does not mean nothing was done. What the consolidation reports for one cluster is
+-- there too, as "consolidate: …", of two kinds: an observation it could not write or reinforce, a mark that failed, a
+-- synthesis that gave no text, a read that checks a cluster is unchanged that failed ("could not check the cluster: …")
+-- — those rows are left unconsolidated and unarchived, and the next run tries them again —
+-- and notices about how an observation was made ("embed obs body: …": the cluster's own vector is used;
+-- "synthesize: <the summarizer's error>", with MEMO_CONSOLIDATE_LOG_ERRORS: the best member's text is used) — they report
+-- the embedder or the summarizer, and stand even if the cluster then waited because it changed meanwhile; the rows of a
+-- cluster that went through are archived)
 --
 -- opts (optional table):
 --   dry_run      — if true, skip all writes (inspection only)
---   threshold    — cosine clustering threshold (default from consolidate config)
+--   no_llm       — never ask a model for an observation's wording (maintenance sets it for a remote summarizer)
+--   threshold    — cosine at which the digest groups the tier-0 rows (which cluster is escalated, which rows are archived
+--                  together; not consolidate.process's own grouping). Default: MEMO_CONSOLIDATE_THRESHOLD, else the dedup threshold
+--   deadline     — os.time() the review of folded memories at the end stops at (memo maintain's time box)
 -- ---------------------------------------------------------------------------
 function M.run(scope, opts)
     scope = scope or ""
     opts  = opts or {}
     local dry_run   = opts.dry_run and true or false
-    local threshold = tonumber(opts.threshold)
-                      or tonumber(_cfg.consolidate_threshold) or 0.80
-    -- Capture start time before any DB writes so _purge_stale can exclude
-    -- rows stamped during this run.
-    local run_start = util.now_us()
-
+    local threshold = tonumber(opts.threshold) or settings.same_memory(_cfg, "consolidate_threshold")
     local summary = {
         processed  = 0,
         promoted2  = 0,
@@ -368,122 +401,67 @@ function M.run(scope, opts)
         errors     = {},
     }
 
-    -- Federation: a dev's org replica mirrors the central — the central runs
-    -- the digest for it (and ships the result); nothing to do here.
-    if policy.replica(scope) then
-        summary.skipped = "replica"
-        return summary
-    end
+    -- A dev's org replica mirrors the central — the central runs the digest for it (and ships the result); the code
+    -- index is not memory (nothing to digest, promote or review; memo index rebuilds it from the source).
+    summary.skipped = policy.maintenance_skip(scope)
+    if summary.skipped then return summary end
 
     -- 1. Fetch unconsolidated tier-0 memories.
-    local tier0 = _fetch_tier0(scope)
-    if #tier0 == 0 then
-        -- Nothing to process; still run promotion + purge.
-        if not dry_run then
-            local p2, p3 = _promote(scope)
-            summary.promoted2 = p2
-            summary.promoted3 = p3
-            summary.deleted   = _purge_stale(scope, run_start)
-        end
-        return summary
+    -- (no tier-0 memories: no clusters, and the promotion and the review at the end still run)
+    local tier0, read_err = _fetch_tier0(scope)
+
+    -- 2. Cluster by embedding similarity, each cluster a plan entry.
+    local plan = {}
+    if tier0 then
+        local clustered, plan_err = _plan(util.cluster(tier0, threshold))
+        if clustered then plan = clustered else read_err = plan_err end
+    end
+    if read_err then
+        -- the notes or their mistake counts could not be read: nothing is clustered, escalated, consolidated or archived
+        -- (a cluster archived without the escalation its mistakes call for is hidden for good); the promotion and the
+        -- review below still run, and the next run tries again
+        summary.errors[#summary.errors + 1] = read_err
     end
 
-    -- 2. Cluster by embedding similarity.
-    local clusters = _cluster(tier0, threshold)
-
-    -- Gather all IDs and fetch mistake counts in one aggregate query.
-    local all_ids = {}
-    for _, m in ipairs(tier0) do
-        all_ids[#all_ids + 1] = math.floor(tonumber(m.id) or 0)
-    end
-    local mistake_counts = _fetch_mistake_counts(all_ids)
-
-    -- 3. Process each cluster.
-    for _, cluster in ipairs(clusters) do
-        -- Collect IDs and pick the highest-importance member as representative.
-        local ids  = {}
-        local best = cluster[1]
-        for _, m in ipairs(cluster) do
-            ids[#ids + 1] = math.floor(tonumber(m.id) or 0)
-            if (tonumber(m.importance) or 0) > (tonumber(best.importance) or 0) then
-                best = m
-            end
-        end
-
-        local mistake_n = 0
-        for _, mid in ipairs(ids) do
-            mistake_n = mistake_n + (mistake_counts[tostring(mid)] or 0)
-        end
-
-        if dry_run then
-            -- In dry-run mode just count.
-            summary.processed = summary.processed + #cluster
+    if dry_run then
+        for _, c in ipairs(plan) do summary.processed = summary.processed + c.size end   -- (just count)
+    elseif #plan > 0 then
+        -- 3. a. escalate the clusters with mistakes behind them; b. consolidate, ONCE: consolidate.process takes every
+        -- unconsolidated row of the scope that has a vector (consolidate.UNPROCESSED_SQL), reinforcing the observation that matches
+        -- or synthesising a new one. If it RAISES, or reports that it did nothing (`failed`: not configured, or it could
+        -- not read the rows), nothing is archived (the next run tries again). A cluster whose own step failed (its
+        -- observation could not be written or reinforced) is left unconsolidated by process, so c. archive — which takes
+        -- only consolidated rows — leaves it too.
+        _escalate_clusters(scope, plan)
+        local ok_c, c_res = pcall(consolidate.process, scope, { no_llm = opts.no_llm })
+        local c_failed   -- what went wrong: the error it raised, or why it says it did nothing (nil: it ran)
+        if not ok_c then c_failed = tostring(c_res) elseif c_res.failed then c_failed = c_res.failed end
+        if c_failed then
+            summary.errors[#summary.errors + 1] = "consolidate error: " .. c_failed
         else
-            -- a. Check if cluster overlaps an existing observation.
-            local best_vec = best.embedding
-            local obs_hit = nil
-            if type(best_vec) == "table" then
-                local obs_limit = 5
-                local ok_search, obs_rows = pcall(consolidate.search,
-                    scope, best_vec, obs_limit)
-                if ok_search and obs_rows and #obs_rows > 0 then
-                    obs_hit = obs_rows[1]   -- highest-scoring observation
-                end
-            end
-
-            if obs_hit and obs_hit.id then
-                -- b. Reinforce the matching observation.
-                local ok_r, r_err = pcall(function()
-                    consolidate.process(scope)  -- full process handles reinforcement
-                end)
-                if not ok_r then
-                    summary.errors[#summary.errors + 1] =
-                        "reinforce error: " .. tostring(r_err)
-                end
-            else
-                -- c. Synthesise: use consolidate.process for new observations,
-                --    OR apply mistake escalation if triggered.
-                if mistake_n > 0 then
-                    -- Escalate importance of the best member and bump its tier
-                    -- with the mistake count: _escalate is a 0–1 relevance, so its
-                    -- tier comes from the relevance thresholds (2 mistakes → 1,
-                    -- 5 → 2, ~15 → 3), never below where it is.
-                    local new_imp = _escalate(best.importance, mistake_n)
-                    local new_tier = policy.cap_tier(scope,
-                        math.max(tonumber(best.tier) or 0, _tier_from_relevance(new_imp)))
-                    local mid = math.floor(tonumber(best.id) or 0)
-                    if mid > 0 and policy.feedback_may_mutate(scope, best.tier) then
-                        db.run("UPDATE lm_memories SET importance = ?, tier = ? WHERE id = ?",
-                            new_imp, math.floor(new_tier), mid)
-                    end
-                end
-                -- Let consolidate.process handle observation creation for the
-                -- remaining members (it reads consolidated_at IS NULL).
-                local ok_c, c_err = pcall(consolidate.process, scope)
-                if not ok_c then
-                    summary.errors[#summary.errors + 1] =
-                        "consolidate error: " .. tostring(c_err)
-                end
-            end
-
-            -- 6. Stamp consolidated_at on processed tier-0 rows.
-            _stamp_consolidated(ids)
-            summary.processed = summary.processed + #cluster
+            -- (what it reports for one cluster is reported too: a cluster it could not make an observation of, or mark,
+            -- stays unconsolidated, so the archive below leaves it for the next run; a notice about an observation made
+            -- all the same — its vector, its wording — leaves its rows consolidated and archived)
+            for _, e in ipairs(c_res.errors or {}) do summary.errors[#summary.errors + 1] = "consolidate: " .. e end
+            _archive_clusters(scope, plan, summary)
         end
     end
 
     -- 4 & 5. Tier promotion (skip in dry_run).
     if not dry_run then
-        local p2, p3 = _promote(scope)
+        local p2, p3, perrs = _promote(scope)
         summary.promoted2 = p2
         summary.promoted3 = p3
+        for _, e in ipairs(perrs) do summary.errors[#summary.errors + 1] = e end
 
-        -- 7. Purge stale consolidated tier-0 rows.
-        summary.deleted = _purge_stale(scope, run_start)
+        -- 6. Review the folded raw rows whose grace period is over: deleted only when they were not useful or the
+        -- observation holds their facts, else the observation is corrected and they wait again (luamemo.fold). What
+        -- went wrong with a row goes to summary.errors (the digest reports the deletes; `memo maintain --review` has
+        -- the other counts).
+        local review = fold.run(scope, { deadline = tonumber(opts.deadline) })
+        for _, e in ipairs(review.errors or {}) do summary.errors[#summary.errors + 1] = "review: " .. e end
+        summary.deleted = review.deleted or 0
     end
-
-    -- Reset idle clock so the timer doesn't immediately re-fire.
-    _last_write[scope] = nil
 
     return summary
 end

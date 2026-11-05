@@ -16,8 +16,9 @@
 --   3. Hit  = any top-K result's `metadata.session_id` is in
 --            `evidence_session_ids`. Rank = position of the first hit.
 --
--- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes):
---   MEMO_DB=bench luajit eval/convomem_run.lua \
+-- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes;
+-- MEMO_NO_MAINTENANCE=1: its writes start no `memo maintain` on it):
+--   MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/convomem_run.lua \
 --       --embedder hash --corpus eval/fixtures/convomem_tiny.json \
 --       --out eval/results/convomem_hash_smoke.json
 --
@@ -138,6 +139,7 @@ if args.summarizer_model then
     setup_opts.summarizer_model   = args.summarizer_model
 end
 
+setup_opts.embed_prompts = os.getenv("EMBED_PROMPTS")   -- none | auto | JSON (luamemo.embed)
 memory.setup(setup_opts)
 
 if args.rerank then
@@ -183,15 +185,9 @@ print(string.format("embedder=%s  dialogues=%d  qa_pairs=%d  k_max=%d  backend=%
     args.embedder, #rows, total_qa, args.k_max, memory.store.backend(),
     args.rerank and args.rerank_adapter or "off"))
 
-local function new_bucket()
-    return {
-        n            = 0,
-        sum_mrr      = 0,
-        hits         = { [1] = 0, [5] = 0, [10] = 0, [20] = 0 },
-        rank_list    = {},
-        miss_count   = 0,
-    }
-end
+-- eval/metrics.lua: R@k, MRR, miss rate, bytes to the hit
+local metrics = require("eval.metrics")
+local new_bucket = metrics.new
 local overall = new_bucket()
 local by_cat  = {}
 
@@ -275,20 +271,8 @@ for ri, r in ipairs(rows) do
                 if sid and gold[sid] then rank = sri; break end
             end
 
-            local function record(b)
-                b.n = b.n + 1
-                if rank then
-                    b.sum_mrr = b.sum_mrr + (1.0 / rank)
-                    b.rank_list[#b.rank_list + 1] = rank
-                    for _, k in ipairs({ 1, 5, 10, 20 }) do
-                        if rank <= k then b.hits[k] = b.hits[k] + 1 end
-                    end
-                else
-                    b.miss_count = b.miss_count + 1
-                end
-            end
-            record(overall)
-            record(by_cat[cat])
+            metrics.record(overall, rank, sresults)
+            metrics.record(by_cat[cat], rank, sresults)
             per_question[#per_question + 1] = {
                 dialogue_id = dlg_id,
                 qa_index    = qi,
@@ -310,28 +294,7 @@ for ri, r in ipairs(rows) do
 end
 print("")
 
-local function median(t)
-    if #t == 0 then return nil end
-    local sorted = {}
-    for _, v in ipairs(t) do sorted[#sorted + 1] = v end
-    table.sort(sorted)
-    local mid = math.floor(#sorted / 2) + 1
-    if #sorted % 2 == 1 then return sorted[mid] end
-    return (sorted[mid - 1] + sorted[mid]) / 2
-end
-local function summarise(b)
-    local n = b.n
-    return {
-        n_questions   = n,
-        ["recall@1"]  = n > 0 and (b.hits[1]  / n) or 0,
-        ["recall@5"]  = n > 0 and (b.hits[5]  / n) or 0,
-        ["recall@10"] = n > 0 and (b.hits[10] / n) or 0,
-        ["recall@20"] = n > 0 and (b.hits[20] / n) or 0,
-        mrr           = n > 0 and (b.sum_mrr  / n) or 0,
-        median_rank   = median(b.rank_list),
-        tail_misses   = b.miss_count,
-    }
-end
+local summarise = metrics.summary
 
 local report = {
     embedder      = args.embedder,
@@ -347,14 +310,16 @@ local report = {
     per_question  = per_question,
 }
 for cat, b in pairs(by_cat) do report.by_category[cat] = summarise(b) end
+for k, v in pairs(metrics.rerank_summary()) do report.overall[k] = v end   -- the reranker's cost
 
 local function fmt_pct(x) return string.format("%5.1f%%", x * 100) end
 local function print_row(label, s)
-    print(string.format("  %-28s n=%4d  R@1=%s  R@5=%s  R@10=%s  R@20=%s  MRR=%.3f  miss=%d",
+    print(string.format("  %-28s n=%4d  R@1=%s  R@5=%s  R@10=%s  R@20=%s  MRR=%.3f  not-found=%d",
         label, s.n_questions,
         fmt_pct(s["recall@1"]),  fmt_pct(s["recall@5"]),
         fmt_pct(s["recall@10"]), fmt_pct(s["recall@20"]),
         s.mrr, s.tail_misses))
+    print(string.format("  %-28s %s", "", metrics.line(s)))
 end
 print(string.rep("-", 96))
 print(string.format("embedder      : %s (dim=%d, backend=%s)",

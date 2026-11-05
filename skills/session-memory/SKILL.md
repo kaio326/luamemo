@@ -25,7 +25,10 @@ where you left off, or ensure key decisions are not forgotten.
 - **Code:** when the brief shows a map, use `index_search` / `index_outline` before
   grepping or reading whole files — and still read a file before you edit it.
 - **Learning:** when the user corrects you, sets a standing rule or confirms
-  something, call `memory_sense` with the recent turns.
+  something, call `memory_sense` with the recent turns (a standing rule no memory
+  holds is stored for you).
+- **One store:** luamemo is the only place you keep memory — not also a memory
+  directory or notes file of your own, which luamemo's search can't see.
 - **Secrets:** never ask for a key, token or password in the chat. The user stores
   it with `memo secret-store NAME` in a terminal; you use it through `secret_execute`,
   which fills it in server-side.
@@ -83,7 +86,8 @@ Several memories at once: `memory_write({ items = [ {…}, {…} ] })` (up to 10
 3. Call `memory_sense` with the recent turns (`[{role, text}]`, oldest first) so
    memory LEARNS from the session: it detects where the user corrected you, gave a
    standing rule, or confirmed something, and reinforces the memory each signal is
-   about. This is how retrieval improves over time — do it whenever the user
+   about (a standing rule no memory holds is stored as a decision). This is how
+   retrieval improves over time — do it whenever the user
    corrects you, not only at the very end. It is idempotent, so re-relaying overlapping
    turns is safe.
 

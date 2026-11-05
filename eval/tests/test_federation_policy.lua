@@ -10,12 +10,15 @@
 --      dev   — org: scopes are a read-only replica (replica capability only);
 --              feedback records the event but never mutates replica rows.
 --
+-- (B, org: the fold review and the brief's scan leave approved org knowledge alone; the digest's escalation of a cluster
+--  with mistakes stops at tier 2 and leaves what it escalated visible.)
 -- Uses the run's database (MEMO_DB), scopes org:fedtest / repo:fedtest,
 -- cleaned before and after.
 -- Run: luajit eval/tests/run.lua --only federation_policy
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
-local T = require("eval.tests._harness").new("Federation policy")
+local H = require("eval.tests._harness")
+local T = H.new("Federation policy")
 local check = T.check
 
 local policy   = require("luamemo.federation.policy")
@@ -116,13 +119,7 @@ local store   = luamemo.store
 local digest  = require("luamemo.digest")
 local consolidate = require("luamemo.consolidate")
 
-local BASE = { embedder_local = "hash", embed_dim = 384, skip_embed_probe = true, patterns_enabled = false }
-local function setup_role(extra)
-    local cfg = {}
-    for k, v in pairs(BASE) do cfg[k] = v end
-    for k, v in pairs(extra or {}) do cfg[k] = v end
-    luamemo.setup(cfg)
-end
+local function setup_role(extra) H.setup(extra) end
 local function wipe()
     db.run("DELETE FROM lm_memories WHERE scope IN ('org:fedtest', 'repo:fedtest')")
     db.run("DELETE FROM lm_reinforcements WHERE scope IN ('org:fedtest', 'repo:fedtest')")
@@ -243,7 +240,7 @@ local plain_decayer = store.write({ scope = "org:fedtest", title = "decaying not
                                    body = "ordinary org row with a decay rate", decay_rate = 1.0 })
 -- Backdating sticks (the updated_at trigger only touches implicit updates).
 db.run("UPDATE lm_memories SET updated_at = ? WHERE id IN (?, ?)",
-    require("luamemo.util").now_us() - 400 * 86400 * 1000000, decayer.id, plain_decayer.id)
+    require("luamemo.util").now_us() - 400 * require("luamemo.util").DAY_US, decayer.id, plain_decayer.id)
 local decayed = store.find_decayed({ scope = "org:fedtest", apply = false })
 local hit, control = false, false
 for _, id in ipairs(decayed or {}) do
@@ -267,6 +264,63 @@ check("org: promote(delete_source) from org: still runs", pr and pr.promoted == 
 check("org: promote(delete_source) keeps the directive", row(keep.id).id ~= nil)
 local folded = db.value("SELECT count(*) FROM lm_memories WHERE scope = 'org:fedtest' AND tier < 3")
 check("org: promote(delete_source) deletes the non-directive rows", tonumber(folded) == 0, folded)
+-- Archiving what a summary replaces spares directives too (the DELETE it replaced did; the UPDATE must).
+local fold_plain = store.write({ scope = "org:fedtest", title = "foldable two", body = "ordinary org row folded into a summary", importance = 0.5 })
+local fsum, ferr = store.replace_with_summary({ keep.id, fold_plain.id }, { scope = "org:fedtest", title = "S", body = "a summary of two notes" })
+check("org: replace_with_summary runs", fsum ~= nil, ferr)
+check("org: … it archives the ordinary row",
+    db.value("SELECT json_type(metadata, '$.lm_fold') FROM lm_memories WHERE id = ?", fold_plain.id) == "object")
+check("org: … and leaves the directive as it was: tier 3, not folded, not consolidated",
+    tonumber(row(keep.id).tier) == 3 and db.value("SELECT json_type(metadata, '$.lm_fold') FROM lm_memories WHERE id = ?", keep.id) == nil
+    and db.value("SELECT consolidated_at FROM lm_memories WHERE id = ?", keep.id) == nil)
+check("org: fold.archive on a directive archives nothing",
+    require("luamemo.fold").archive({ keep.id }, "summary", nil) == 0 and tonumber(row(keep.id).tier) == 3)
+local ctrl_row = store.write({ scope = "org:fedtest", title = "ordinary and old", body = "an ordinary org row the pass may offer", importance = 0.2 })
+local offered = {}
+for _, b in ipairs(store.select_for_summarization({ scope = "org:fedtest", weight_threshold = 99, retention_days = 0 }) or {}) do
+    for _, m in ipairs(b.memories or {}) do offered[tonumber(m.id)] = true end
+end
+check("org: (control) the pass does offer an ordinary row of the scope …", offered[ctrl_row.id] == true)
+check("org: … but not the directive", offered[keep.id] == nil)
+check("org: … nor the row that was just archived", offered[fold_plain.id] == nil)
+-- The review (and the brief's scan for it) leave approved org knowledge alone — the exclusion is all that stops a
+-- tier-0, consolidated row from being offered to a review that may delete it; only the admin removes it.
+do
+    local fold, maintenance, util = require("luamemo.fold"), require("luamemo.maintenance"), require("luamemo.util")
+    local old = util.now_us() - 40 * util.DAY_US
+    local function due_row(title, knowledge)
+        local r = store.write({ scope = "org:fedtest", title = title, body = title .. " as an org row", importance = 0.2 })
+        db.run("UPDATE lm_memories SET tier = 0, consolidated_at = ?, metadata = ? WHERE id = ?", old,
+            knowledge and '{"lm_org_knowledge": {"proposal": "p1"}}' or "{}", r.id)
+        return r.id
+    end
+    local function listed() for _, s in ipairs(maintenance.due_scopes()) do if s == "org:fedtest" then return true end end return false end
+    local know = due_row("approved knowledge", true)
+    local res = fold.run("org:fedtest")
+    check("org: the review does not offer approved org knowledge, however old", res.reviewed == 0 and row(know) ~= nil and row(know).id ~= nil,
+        require("luamemo.json").encode(res))
+    check("org: … and the brief's scan does not list the scope for it", not listed())
+    local ordinary = due_row("ordinary old row", false)
+    check("org: (control) an ordinary row in the same state is due, and the scan lists the scope", listed()
+        and fold.run("org:fedtest", { dry_run = true }).reviewed == 1)
+    db.run("DELETE FROM lm_memories WHERE id IN (?, ?)", know, ordinary)
+end
+-- The digest's escalation of a cluster with mistakes is capped at tier 2 on the central (core is directive-only), and what
+-- it escalated stays visible there.
+do
+    local feedback, digest = require("luamemo.feedback"), require("luamemo.digest")
+    local function note(title)
+        return store.write({ scope = "org:fedtest", title = title, body = "escalation fixture " .. title, importance = 0.2, tier = 0,
+            dedup_strategy = "append" }).id
+    end
+    local flagged = note("flagged note"); note("flagged note")
+    for _ = 1, 20 do assert(feedback.record_reinforcement(flagged, "org:fedtest", "mistake")) end
+    local res = digest.run("org:fedtest", { no_llm = true })
+    check("org: 20 mistakes on a tier-0 cluster: the digest escalates its best member, to tier 2 at most, and it stays visible",
+        res.processed >= 2 and tonumber(row(flagged).tier) == 2
+        and db.value("SELECT json_type(metadata, '$.lm_fold') FROM lm_memories WHERE id = ?", flagged) == nil,
+        require("luamemo.json").encode(res) .. " tier=" .. tostring(row(flagged).tier))
+end
 check("org: delete with capability removes a directive", store.delete(d.id, { _cap = DIR }) ~= nil)
 end)
 
@@ -300,6 +354,27 @@ check("dev: personal scopes unaffected (tier 3 at importance 9.5)", pw and tonum
 -- memory_promote(delete_source) from the replica would wipe it via raw SQL.
 local pr = require("luamemo.summarizer").promote({ from_scope = "org:fedtest", to_scope = "repo:fedtest",
                                                    delete_source = true })
+check("dev: fold.archive on a replica row archives nothing (it mirrors the central)",
+    require("luamemo.fold").archive({ rr.id }, "summary", nil) == 0
+    and db.value("SELECT json_type(metadata, '$.lm_fold') FROM lm_memories WHERE id = ?", rr.id) == nil)
+local function offered_in(scope)
+    local out = {}
+    for _, b in ipairs(store.select_for_summarization({ scope = scope, weight_threshold = 99, retention_days = 0 }) or {}) do
+        for _, m in ipairs(b.memories or {}) do out[tonumber(m.id)] = true end
+    end
+    return out
+end
+check("dev: (control) the pass offers a personal row of the same machine", offered_in("repo:fedtest")[pw.id] == true)
+check("dev: … and no summarization pass offers a replica row", offered_in("org:fedtest")[rr.id] == nil)
+local fold_mod, mnt = require("luamemo.fold"), require("luamemo.maintenance")
+local lm_cfg = require("luamemo").config
+local saved_adapter, saved_fb = lm_cfg.rerank_adapter, lm_cfg.feedback_enabled
+lm_cfg.rerank_adapter, lm_cfg.feedback_enabled = "learned", true   -- (so the training is not skipped for being off)
+local learn_res = mnt.learn("org:fedtest")
+lm_cfg.rerank_adapter, lm_cfg.feedback_enabled = saved_adapter, saved_fb
+check("dev: the review, the maintenance run and the training all leave a replica scope alone",
+    fold_mod.run("org:fedtest").skipped == "replica" and mnt.run("org:fedtest").skipped == "replica"
+    and learn_res.skipped == "replica", tostring(learn_res.skipped))
 check("dev: promote(delete_source) from the replica is refused",
     pr and pr.promoted == 0 and pr.errors and tostring(pr.errors[1]):find("read-only replica", 1, true),
     pr and pr.errors and pr.errors[1])

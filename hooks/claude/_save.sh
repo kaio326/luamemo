@@ -7,6 +7,7 @@
 # read when stdin doesn't carry them. Without jq nothing is saved (exit 0).
 
 command -v jq &>/dev/null || exit 0
+. "$(dirname "${BASH_SOURCE[0]}")/_project.sh" 2>/dev/null || exit 0   # (luamemo_memo, the transcript's jq definitions)
 
 # ── Hook input (one jq call; \x1f separates the fields, so an empty one stays empty) ──
 INPUT=""
@@ -34,17 +35,12 @@ MAX_CHARS="${MEMO_HOOK_MAX_CHARS:-500}"
 # finds the project's database); a failed save never makes the hook fail.
 save_transcript() {
     [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] || return 0
-    command -v memo &>/dev/null || return 0
+    local memo   # (the memo `memo agent install` pinned in MEMO_BIN, else the one beside these hooks, else the one on PATH)
+    memo=$(luamemo_memo) || return 0
     local body
     body=$(tail -n "$(( MAX_MESSAGES * 50 ))" "$TRANSCRIPT" \
-        | jq -r --argjson max "$MAX_CHARS" '
-            select((.type == "user" or .type == "human" or .type == "assistant")
-                   and (.isSidechain != true) and (.isMeta != true))
-            | (.message.content // .content) as $c
-            | (if ($c | type) == "array"
-               then [ $c[] | select(.type == "text") | .text ] | join(" ")
-               else ($c // "") | tostring end
-               | gsub("\\s+"; " ")) as $text
+        | jq -r --argjson max "$MAX_CHARS" "$LUAMEMO_JQ_DEFS"'
+            conversation | text_of as $text
             | select($text | test("\\S"))
             | (if .type == "assistant" then "ASSISTANT" else "USER" end) + ": " + $text[:$max]
         ' 2>/dev/null \
@@ -56,6 +52,6 @@ save_transcript() {
     # conversation is the digest's input (summarised into tier-1 memories, then removed),
     # not a memory searches return — at tier 1 every unscoped search got the whole
     # transcript chunks (three saves: 30 KB).
-    printf '%s' "$body" | memo write --scope "$SCOPE" --body - --importance "$2" --tier 0 --title "$1" \
+    printf '%s' "$body" | bash "$memo" write --scope "$SCOPE" --body - --importance "$2" --tier 0 --title "$1" \
         >/dev/null 2>&1 || true
 }

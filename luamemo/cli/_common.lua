@@ -34,7 +34,7 @@ end
 -- The .luamemorc keys that select the embedder (one embedding space per database:
 -- a project joining an org database takes that database's values).
 M.EMBED_KEYS = { "MEMO_EMBEDDER", "MEMO_EMBEDDER_URL", "MEMO_EMBEDDER_ADAPTER", "MEMO_EMBEDDER_MODEL",
-                 "MEMO_GGUF_MODEL", "MEMO_EMBED_DIM", "MEMO_EMBED_MAX_CHARS" }
+                 "MEMO_GGUF_MODEL", "MEMO_EMBED_DIM", "MEMO_EMBED_MAX_CHARS", "MEMO_EMBED_PROMPTS" }
 
 -- The embedder rules, on a config holding the settings: an HTTP embedder
 -- (MEMO_EMBEDDER_URL) takes priority; otherwise the in-process one MEMO_EMBEDDER names,
@@ -67,7 +67,7 @@ function M.embed_config(map)
     local all = require("luamemo.settings").from_env(function(k) return map[k] end)
     local cfg = {}
     for _, k in ipairs({ "embedder_local", "embedder_url", "embedder_adapter", "embedder_model", "gguf_model",
-                         "embed_dim", "embed_max_chars" }) do
+                         "embed_dim", "embed_max_chars", "embed_prompts" }) do
         cfg[k] = all[k]
     end
     return embedder(cfg)
@@ -121,8 +121,7 @@ function M.rc_set(path, key, value)
     -- A project's settings file that is a symlink is left alone: a downloaded folder could
     -- point it at any file of the user's, which would be read and rewritten. (The user's
     -- own ~/.luamemorc is written through its link — a dotfiles manager's.)
-    local link = not own and os.execute("test -L " .. util.shell_quote(path))
-    if link == 0 or link == true then
+    if not own and util.is_symlink(path) then
         return nil, ("%s is a symbolic link — left alone; luamemo writes a project's settings only to a "
             .. "regular file"):format(path)
     end

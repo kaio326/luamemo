@@ -51,7 +51,14 @@ memo calibrate
    messages (later runs read only new commits);
 4. writes the MCP entry for the clients it finds (VS Code, Cursor, Claude
    Desktop) — `memo mcp`, nothing secret in it — prints it for any other client,
-   and installs the VS Code agent plugin.
+   and installs the VS Code agent plugin (`--no-mcp` and `--no-plugin` skip
+   these);
+5. if Claude Code is installed (`~/.claude` exists), runs `memo agent install`
+   without asking: hooks in `~/.claude/settings.json`, a luamemo block in
+   `~/.claude/CLAUDE.md`, and the project's Claude Code memory notes moved into
+   luamemo (the originals are archived). `memo agent status` shows it, `memo agent
+   uninstall` takes the hooks and the block out, and `--no-agent` skips it
+   ([Session continuity and hooks](#session-continuity-and-hooks)).
 
 Then:
 
@@ -89,11 +96,24 @@ repeats instead of piling up copies.
 
 **Keeps what matters on top.** Every memory has an `importance` (0–10, default
 1) and an optional daily `decay_rate`, and sits in a **tier**: 0 ephemeral,
-1 working, 2 consolidated, 3 core. With self-maintenance on (calibrate turns it
-on), writes trigger a debounced digest that promotes memories proven useful,
-folds related ones into observations and lets stale scratch notes fade —
-nothing has to schedule it. Old, low-weight memories can be summarized (with or
-without an LLM).
+1 working, 2 consolidated, 3 core. Self-maintenance is on by default: writes
+trigger a debounced digest, in the background, that promotes memories proven
+useful, folds related ones into observations and lets stale scratch notes fade —
+nothing has to schedule it. Old, low-weight memories are summarized once a day by
+the language model you configured (`MEMO_GEN_MODEL`; without one they are joined
+as they were). A memory folded into a summary or an observation is not deleted:
+it is archived — hidden, kept for 30 days — and then reviewed against what
+replaced it. It is deleted only if it was never shown useful or the summary holds
+its facts; otherwise the missing facts are added to the summary and it waits
+again (restored, never deleted, after two such corrections). If what it was folded
+into has since disappeared it is given back too — restored to its tier, or, for a
+tier-0 memory, kept (back as it was, hidden like any tier-0 memory); raw conversation
+the digest folded into an observation is the one exception: deleted unless it was
+ever useful. Every deletion is recorded in the database's `.maintenance.log` (next
+to the file) first, and is not made if the record cannot be written. None of this
+runs inside the agent's calls: a write that makes it due starts `memo maintain` as a
+silent background process (so does the session brief, once a day, when a review is
+due or the usage log is to be pruned), and a search never waits on a language model.
 
 **Maps your codebase.** `memo index` turns a repository into searchable rows —
 files, functions/classes/methods with their line numbers, import edges, commit
@@ -204,15 +224,15 @@ The server (`memo mcp`, stdio) gives a client 27 tools:
 | Tool | What it does |
 |---|---|
 | `memory_brief` | The session brief: the project's scope and latest memories, its codebase map, what waits for the user — the same text the session-start hook injects |
-| `memory_search` | Hybrid search: `query`, `scope` or `scopes`, `kind`, `limit`, `since` / `until`, `tier_min` / `tier_max`, `metadata_filter`, `min_score`, `rerank`, `hybrid_weights`, `project`, `ignore_decay`. Results carry `facts` — the current values (and previous ones) of what the query is about |
+| `memory_search` | Hybrid search: `query`, `scope` or `scopes`, `kind`, `limit`, `since` / `until`, `tier_min` (default 1: ephemeral tier-0 memories are hidden unless the call passes `tier_min: 0`) / `tier_max`, `metadata_filter`, `min_score`, `rerank`, `hybrid_weights`, `project`, `ignore_decay`. Results carry `facts` — the current values (and previous ones) of what the query is about |
 | `memory_write` | Store a memory — or up to 100 at once (`items`); `importance`, `decay_rate`, `tier`, `dedup_strategy`, `created_at` |
-| `memory_recent` | The newest memories of a scope (`kind`, `limit`, `offset`, `tier_min`) |
-| `memory_get` / `memory_update` | One memory by id; change its fields (re-embedded when the text changes) |
-| `memory_delete` | Delete one by `id` — or every memory matching a filter, in two calls: a preview with a confirmation token, then the delete |
+| `memory_recent` | The newest memories of a scope (`kind`, `limit`, `offset`, `tier_min` — default 1, so tier-0 memories are hidden unless it is 0) |
+| `memory_get` / `memory_update` | One memory by id; change its fields (re-embedded when the text changes; new text or a new scope retires what was distilled from it, and a `warning` says when the embedding is degraded or that could not be done) |
+| `memory_delete` | Delete one by `id` — or every memory matching a filter, in two calls: a preview with a confirmation token, then the delete (a delete by `id` answers with a `warning` when the observations made from it could not be removed; a delete by filter answers with the count only) |
 | `memory_promote` | Fold a session scope into one summary in a long-term scope ([SESSION_CONTINUITY.md](SESSION_CONTINUITY.md)) |
 | `memory_digest` / `memory_consolidate` | Maintenance: promote proven memories, group related ones, expire decayed ones (`dry_run` to preview) |
 | `memory_summarize` | Fold old, low-weight memories into summaries (`dry_run` first) |
-| `memory_sense` | Record corrections, rules and praise from the conversation the agent relays — how memory learns |
+| `memory_sense` | Record corrections, rules and praise from the conversation the agent relays — how memory learns; a standing rule nothing holds is stored as a decision |
 | `memory_learn` | The scope's learned reranker: `run` (train, promote only if better), `status`, `rollback` |
 | `memory_embed` | What the embedder makes of a text; how similar two texts are |
 | `memory_tune_weights` | Which vector / full-text blend finds this scope's memories best (a report — people apply it) |
@@ -230,8 +250,8 @@ brief, search before answering, write as you go, never ask for a secret in chat 
 the same rules the skill and the agent carry). It also offers a `session_start`
 prompt. Settings are read-only over MCP — people change them with `memo config`.
 
-What it costs an agent in tokens is kept down: the tool list is about 15 KB
-(`MEMO_MCP_TOOLS=core` offers the 16 everyday tools in about 10 KB), search and
+What it costs an agent in tokens is kept down: the tool definitions are about 16 KB
+(`MEMO_MCP_TOOLS=core` offers the 16 everyday tools in about 11 KB), search and
 recent rows leave out the scoring internals (`verbose: true` for whole rows), and a
 write doesn't echo back the text it was sent. More in [mcp/README.md](mcp/README.md).
 
@@ -285,14 +305,18 @@ are listed by neither — open the client once, then run `memo doctor`.
 | `memo calibrate` | Set up a project: embedder, database, existing knowledge, MCP clients (`--help`) |
 | `memo mcp [--project P]` · `--print-config` | The MCP server, as clients start it / the entry that starts it ([Connect any MCP client](#connect-any-mcp-client)) |
 | `memo gguf [status / install]` | The in-process GGUF embedder's runtime: what is in use; install the release's prebuilt one |
+| `memo maintain [--scope S] [--all] [--digest] [--summarize] [--review] [--learn] [--quiet] [--max-seconds N]` | The maintenance that runs beside the agent — the digest, one batch of summarizing, the review of folded memories whose grace period is over, the learned reranker's training, the usage log's retention. A write that makes it due starts it in the background, silent (`<database>.maintenance.log` has the result); run by hand it prints a line per scope, and what went wrong. `--max-seconds N` (default 900): no part is started after N seconds, for the whole run however many scopes `--all` takes, and the review stops there; N must be a positive number or it is a usage error |
+| `memo usage [--scope S] [--days N] [--gap SECONDS] [--json]` | What the usage log says about how your agent really uses memory — searches, follow-ups within `--gap` seconds (default 120: asked again / in other words), what was said afterwards, where a memory confirmed useful stood in the results. Needs `MEMO_FEEDBACK_ENABLED=true`; reads only |
+| `memo eval status / install / fetch / run / history / build-corpus` | The retrieval benchmarks on your machine — R@k, miss rate, bytes to the right memory — from an optional, checksum-checked kit ([Benchmarks](#benchmarks)) |
 | `memo ping` / `memo doctor` | Health check (libraries, database, embedder) / corpus health (truncation, row sizes) and MCP clients too old for something luamemo needs |
 | `memo write` / `search` / `recent` / `get` / `update` | The memories, as the MCP tools do |
-| `memo delete ID` · `memo delete --scope S [--kind K] [--meta JSON] [--yes]` | Delete one, or preview a filter and delete it with `--yes` |
+| `memo delete ID` · `memo delete --scope S [--kind K] [--meta JSON] [--yes]` | Delete one (a `warning` in the answer when the observations made from it could not be removed), or preview a filter and delete it with `--yes` |
 | `memo context QUERY` | Search + current facts in one block, formatted for an agent |
 | `memo brief` | The session-start digest a hook injects (memories, code map, pending org decisions) |
 | `memo kg assert / query / invalidate / timeline` | The knowledge graph — recording facts is for people and their scripts; `memo search` and `memory_search` return the current ones ([KG.md](KG.md)) |
 | `memo promote` / `summarize` / `digest` / `consolidate` | Session promotion and maintenance |
 | `memo sense` / `memo learn SCOPE [--status / --rollback]` | Feedback signals; the learned reranker |
+| `memo agent install \| uninstall \| status \| import-notes` | Claude Code: hooks in `~/.claude/settings.json`, a block in `CLAUDE.md`, the project's Claude memory notes moved into luamemo (`memo calibrate` does it) |
 | `memo embed TEXT [--compare-to TEXT]` | The embedder's view of a text |
 | `memo tune-weights --scope S` | Measure the best search blend; prints the `memo config set` that applies it |
 | `memo reembed --scope S / --all` | Re-embed after switching embedders |
@@ -306,7 +330,8 @@ are listed by neither — open the client once, then run `memo doctor`.
 `memo` works on the database the project's `.luamemorc` names (the project is
 `calibrate --root` / `mcp --project` when given, else `MEMO_PROJECT`, else the
 nearest directory from here upward with a `.luamemorc`, so any subfolder works). Output is JSON unless a command says
-otherwise; exit status 1 means it failed.
+otherwise; exit status 0 is success, 1 means the command failed, 2 a usage error
+(a bad option or a missing argument).
 
 ---
 
@@ -329,8 +354,8 @@ memo config check                         # values that don't parse, names luame
   the project or edited by hand is ignored until you review it and run
   `memo config trust` (again whenever it changes).
 - A project's file never names code to run: `MEMO_LUA`, `MEMO_LIB_SQLITE3`,
-  `MEMO_LIB_SODIUM` and `MEMO_GGUF_SHIM` are read only from the environment and
-  `~/.luamemorc`.
+  `MEMO_LIB_SODIUM` and `MEMO_GGUF_SHIM` (and its older name `MEMO_GEMMA_SHIM`)
+  are read only from the environment and `~/.luamemorc`.
 - A credential never goes into a setting: store it with `memo secret-store NAME`
   and refer to it — `MEMO_EMBEDDER_HEADERS='{"Authorization": "Bearer {secret:NAME}"}'`.
 
@@ -410,21 +435,38 @@ Turned on with `memo config set MEMO_FEEDBACK_ENABLED true`. The base embedder
 never changes — only small learned layers adapt, and only when they demonstrably
 help.
 
+**What the usage log keeps.** It is off by default because it stores what was asked:
+the text of every search, its scope and the ids it returned, in the project's
+database (and, if the project has joined an organization with `MEMO_ORG_SHARE=triples`,
+the queries behind confirmed memories go there too). A search is removed after
+`MEMO_FEEDBACK_RETENTION_DAYS` (90; 0 keeps everything) unless it is one of the newest
+20 (per scope) that offered a memory with a recorded reinforcement (praise, direct command, mistake,
+reversal or miss) — those are the learner's training examples. `memo doctor` says whether the log is on, how much it holds and for how
+long; `memo usage` reads it, says whose miss a miss was (the ranking's, an ignored
+result, or no search first) and when there are too few searches to read the rates.
+
 1. **Signals.** The agent relays the recent turns with `memory_sense` (or
    `memo sense`): explicit corrections, standing rules ("always …", "never …")
    and praise are attributed to the memories they concern (an optional
    in-process instruct model, `MEMO_GEN_MODEL`, also catches paraphrased ones).
+   A standing rule that no memory holds ("always …", "from now on …": a short turn that begins with it, no question) is
+   stored as a `decision` memory of its own, with the first 300 characters of what the assistant had just said
+   (`MEMO_SENSE_CAPTURE`, on by default); `memory_brief` lists the ones stored in the last week, and `memory_delete`
+   removes a wrong one. What you type is scrubbed of credentials before it is kept as a signal's note.
    **Misses** are automatic: a new write that nearly duplicates an existing
    memory means a search should have found it; a correction about a memory that
    was never retrieved counts as a miss, not a mistake.
 2. **Self-maintenance.** The debounced digest (`MEMO_AUTO_DIGEST_ENABLED`, on
-   after calibrate) promotes memories that keep proving useful and escalates
+   by default) promotes memories that keep proving useful and escalates
    recurring mistakes into the core tier.
 3. **Gated promotion.** `memo learn <scope>` (or `memory_learn`) turns the
    scope's feedback into training examples, trains a learned reranker and
    compares it with the current one on held-out data — promoting it **only if
    it is better**. Versions are kept per scope; `--status` lists them,
-   `--rollback` goes back one; every run is recorded.
+   `--rollback` goes back one; every run is recorded. Where the learned
+   reranker is chosen (`MEMO_RERANK_ADAPTER=learned`, with the usage log on) the
+   background `memo maintain` does this for you, at most weekly per scope; the
+   shipped reranker is still `noop`.
 
 ---
 
@@ -436,9 +478,28 @@ the end, so the next session finds it — see
 [SESSION_CONTINUITY.md](SESSION_CONTINUITY.md), which also lists the conventions
 for capturing a conversation (scopes, kinds, dedup per kind).
 
-**Claude Code** — besides MCP, three hooks:
+**Claude Code** — besides MCP, these hooks. With the luamemo plugin the SessionStart, UserPromptSubmit and PreToolUse
+hooks are already on. Without it, **`memo calibrate` sets everything up** (its last phase; `--no-agent` skips it) — or
+run `memo agent install` yourself:
 
-- **SessionStart** (in the plugin, `hooks/hooks.json`): injects `memo brief` —
+- it copies the hook scripts to `<data dir>/hooks/claude/` — `~/.local/share/luamemo/` unless `XDG_DATA_HOME` is set; a
+  path an upgrade does not move — and merges them into `~/.claude/settings.json`: your other hooks and settings stay, in
+  their order, a second run changes nothing, a symlinked file is written through and keeps its mode, and the original
+  is copied once to `settings.json.luamemo-bak`;
+- it writes a marked block into `~/.claude/CLAUDE.md` that tells the agent luamemo is its memory;
+- it moves the project's Claude Code memory notes (`~/.claude/projects/<project>/memory/*.md`) into luamemo as memories
+  (`memo agent import-notes` alone; a note edited since its import updates its memory), leaving the originals and your
+  old `MEMORY.md` in `memory-archive-DATE` (a name already there is never overwritten) and `MEMORY.md` as a pointer —
+  and nothing moves while a note cannot be read;
+- `--with-transcripts` also wires the two capture hooks below; they stay wired on later runs until
+  `memo agent install --no-transcripts`. `memo agent status` shows what is installed or stale (`memo doctor` too);
+  `memo agent uninstall` removes the hooks, the block and the script copies — not the imported memories, the backup,
+  the archive or the `MEMORY.md` pointer (to get Claude Code's file memory back, move the archived notes back and delete
+  that `MEMORY.md`). Without `~/.claude` (no Claude Code) it does nothing. The guard also honours `$CLAUDE_CONFIG_DIR`.
+
+The hooks:
+
+- **SessionStart** (`hooks/claude/session_start.sh`; the plugin's `hooks/hooks.json` and `memo agent install` both run it): injects `memo brief` —
   how many memories, whether a code map exists, what waits for the org admin —
   so the agent knows what it can draw on without being asked. (Clients without
   hooks get the same text from the `memory_brief` tool; the server's instructions
@@ -462,9 +523,18 @@ for capturing a conversation (scopes, kinds, dedup per kind).
   }
   ```
 
-  They need `memo` and `jq` on `PATH` (and `_save.sh`, which both source, beside
-  them) and never block or fail the session. Anything in the conversation that
+  They need `jq` and `memo` (found through `$MEMO_BIN`, the checkout the scripts
+  sit in, or `PATH`), with `_save.sh` and `_project.sh` beside them (`_save.sh`
+  sources `_project.sh`, and the scripts source both: without them a hook does
+  nothing, silently), and never block or fail the session. Anything in the conversation that
   looks like a credential is stored as `[redacted]`, as in every memory.
+- **UserPromptSubmit** (`hooks/claude/user_prompt.sh`): sends what you type — with the assistant's last message, for
+  context — to `memo sense` in the background, so a correction, a praise or a standing rule ("always …", "from now
+  on …") reaches memory without the agent having to remember to call `memory_sense`. It prints nothing and never
+  delays the prompt; a project without a `.luamemorc` stores nothing.
+- **PreToolUse** (`hooks/claude/block_file_memory.sh`, matcher `Write|Edit|NotebookEdit`): in a project that has a
+  `.luamemorc`, a write under `~/.claude/projects/*/memory/` is denied with a pointer to the luamemo tools — Claude
+  Code's own file memory is invisible to luamemo's search, brief and learning. Projects without luamemo keep it.
 
 **VS Code** — `memo calibrate` installs the luamemo agent plugin (or run
 **Chat: Install Plugin From Source** with `https://github.com/kaio326/luamemo`):
@@ -536,10 +606,11 @@ One binary, three roles — chosen by configuration, never detected:
 | **dev** | `memo calibrate --org-url URL --org-fingerprint FP` | Joins the org's central on your network: a **read-only local replica** of `org:<name>` (searchable offline), the org's promoted reranker, feedback on org memories pushed up, and filtered project knowledge **proposed** for the admin to approve. All of one org's projects on the machine share one database. |
 | **org central** | `memo calibrate --role org --org-name NAME` | Serves the org (`memo serve`), holds its **directives** in a protected tier, reviews the devs' proposals and learns from everyone's feedback. |
 
-**Local network only — we hold no servers.** `memo serve` binds only to
+**Local network only — we hold no servers.** `memo serve --host` takes a
 loopback, private (10/8, 172.16/12, 192.168/16, IPv6 ULA / link-local) or
-Tailscale (100.64/10, fd7a:115c:a1e0::/48) addresses and drops public peers; a
-dev refuses a central whose address resolves to a public IP. It serves many
+Tailscale (100.64/10, fd7a:115c:a1e0::/48) address, or `0.0.0.0` / `::` (all
+interfaces — every connection from a public address is then dropped); any other
+address is refused. A dev refuses a central whose address resolves to a public IP. It serves many
 connections at once — a slow client can't hold up the others.
 
 **No passwords, no tokens — keys and a pairing code (the SSH model).** The
@@ -637,7 +708,9 @@ Then search the org with the project: `memory_search` with `scopes =
   0700, files 0600). luamemo connects only where you point it: the embedder,
   reranker or summarizer you configure, `secret_execute`'s targets, your org's
   central; calibrate also probes local services (Ollama, TEI, Docker) and clones
-  the VS Code plugin from GitHub. No telemetry.
+  the VS Code plugin from GitHub; if you accept (or run `memo gguf install`), it
+  downloads the prebuilt GGUF runtime from the project's GitHub releases, checked
+  against a checksum shipped in the rock. No telemetry.
 - **Settings files are data, and a project's must be memo's or trusted.** A
   `.luamemorc` is parsed, never run; one memo didn't write (it came with a
   repository or a download, or was edited) is ignored until you review it
@@ -664,31 +737,77 @@ Then search the org with the project: `memory_search` with `scopes =
 
 ## Benchmarks
 
-Retrieval recall — does the memory that answers the question come back in the
-top k? — on four public conversational-memory benchmarks and a project-specific
-one, with three embedders. Measured on this version's store (October 2026, the
-same vectors as the previous Postgres store, which the change matched within
-±0.4 points on every number):
+Retrieval recall asks whether the memory that answers the question comes back in
+the top k. It is measured on four public conversational-memory benchmarks and a
+project-specific one, with four embedders: luamemo 0.5.2, October 2026, `memo eval
+run` (retrieval only; no generated answers are scored).
 
-| Benchmark | hash (pure Lua) R@1 / R@5 / R@10 | nomic-embed-text (Ollama) | bge-m3 (TEI) |
-|---|---|---|---|
-| Project personalization (36 questions) | 58.3 / 88.9 / 94.4 | 72.2 / 97.2 / 100 | 94.4 / 100 / 100 |
-| LongMemEval, oracle (500) | 100 / 100 / 100 | 99.8 / 99.8 / 99.8 | 100 / 100 / 100 |
-| LoCoMo | 45.3 / 68.8 / 82.6 | 52.9 / 77.3 / 87.7 | 58.3 / 84.6 / 92.3 |
-| ConvoMem | 82.8 / 96.5 / 96.5 | 90.2 / 96.5 / 96.5 | 92.0 / 96.5 / 96.5 |
-| MemBench (8,500, hash) | 42.5 / 72.9 / 83.6 | | |
+| Benchmark | hash (pure Lua) R@1 / R@5 / R@10 | EmbeddingGemma-300M (in-process GGUF) | nomic-embed-text (Ollama) | bge-m3 (TEI) |
+|---|---|---|---|---|
+| Project personalization (36 questions) | 58.3 / 88.9 / 94.4 | 94.4 / 100 / 100 | 80.6 / 100 / 100 | 94.4 / 100 / 100 |
+| LongMemEval, oracle (500) | 100 / 100 / 100 | 100 / 100 / 100 | 100 / 100 / 100 | 100 / 100 / 100 |
+| LoCoMo (1,986) | 45.3 / 68.9 / 82.6 | 59.0 / 84.6 / 93.1 | 53.2 / 79.3 / 88.4 | 58.5 / 84.6 / 92.3 |
+| ConvoMem (2,478) | 83.0 / 96.5 / 96.5 | 91.8 / 96.5 / 96.5 | 91.0 / 96.5 / 96.5 | 92.7 / 96.5 / 96.5 |
+| MemBench (8,500) | 42.7 / 73.0 / 83.8 | not measured | not measured | not measured |
+| LongMemEval `_s` (500) | 54.2 / 73.6 / 83.4 | not measured | not measured | not measured |
 
-On the harder LongMemEval `_s` split (500 questions, ~50 sessions of haystack
-each), measured on the previous store: bge-m3 **87.0 % R@1, 96.4 % R@5, 98.6 %
-R@10** — on par with systems that summarize every session with an LLM, with
-single-stage retrieval and no LLM at all.
+**What retrieval costs the agent.** The **miss rate** is how often the right
+memory is not among the 10 results an agent gets (1 − R@10). Then the agent searches
+again, greps or reads files. **Bytes to hit** is what the agent reads before the
+right memory comes: the compact rows as the MCP server returns them, up to that one
+(mean; ≈ tokens = bytes / 4):
+
+| Benchmark | hash: miss · bytes to hit | EmbeddingGemma | nomic-embed-text | bge-m3 |
+|---|---|---|---|---|
+| Project personalization | 5.6 % · 1,117 (~279 tok) | 0 % · 583 (~146) | 0 % · 711 (~178) | 0 % · 568 (~142) |
+| LongMemEval, oracle | 0 % · 2,235 (~559) | 0 % · 2,234 (~558) | 0 % · 2,236 (~559) | 0 % · 2,233 (~558) |
+| LoCoMo | 17.4 % · 5,983 (~1,496) | 6.9 % · 4,676 (~1,169) | 11.6 % · 4,910 (~1,228) | 7.7 % · 4,619 (~1,155) |
+| ConvoMem | 3.5 % · 2,486 (~622) | 3.5 % · 2,227 (~557) | 3.5 % · 2,260 (~565) | 3.5 % · 2,209 (~552) |
+| MemBench | 16.2 % · 894 (~224) | not measured | not measured | not measured |
+| LongMemEval `_s` | 16.6 % · 5,070 (~1,267) | not measured | not measured | not measured |
+
+- **R@1 is where the context goes.** A conversational memory here is a whole
+  session, so one row is ~2.2 KB. On LoCoMo the median question costs that one row,
+  and the mean is 2–3× higher because of the questions answered further down.
+- **A miss is the expensive case.** It returns ~22 KB on LoCoMo and LongMemEval `_s`
+  (10 long rows), none of them the answer, before the agent's own fallback.
+- **The embedder is the dominant lever.** EmbeddingGemma, which runs in-process with
+  no service, comes within a point of bge-m3's R@1 and cuts LoCoMo's miss rate from
+  17 % (hash) to 7 %.
+- **The oracle set is easy.** It holds only the sessions with the answer: 100 % says
+  little.
+
+Differences from the previous store's numbers are within 0.3 points, with three
+exceptions:
+
+- ConvoMem's R@1 is up to 0.8 points higher. Since 0.5.2, a tie in the search's rank
+  fusion is ordered the same way on every run; before, it depended on the process.
+- nomic-embed-text moved on personalization (R@1 80.6 %, was 72.2 %) and LoCoMo
+  (R@5 79.3 %, was 77.3 %; R@10 88.4 %, was 87.7 %).
+- hash moved on LongMemEval `_s` (R@1 54.2 %, was 49.0 %).
+
+On `_s`, bge-m3 reached 87.0 % R@1 on the previous store; it isn't measured on this
+one yet.
+
+Also measured, in [eval/README.md](eval/README.md#results): what luamemo sends before the first
+search (18.3 KB with all 27 tools, 13.4 KB with `MEMO_MCP_TOOLS=core` — usage rules, tool
+definitions and brief together), the code map against grep
+(about 290 bytes to the right file where grep reads about 86 KB), search latency by size (75 ms at
+20k memories, 297 ms at 100k, with 768-dimension vectors), task prompts, EmbeddingGemma 2, and an LLM reranker (which hurts).
+
+Measure it on your machine with `memo eval` ([eval/README.md](eval/README.md)):
+`memo eval run --tier standard` (personalization, LoCoMo, ConvoMem, LongMemEval oracle;
+`--tier full` adds MemBench and LongMemEval `_s`). The standard tier takes about half a
+minute with hash, 7–25 minutes with nomic-embed-text or bge-m3 on an RTX 2060, and about
+3 hours with EmbeddingGemma on a CPU (ConvoMem alone takes about 2).
 
 **Search latency** (one scope, 384-dimension vectors, median of 15 searches;
-every search exact — every vector in scope is scored):
+every search exact — every vector in scope is scored; the 768-dimension figures of
+this version, 75 ms at 20k and 297 ms at 100k, are in [eval/README.md](eval/README.md#results)):
 
 | Memories in scope | 1,000 | 5,000 | 20,000 | 100,000 |
 |---|---|---|---|---|
-| this version | 3.9 ms | 18.3 ms | 71 ms | 233 ms |
+| this version (0.5.0 measurement) | 3.9 ms | 18.3 ms | 71 ms | 233 ms |
 | previous store (Postgres, brute force) | 136 ms | 167 ms | approximate above 10k | — |
 
 The harness, datasets and how to reproduce: [eval/README.md](eval/README.md);
@@ -715,7 +834,7 @@ full analyses in [eval/results/](eval/results/).
   reimplemented as an FTS5 function (BM25 measured worse here). The two scores are
   normalised and blended (`MEMO_HYBRID_WEIGHTS`, 0.7 / 0.3), boosted for quoted
   phrases, names and time expressions, and weighted by
-  `importance × e^(−decay_rate × days)` and the tier (so across several scopes
+  `√importance × e^(−decay_rate × days)` (`MEMO_IMPORTANCE_CURVE`) and the tier (so across several scopes
   an org directive outranks a working note); then the optional reranker and the
   limit.
 - **Writes:** embedded, checked for a near-duplicate in the scope (merged by
@@ -761,6 +880,12 @@ database isn't converted automatically. Per project:
 
 3. Secrets: store them again with `memo secret-store` (the old vault file isn't
    read).
+4. Team memory: org tokens are gone and an old org database isn't converted. On
+   the central run `memo calibrate --role org --org-name NAME`, then `memo org
+   directives ./standards` (directives aren't carried over) and `memo serve`. Each
+   dev runs `memo calibrate --org-url URL --org-fingerprint FP`, reads the pairing
+   code to the admin, who runs `memo org devs approve <CODE>`
+   ([Team memory](#team-memory-federation)).
 
 Tiers now follow importance (`< 0.3` → 0 · `< 5` → 1 · `< 9` → 2 · `≥ 9` → 3), so
 imported memories land in the tier their importance gives them.

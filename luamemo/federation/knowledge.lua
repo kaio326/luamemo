@@ -12,7 +12,7 @@
 --     refused · withdrawn
 --   knowledge.list({status, limit}) / get(id)
 --   knowledge.approve(id, by, {supersedes}) / approve_top(n, by) / reject(id, by, reason)
---   knowledge.remove(org memory id, by)
+--   knowledge.remove(org memory id, by)         → true [, a warning: what was made from it could not be removed] | nil, err
 --   knowledge.used(memory id, event type) / seen_top(memory id) / floor(memory id)   (feedback hooks)
 --
 -- The queue: identical content (and, when the embedder answers, near-identical
@@ -57,7 +57,7 @@ M.USE_CAP       = 1.0
 
 local KINDS = { fact = true, decision = true }
 local POSITIVE = { praise = true, direct_command = true, miss = true }
-local DAY_US = 86400 * 1000000
+local DAY_US = require("luamemo.util").DAY_US
 
 local function cfg() return require("luamemo").config end
 local TBL = "lm_memories"
@@ -375,7 +375,7 @@ function M.approve(id, by, opts)
             decay_rate = tonumber(cfg().org_knowledge_decay) or M.DEFAULT_DECAY,
             metadata = { project = row.project, lm_org_knowledge = true, lm_proposal_id = tonumber(row.id),
                          proposers = proposers },
-            dedup_strategy = "append" })
+            dedup_strategy = "append", no_miss = true })
         if not w then return nil, err end
         mid = tonumber(w.id)
     end
@@ -415,12 +415,12 @@ function M.remove(memory_id, by)
     if not (t and t.scope == scope() and M.is_knowledge(t.metadata)) then
         return nil, "memory " .. tostring(memory_id) .. " is not approved org knowledge"
     end
-    local ok, err = store.delete(id)
-    if not ok then return nil, err end
+    local res, err = store.delete(id)
+    if not res then return nil, err end
     local now = util.now_us()
     db.run("UPDATE lm_org_proposals SET status = 'rejected', reason = ?, decided_by = ?, decided_at = ?, "
         .. "updated_at = ? WHERE memory_id = ?", "removed from the org's memory", by or "admin", now, now, id)
-    return true
+    return true, res.warning
 end
 
 -- ---------------------------------------------------------------------------

@@ -3,9 +3,10 @@
 -- per-scope cursor (lm_digest_state) debounces a maintenance
 -- digest that piggybacks on ordinary writes — so it survives across the stateless
 -- CLI's process boundaries and never depends on an agent/scheduler remembering.
---   Section 1: maybe_run claims a slot, then debounces within the interval
+--   Section 1: claim takes the slot, then debounces within the interval
 --   Section 2: becomes due again once the cursor ages past the interval
---   Section 3: store.write piggybacks maybe_run only when auto_digest_enabled
+--   Section 3: store.write piggybacks the claim only when auto_digest_enabled
+--   Section 4: after_write never stays busy, whatever its claims do
 --
 -- Usage (the test runner sets a new MEMO_DB per file):
 --   MEMO_DB=/tmp/test_autodigest.db luajit eval/tests/test_autodigest.lua
@@ -24,6 +25,9 @@ end
 local function header(s) io.write(string.format("\n=== %s ===\n", s)) end
 
 memory.setup({ embedder_local = "hash", embed_dim = 384, skip_embed_probe = true })
+-- (a won slot starts a background `memo maintain`; this file is about the claims, not the process)
+local maintenance = require("luamemo.maintenance")
+maintenance.spawner = function() return true end
 
 local SCOPE = "autodigesttest"
 local function wipe()
@@ -35,29 +39,29 @@ local function cursor()   -- µs
 end
 
 -- =========================================================================
-header("Section 1 — maybe_run claims a slot, then debounces")
+header("Section 1 — claim takes a slot, then debounces")
 wipe()
 digest.configure({ auto_digest_interval = 100000 })   -- large: only the first call is due
-check("no cursor before first maybe_run", cursor() == nil)
-digest.maybe_run(SCOPE)
+check("no cursor before the first claim", cursor() == nil)
+check("the first claim wins the slot", digest.claim(SCOPE) == true)
 local c1 = cursor()
-check("first maybe_run creates the cursor (claimed the slot)", c1 ~= nil)
-local ran2 = digest.maybe_run(SCOPE)
-check("second maybe_run is debounced (returns false)", ran2 == false, tostring(ran2))
+check("… and creates the cursor", c1 ~= nil)
+local second = digest.claim(SCOPE)
+check("the second claim is debounced (returns false)", second == false, tostring(second))
 check("debounced call leaves the cursor unchanged", cursor() == c1)
 
 -- =========================================================================
 header("Section 2 — due again once the cursor ages past the interval")
 db.run("UPDATE lm_digest_state SET last_digested_at = ? WHERE scope = ?",
     require("luamemo.util").now_us() - 200000 * 1000000, SCOPE)
-digest.maybe_run(SCOPE)
-check("maybe_run runs again after the interval elapsed", (cursor() or 0) > (c1 or 0),
+check("claim wins again after the interval elapsed", digest.claim(SCOPE) == true)
+check("… and moved the cursor", (cursor() or 0) > (c1 or 0),
     string.format("%s -> %s", tostring(c1), tostring(cursor())))
 -- unavailable table / empty scope are safe no-ops
-check("maybe_run on empty scope is a safe no-op", digest.maybe_run("") == false)
+check("claim on empty scope is a safe no-op", digest.claim("") == false)
 
 -- =========================================================================
-header("Section 3 — store.write piggybacks maybe_run only when enabled")
+header("Section 3 — store.write piggybacks the claim only when enabled")
 wipe()
 digest.configure({ auto_digest_interval = 100000 })
 memory.config.auto_digest_enabled = false
@@ -67,6 +71,20 @@ memory.config.auto_digest_enabled = true
 memory.write({ scope = SCOPE, title = "b", body = "lazy digest sample two", importance = 0.5 })
 check("write triggers a debounced digest when auto_digest_enabled=true", cursor() ~= nil)
 memory.config.auto_digest_enabled = false
+
+-- =========================================================================
+header("Section 4 — after_write never stays busy")
+wipe()
+local real_claim = digest.claim
+digest.claim = function() error("the database is locked") end
+local res = maintenance.after_write(SCOPE, { auto_digest_enabled = true })
+check("a claim that raises does not raise out of after_write", res == false, tostring(res))
+digest.claim = real_claim
+digest.configure({ auto_digest_interval = 100000 })
+local started = 0
+maintenance.spawner = function() started = started + 1; return true end
+maintenance.after_write(SCOPE, { auto_digest_enabled = true })
+check("… and the next write still maintains (the busy flag was let go)", started == 1, tostring(started))
 
 wipe()
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))

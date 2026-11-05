@@ -22,23 +22,24 @@
 -- This is retrieval-side only — no generated answers scored.
 -- Primary metric: R@5.
 --
--- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes):
---   MEMO_DB=bench luajit eval/membench_run.lua --embedder hash \
+-- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes;
+-- MEMO_NO_MAINTENANCE=1: its writes start no `memo maintain` on it):
+--   MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/membench_run.lua --embedder hash \
 --       --data-dir eval/data/membench --n 850 \
 --       --out eval/results/membench_hash_v032.json
 --
 -- Full 8500-item run:
---   MEMO_DB=bench luajit eval/membench_run.lua --embedder hash \
+--   MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/membench_run.lua --embedder hash \
 --       --data-dir eval/data/membench \
 --       --out eval/results/membench_hash_v032.json
 --
 -- TEI bge-m3:
 --   TEI_URL=http://127.0.0.1:8081/embed TEI_DIM=1024 EMBED_TIMEOUT_MS=120000 \
---   MEMO_DB=bench luajit eval/membench_run.lua --embedder tei \
+--   MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/membench_run.lua --embedder tei \
 --       --out eval/results/membench_tei_bge-m3_v032.json
 --
 -- Flags:
---   --embedder hash|ollama|tei|openai
+--   --embedder hash|ollama|tei|openai|gguf
 --   --n N              limit to N questions (smoke test)
 --   --k-max N          retrieve top-N per question (default 20)
 --   --cats cat1,cat2   run only these categories (comma-separated)
@@ -152,10 +153,17 @@ elseif args.embedder == "openai" then
     setup_opts.embedder_model   = os.getenv("OPENAI_MODEL") or "text-embedding-3-small"
     setup_opts.embedder_headers = { Authorization = "Bearer " .. key }
     setup_opts.embed_dim        = tonumber(os.getenv("OPENAI_DIM") or "1536")
+elseif args.embedder == "gguf" then
+    -- In-process GGUF embedder (EmbeddingGemma via LuaJIT FFI), as the other runners.
+    setup_opts.embedder_local = "gguf_ffi"
+    setup_opts.embedder_model = os.getenv("MEMO_GGUF_MODEL")
+        or (os.getenv("HOME") .. "/models/embeddinggemma-300M-Q8_0.gguf")
+    setup_opts.embed_dim      = tonumber(os.getenv("MEMO_GGUF_DIM") or "768")
 else
     io.stderr:write("unknown --embedder: " .. tostring(args.embedder) .. "\n"); os.exit(2)
 end
 
+setup_opts.embed_prompts = os.getenv("EMBED_PROMPTS")   -- none | auto | JSON (luamemo.embed)
 memory.setup(setup_opts)
 
 -- ---------------------------------------------------------------------------
@@ -175,14 +183,9 @@ print(string.format("embedder=%s  questions=%d  k_max=%d  topic=%s  backend=%s",
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
-local function new_bucket()
-    return {
-        n         = 0,
-        sum_mrr   = 0,
-        hits      = { [1] = 0, [5] = 0, [10] = 0, [20] = 0 },
-        miss      = 0,
-    }
-end
+-- eval/metrics.lua: R@k, MRR, miss rate, bytes to the hit
+local evm = require("eval.metrics")
+local function new_bucket() return evm.new({ limit = math.min(args.k_max, evm.LIMIT) }) end
 
 -- ---------------------------------------------------------------------------
 -- Run
@@ -239,20 +242,8 @@ for _, q in ipairs(data) do
     -- Accumulate into overall and per-category buckets.
     local cat = q.category or "unknown"
     if not by_cat[cat] then by_cat[cat] = new_bucket() end
-    local function accum(b)
-        b.n = b.n + 1
-        if rank then
-            local mrr = 1.0 / rank
-            b.sum_mrr = b.sum_mrr + mrr
-            for k in pairs(b.hits) do
-                if rank <= k then b.hits[k] = b.hits[k] + 1 end
-            end
-        else
-            b.miss = b.miss + 1
-        end
-    end
-    accum(overall)
-    accum(by_cat[cat])
+    evm.record(overall, rank, results)
+    evm.record(by_cat[cat], rank, results)
 
     local n_target = 0
     for _ in pairs(q.target_sids) do n_target = n_target + 1 end
@@ -279,17 +270,13 @@ local t_elapsed = os.time() - t_start
 -- ---------------------------------------------------------------------------
 -- Final metrics
 -- ---------------------------------------------------------------------------
+-- This runner's own keys (n, r1 … r20, mrr, miss) kept for the older result files, beside
+-- the shared summary's (miss_rate, bytes_to_hit_*, …).
 local function metrics(b)
-    if b.n == 0 then return { n = 0, r1 = 0, r5 = 0, r10 = 0, r20 = 0, mrr = 0 } end
-    return {
-        n   = b.n,
-        r1  = b.hits[1]  / b.n,
-        r5  = b.hits[5]  / b.n,
-        r10 = b.hits[10] / b.n,
-        r20 = b.hits[20] / b.n,
-        mrr = b.sum_mrr  / b.n,
-        miss = b.miss,
-    }
+    local s = evm.summary(b)
+    s.n, s.miss = b.n, b.tail_misses
+    s.r1, s.r5, s.r10, s.r20 = s["recall@1"], s["recall@5"], s["recall@10"], s["recall@20"]
+    return s
 end
 
 local result = {
@@ -301,6 +288,7 @@ local result = {
     by_category = {},
     per_question = per_q,
 }
+for k, v in pairs(evm.rerank_summary()) do result.overall[k] = v end   -- the reranker's cost
 local sorted_cats = {}
 for cat in pairs(by_cat) do sorted_cats[#sorted_cats + 1] = cat end
 table.sort(sorted_cats)
@@ -319,12 +307,14 @@ print(string.format("Overall  R@1=%.1f%%  R@5=%.1f%%  R@10=%.1f%%  MRR=%.3f  (n=
     100 * result.overall.r10,
     result.overall.mrr,
     result.overall.n))
+print("         " .. evm.line(result.overall))
 print("\nBy category:")
 for _, cat in ipairs(sorted_cats) do
     local m = result.by_category[cat]
     print(string.format("  %-20s  R@1=%5.1f%%  R@5=%5.1f%%  R@10=%5.1f%%  MRR=%.3f  n=%d",
         cat,
         100 * m.r1, 100 * m.r5, 100 * m.r10, m.mrr, m.n))
+    print(string.format("  %-20s  %s", "", evm.line(m)))
 end
 
 -- ---------------------------------------------------------------------------

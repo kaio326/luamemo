@@ -76,6 +76,10 @@ S{ env = "MEMO_EMBED_DIM", key = "embed_dim", type = "integer", default = 384, m
 S{ env = "MEMO_EMBEDDER_HEADERS", key = "embedder_headers", type = "json", default = {}, headers = true,
    group = "embedder",
    doc = "Extra HTTP headers for the embedder, a JSON object; a credential as {secret:NAME} (memo secret-store)." }
+S{ env = "MEMO_EMBED_PROMPTS", key = "embed_prompts", type = "string", default = "none", group = "embedder",
+   reembed = true, mcp_env = true,
+   doc = "Task prompts for the embedder: none, auto (the model's own — EmbeddingGemma's task: / title: prefixes, "
+      .. "nomic-embed-text's search_query: / search_document:) or {\"query\":\"…{text}…\",\"document\":\"…{text}…\"}." }
 S{ env = "MEMO_EMBEDDER_INPUT_TYPE", key = "embedder_input_type", type = "string", group = "embedder",
    reembed = true, doc = "Input type sent to cohere (default search_document) or voyage (default: none)." }
 S{ env = "MEMO_EMBEDDER_NUM_CTX", key = "embedder_num_ctx", type = "integer", min = 1, group = "embedder",
@@ -86,8 +90,8 @@ S{ env = "MEMO_EMBED_MAX_CHARS", key = "embed_max_chars", type = "integer", min 
    doc = "Longer text is cut to this many characters before embedding (the row is flagged); unset: no limit." }
 S{ env = "MEMO_PROJECTED_BASE", key = "projected_base", type = "string", group = "embedder", reembed = true,
    doc = "Base embedder of the projected embedder (hash, gguf_ffi, …)." }
-S{ env = "MEMO_GGUF_NCTX", key = "gguf_n_ctx", type = "integer", implied = 2048, min = 1, group = "embedder",
-   aliases = { "MEMO_GEMMA_NCTX" }, doc = "Context size of the in-process GGUF embedder." }
+S{ env = "MEMO_GGUF_NCTX", key = "gguf_n_ctx", type = "integer", min = 1, group = "embedder",
+   aliases = { "MEMO_GEMMA_NCTX" }, doc = "Context size of the in-process GGUF embedder (unset: the context the model was trained with, at most 8192 — EmbeddingGemma 2 reads 8K, EmbeddingGemma-300M 2K)." }
 S{ env = "MEMO_GGUF_NGL", key = "gguf_n_gpu", type = "integer", implied = 0, min = -1, group = "embedder",
    aliases = { "MEMO_GEMMA_NGL" }, doc = "GPU layers for the GGUF embedder: 0 CPU, N layers, -1 all." }
 S{ env = "MEMO_GGUF_SHIM", key = "gguf_shim_path", type = "string", group = "embedder",
@@ -124,6 +128,9 @@ S{ env = "MEMO_PATTERNS_MAX_BODY_CHARS", key = "patterns_max_body_chars", type =
 -- ── search ──────────────────────────────────────────────────────────────────
 S{ env = "MEMO_HYBRID_WEIGHTS", key = "hybrid_weights", type = "json", default = { vector = 0.7, fts = 0.3 },
    group = "search", doc = "Blend of the vector and text scores: {\"vector\": …, \"fts\": …}." }
+S{ env = "MEMO_IMPORTANCE_CURVE", key = "importance_curve", type = "string", default = "sqrt",
+   values = { "linear", "sqrt", "log" }, group = "search",
+   doc = "How much a memory's importance weighs against its similarity in ranking: sqrt (the square root: 0.2 to 6 is a 5.5x spread — a clearly better match can beat a more important memory), linear (the importance itself: a 30x spread, importance decides the order), log2(1+importance) (11x). All are 1 at importance 1." }
 S{ env = "MEMO_OBS_MAX_SLOTS", key = "obs_max_slots", type = "integer", default = 3, min = 0, group = "search",
    doc = "Observations listed after the memories of a search (0: none)." }
 S{ env = "MEMO_PERSON_NAME_BOOST", key = "person_name_boost", type = "number", default = 0.15, min = 0,
@@ -142,7 +149,7 @@ S{ env = "MEMO_RERANK_ENABLED", key = "rerank_enabled", type = "boolean", defaul
    doc = "Rerank every search (a call can still turn it off)." }
 S{ env = "MEMO_RERANK_ADAPTER", key = "rerank_adapter", type = "string", default = "noop",
    values = { "noop", "ollama", "openai", "cross_encoder", "learned" }, group = "rerank",
-   doc = "Reranker: noop (word overlap), ollama, openai, cross_encoder (TEI / Cohere / Jina), learned (from use)." }
+   doc = "Reranker: noop (word overlap), ollama, openai, cross_encoder (TEI / Cohere / Jina), learned (from use: with MEMO_FEEDBACK_ENABLED, memo maintain trains it in the background and promotes a model only if it beats the current ranking on held-out data; until then the order is untouched)." }
 S{ env = "MEMO_RERANK_URL", key = "rerank_url", type = "string", group = "rerank", doc = "Reranker endpoint." }
 S{ env = "MEMO_RERANK_MODEL", key = "rerank_model", type = "string", group = "rerank", doc = "Reranker model." }
 S{ env = "MEMO_RERANK_HEADERS", key = "rerank_headers", type = "json", default = {}, headers = true,
@@ -156,9 +163,9 @@ S{ env = "MEMO_RERANK_EPSILON", key = "rerank_epsilon", type = "number", default
    doc = "learned reranker: chance that a result's score is jittered, so new results still get seen (0: off)." }
 
 -- ── summarizer ──────────────────────────────────────────────────────────────
-S{ env = "MEMO_SUMMARIZER_ADAPTER", key = "summarizer_adapter", type = "string", default = "noop",
-   values = { "noop", "ollama", "openai" }, group = "summarizer",
-   doc = "Summarizer: noop (no model — joins the memories), ollama, openai." }
+S{ env = "MEMO_SUMMARIZER_ADAPTER", key = "summarizer_adapter", type = "string", default = "auto",
+   values = { "auto", "noop", "gguf", "ollama", "openai" }, group = "summarizer",
+   doc = "Summarizer: auto (the language model, MEMO_GEN_MODEL, when one is configured and loads; else noop), noop (no model — joins the memories), gguf (that model, in-process), ollama, openai (each with its URL and model). ollama and openai are used when you ask (memory_summarize, memo consolidate), never by the scheduled background maintenance: that runs only on this machine's own model." }
 S{ env = "MEMO_SUMMARIZER_URL", key = "summarizer_url", type = "string", group = "summarizer",
    doc = "Summarizer endpoint." }
 S{ env = "MEMO_SUMMARIZER_MODEL", key = "summarizer_model", type = "string", group = "summarizer",
@@ -169,8 +176,8 @@ S{ env = "MEMO_SUMMARIZER_HEADERS", key = "summarizer_headers", type = "json", d
 S{ env = "MEMO_SUMMARIZER_TIMEOUT_MS", key = "summarizer_timeout_ms", type = "integer", default = 60000,
    min = 1, group = "summarizer", doc = "Timeout of one summarizer request (ms)." }
 S{ env = "MEMO_SUMMARIZER_INTERVAL_SECONDS", key = "summarizer_interval_seconds", type = "integer",
-   default = 0, min = 0, group = "summarizer",
-   doc = "Summarize automatically (alongside the writes' maintenance) at most this often; 0: only on demand." }
+   default = 86400, min = 0, group = "summarizer",
+   doc = "Summarize automatically — one batch, in the background, started by a write — at most this often per scope (a day); 0: only on demand. What is folded is archived and reviewed, not deleted. Only with the in-process model (or none): a remote summarizer is never used in the background." }
 S{ env = "MEMO_SUMMARIZER_WEIGHT_THRESHOLD", key = "summarizer_weight_threshold", type = "number",
    default = 0.5, min = 0, group = "summarizer",
    doc = "Memories weighing less than this (importance × decay) are summarized …" }
@@ -182,38 +189,70 @@ S{ env = "MEMO_SUMMARIZER_MAX_BATCHES", key = "summarizer_max_batches", type = "
    min = 1, group = "summarizer", doc = "Summaries per run (a cost cap)." }
 
 -- ── maintenance ─────────────────────────────────────────────────────────────
-S{ env = "MEMO_AUTO_DIGEST_ENABLED", key = "auto_digest_enabled", type = "boolean", default = false,
+S{ env = "MEMO_AUTO_DIGEST_ENABLED", key = "auto_digest_enabled", type = "boolean", default = true,
    group = "maintenance", aliases = { "MEMO_AUTO_DIGEST" },
-   doc = "Writes keep memory maintained: tiers, consolidation, decay." }
+   doc = "Writes keep memory maintained — tiers, consolidation, decay, the review of folded memories — by starting the digest in the background when it is due (MEMO_AUTO_DIGEST_INTERVAL)." }
 S{ env = "MEMO_AUTO_DIGEST_INTERVAL", key = "auto_digest_interval", type = "integer", default = 3600, min = 0,
    group = "maintenance", doc = "At most one automatic maintenance per scope per this many seconds." }
 S{ env = "MEMO_DIGEST_PROMOTE_TIER2_AT", key = "digest_promote_tier2_at", type = "integer", default = 3,
-   min = 1, group = "maintenance", doc = "Times a memory is proven useful before it moves to tier 2." }
+   min = 1, group = "maintenance", doc = "How many memories (proof) an observation needs, and not be stale, before the tier-1 memories it holds move to tier 2." }
 S{ env = "MEMO_DIGEST_PROMOTE_TIER3_AT", key = "digest_promote_tier3_at", type = "integer", default = 5,
-   min = 1, group = "maintenance", doc = "Times a mistake recurs before its memory moves to tier 3 (core)." }
-S{ env = "MEMO_DIGEST_GRACE_DAYS", key = "digest_grace_days", type = "integer", default = 7, min = 0,
-   group = "maintenance", doc = "Days an ephemeral (tier 0) memory is kept once consolidated." }
+   min = 1, group = "maintenance", doc = "Times a mistake recurs (a mistake, or a direct command) before its tier-2 memory moves to tier 3 (core); never on an organization's shared scope." }
+S{ env = "MEMO_MAINTENANCE_BACKGROUND", key = "maintenance_background", type = "boolean", default = true,
+   group = "maintenance",
+   doc = "The digest, scheduled summaries and the review of folded memories run in a separate background process (memo maintain), silent, started by the write that makes them due (and, for a review that is due or the usage log's prune, by the session brief, once a day). false: inside that write (a language model can stall it for a minute); the brief then starts nothing." }
+S{ env = "MEMO_FOLD_GRACE_DAYS", key = "fold_grace_days", type = "integer", default = 30, min = 0,
+   group = "maintenance",
+   doc = "Days a memory folded into a summary or an observation is kept, hidden, before it is reviewed. Review: delete it if it was not shown useful or its facts are in the summary; correct the summary (and wait again) if not; restore it if what it was folded into is gone (raw conversation folded by the digest excepted: deleted unless it was ever useful). A deletion is recorded in the maintenance log first, and not made if that cannot be written." }
+S{ env = "MEMO_FOLD_MAX_REVIEWS", key = "fold_max_reviews", type = "integer", default = 2, min = 0,
+   group = "maintenance",
+   doc = "Corrections of the summary one folded memory may cause; past this it is restored instead of deleted." }
+S{ env = "MEMO_FOLD_MIN_COVERAGE", key = "fold_min_coverage", type = "number", default = 0.6, min = 0, max = 1,
+   group = "maintenance",
+   doc = "Share of a folded memory's concrete tokens (numbers, identifiers, file names) its summary must keep, if the memory was ever useful, for it to be deleted." }
+S{ env = "MEMO_FOLD_USEFUL_OFFERS", key = "fold_useful_offers", type = "integer", default = 3, min = 1,
+   group = "maintenance",
+   doc = "Searches that offered a folded memory (the usage log) after which it counts as shown useful, besides any praise or direct command." }
+S{ env = "MEMO_DIGEST_GRACE_DAYS", key = "digest_grace_days", type = "integer", min = 0,
+   implied = function(cfg) return M.number(cfg, "fold_grace_days") end, group = "maintenance",
+   doc = "Days an ephemeral (tier 0) memory is kept once consolidated, before its review (unset: MEMO_FOLD_GRACE_DAYS)." }
 S{ env = "MEMO_DIGEST_ESCALATE_ALPHA", key = "digest_escalate_alpha", type = "number", default = 0.4,
-   min = 0, max = 1, group = "maintenance", doc = "How fast a recurring mistake's importance grows." }
+   min = 0, max = 1, group = "maintenance", doc = "How fast recurring mistakes escalate a memory in the digest. The more mistakes (a mistake, or a direct command) behind a group of not-yet-digested tier-0 notes that no observation matches (see MEMO_CONSOLIDATE_REINFORCE_THRESHOLD), the higher the digest lifts its best note: at 0.4 tier 1 after 2 mistakes, tier 2 after 4, tier 3 after 15 (an organization's shared scope stops at tier 2), and its importance up to a matching value between 0 and 1 if that is higher. The higher this number, the fewer mistakes each step takes. Moving an existing tier-2 memory to tier 3 is MEMO_DIGEST_PROMOTE_TIER3_AT." }
 S{ env = "MEMO_DIGEST_IDLE_SECONDS", key = "digest_idle_seconds", type = "integer", default = 1800, min = 0,
-   group = "maintenance", doc = "A scope without writes for this long is due for a digest." }
-S{ env = "MEMO_CONSOLIDATE_THRESHOLD", key = "consolidate_threshold", type = "number", default = 0.80, min = 0,
-   max = 1, group = "maintenance", doc = "Similarity at which memories are grouped into an observation." }
+   group = "maintenance", doc = "Not used any more (0.5.2): the digest runs from a write, at most once per MEMO_AUTO_DIGEST_INTERVAL, and from memo maintain — never because a scope has gone quiet. Kept so a config that sets it still loads." }
+S{ env = "MEMO_CONSOLIDATE_THRESHOLD", key = "consolidate_threshold", type = "number", min = 0, max = 1,
+   implied = function(cfg) return M.same_memory(cfg) end, group = "maintenance",
+   doc = "Similarity at which memories are grouped into an observation, and at which memo consolidate treats two as duplicates (unset: the dedup threshold). The digest groups its tier-0 notes at it too: which group is escalated for its mistakes, which notes are archived together (memo digest --threshold overrides that grouping only)." }
+S{ env = "MEMO_CONSOLIDATE_MAX_GROUP", key = "consolidate_max_group", type = "integer", default = 8, min = 0,
+   group = "maintenance",
+   doc = "memo consolidate never merges a group of near-duplicates larger than this (a long chain of similar memories is not one memory); it is only reported. 0: no limit." }
 S{ env = "MEMO_CONSOLIDATE_REINFORCE_THRESHOLD", key = "consolidate_reinforce_threshold", type = "number",
-   default = 0.75, min = 0, max = 1, group = "maintenance",
-   doc = "Similarity at which a group reinforces an existing observation." }
+   min = 0, max = 1, implied = function(cfg) return M.same_memory(cfg) end, group = "maintenance",
+   doc = "Similarity at which a group reinforces an existing observation — and so, in the digest, is not escalated for its mistakes but reinforced into it (unset: the dedup threshold; measured, 0.75 matched 99.5 % of unrelated memories)." }
 S{ env = "MEMO_CONSOLIDATE_LOG_ERRORS", key = "consolidate_log_errors", type = "boolean", default = false,
-   group = "maintenance", doc = "Report the observations that failed to build in the consolidation result." }
+   group = "maintenance", doc = "Report, in the consolidation's result (and the digest's errors), a summarizer that failed for a cluster: its observation then falls back to the best member's text." }
 S{ env = "MEMO_CORPUS_HEALTH_CHECK", key = "corpus_health_check", type = "boolean", default = false,
    group = "maintenance", doc = "Print memo doctor's corpus warnings (truncation) at startup." }
 
 -- ── learning from use ───────────────────────────────────────────────────────
+S{ env = "MEMO_LEARN_AUTO", key = "learn_auto", type = "boolean", default = true, group = "learning",
+   doc = "memo maintain trains each scope's learned reranker when it is due (MEMO_LEARN_INTERVAL_DAYS) and enough of the usage log has accumulated; the gate promotes a model only if it beats the current ranking on held-out data. Only where MEMO_RERANK_ADAPTER is learned and MEMO_FEEDBACK_ENABLED is on." }
+S{ env = "MEMO_LEARN_INTERVAL_DAYS", key = "learn_interval_days", type = "integer", default = 7, min = 0, group = "learning",
+   doc = "At most one training attempt per scope per this many days." }
+S{ env = "MEMO_SENSE_CAPTURE", key = "sense_capture", type = "boolean", default = true, group = "learning",
+   doc = "memo sense / memory_sense also stores a standing rule the user states (a sentence that opens with always, never, from now on, make sure, remember to, you must …; a short turn, no question) as a decision memory when no memory already holds it — so a rule given in conversation is not lost for want of a memory to attach it to. The memory holds the rule and, for context, the first 300 characters of what the assistant had just said. memory_brief lists what was captured; memory_delete removes a wrong one." }
+S{ env = "MEMO_SENSE_CAPTURE_SIMILARITY", key = "sense_capture_similarity", type = "number", default = 0.6, min = 0, max = 1,
+   group = "learning",
+   doc = "How close an existing memory must be to a stated rule for it to count as already holding it (the rule is then not stored again)." }
 S{ env = "MEMO_FEEDBACK_ENABLED", key = "feedback_enabled", type = "boolean", default = false,
-   group = "learning", doc = "Log searches and detect missed memories (what the learned reranker trains on)." }
-S{ env = "MEMO_MISS_THRESHOLD", key = "miss_threshold", type = "number", default = 0.90, min = 0, max = 1,
-   group = "learning", doc = "Similarity at which a new write reveals a memory a search missed." }
+   group = "learning", doc = "Log every search (its text, the scope and the ids it returned, in this database; the ones that found nothing too) and detect missed memories. It is what the learned reranker trains on and what memo usage reads. Off by default because it keeps what was asked; older searches are removed (MEMO_FEEDBACK_RETENTION_DAYS says when, and what stays). If the project has joined an organization that shares more than signals, the queries go there too." }
+S{ env = "MEMO_FEEDBACK_RETENTION_DAYS", key = "feedback_retention_days", type = "integer", default = 90, min = 0, group = "learning",
+   doc = "How long the usage log keeps a search, in days (0: forever). Past it, the newest 20 searches (per scope) that offered each memory with a recorded reinforcement (praise, direct command, mistake, reversal or miss) stay — that is what the learned reranker trains on — and so does a row adopted from an organization. A folded memory counts as shown useful (MEMO_FOLD_USEFUL_OFFERS) only by the searches still in the log: keep this above the longer of MEMO_FOLD_GRACE_DAYS and MEMO_DIGEST_GRACE_DAYS." }
+S{ env = "MEMO_MISS_THRESHOLD", key = "miss_threshold", type = "number", min = 0, max = 1,
+   implied = function(cfg) return M.same_memory(cfg) end, group = "learning",
+   doc = "Similarity at which a new write reveals a memory a search missed (unset: the dedup threshold — one definition of \"the same memory\")." }
 S{ env = "MEMO_GEN_MODEL", key = "gen_model", type = "string", group = "learning",
-   doc = "GGUF instruct model for memo sense --generative." }
+   doc = "GGUF instruct model, in-process, for every generative feature: memo sense --generative, the scheduled summaries (MEMO_SUMMARIZER_ADAPTER=auto), consolidate's merge and the wording of the digest's observations." }
 S{ env = "MEMO_GEN_NCTX", key = "gen_n_ctx", type = "integer", implied = 4096, min = 1, group = "learning",
    doc = "Context size of the generative model." }
 S{ env = "MEMO_GEN_NGL", key = "gen_n_gpu", type = "integer", implied = 0, min = -1, group = "learning",
@@ -287,6 +326,9 @@ M.OTHER_VARS = {
         .. "(default luamemo/rerank_weights.json, relative to the working directory).",
     MEMO_PROJECTION_W = "The projected embedder's weights file (default luamemo/projection_W.json, relative to the "
         .. "working directory).",
+    MEMO_NO_MAINTENANCE = "1: luamemo never starts its background maintenance process (memo maintain) — "
+        .. "`memo eval` and the test runner set it, so a scratch database does not grow a process of its own; set it "
+        .. "yourself when you run a benchmark runner directly.",
     MEMO_TEST_TMP = true, MEMO_API_CMD = true,
 }
 
@@ -321,6 +363,35 @@ function M.defaults()
         if e.key and e.default ~= nil then cfg[e.key] = copy(e.default) end
     end
     return cfg
+end
+
+--- The similarity at which two texts count as THE SAME MEMORY: the dedup threshold. Everything that asks that
+--- question — a duplicate write, a miss, a group to merge, an observation to reinforce — takes it from here
+--- unless its own setting (`key`, e.g. "miss_threshold") is set, so changing the one changes them all.
+function M.same_memory(cfg, key)
+    cfg = cfg or {}
+    local own = key and tonumber(cfg[key])
+    if own then return own end
+    local dedup = tonumber(cfg.dedup_threshold)
+    if dedup then return dedup end
+    return BY.MEMO_DEDUP_THRESHOLD.default
+end
+
+--- A setting by its config key: cfg's, else the setting's own default — for a module that is handed a hand-built
+--- cfg (a test, a tool); a configured luamemo already holds every default.
+function M.value(cfg, key)
+    local v = cfg and cfg[key]
+    if v ~= nil and v ~= false then return v end
+    local e = M.get(key)
+    return e and M.implied(e, cfg) or nil
+end
+
+--- The same, as a number (cfg's value, a numeric string, or the default) → number | nil
+function M.number(cfg, key)
+    local v = tonumber(cfg and cfg[key])
+    if v ~= nil then return v end
+    local e = M.get(key)
+    return e and tonumber(M.implied(e, cfg)) or nil
 end
 
 --- The value in force when the setting is unset (its default, or what the module applies).
@@ -532,7 +603,10 @@ end
 
 --- One line about an unknown name (from M.unknown).
 function M.unknown_message(u)
-    if u.retired then return ("%s is no longer read: %s"):format(u.name, u.retired) end
+    if u.retired then
+        return ("%s is no longer read: %s — memo config unset %s removes it from a .luamemorc"):format(u.name,
+            u.retired, u.name)
+    end
     return ("%s is not a luamemo setting%s"):format(u.name,
         u.suggestion and (" — did you mean " .. u.suggestion .. "?") or " (memo config list shows them all)")
 end

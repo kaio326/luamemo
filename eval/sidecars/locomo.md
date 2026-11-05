@@ -4,8 +4,11 @@ LoCoMo (Maharana et al., 2024) is a public conversational-memory
 benchmark with very long, multi-session conversations and per-row QA
 pairs categorised as single-hop, multi-hop, temporal, open-domain, and
 adversarial. Live numbers are gated on a download; the loader, runner,
-and smoke test are shipped without it (see Phase 16.6a in
-`.github/upgrades-memory`).
+and smoke test are shipped without it.
+
+From a release install, `memo eval fetch locomo` downloads the corpus (size and
+sha256 checked) into `~/.local/share/luamemo/eval-data` and `memo eval run locomo`
+runs it. The steps below are for a checkout, and for running one runner by hand.
 
 ## Provenance & licence
 
@@ -85,7 +88,7 @@ Live, after download — hash baseline (`MEMO_DB`: a scratch database; the run
 wipes its own scopes):
 
 ```bash
-MEMO_DB=bench luajit eval/locomo_run.lua --embedder hash \
+MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/locomo_run.lua --embedder hash \
   --out eval/results/locomo_hash.json
 ```
 
@@ -93,7 +96,7 @@ Live, ollama (`nomic-embed-text`, 768d):
 
 ```bash
 ollama pull nomic-embed-text
-MEMO_DB=bench OLLAMA_URL=http://127.0.0.1:11434/api/embeddings \
+MEMO_NO_MAINTENANCE=1 MEMO_DB=bench OLLAMA_URL=http://127.0.0.1:11434/api/embeddings \
   OLLAMA_MODEL=nomic-embed-text OLLAMA_DIM=768 \
   luajit eval/locomo_run.lua --embedder ollama \
   --out eval/results/locomo_ollama.json
@@ -111,7 +114,8 @@ Promote a configuration (e.g. swap default embedder) only when:
 1. R@10 on LoCoMo `overall` ≥ current default + 3 pp, AND
 2. ConvoMem `overall` agrees within ±2 pp on the same delta, AND
 3. No category bucket regresses by > 5 pp R@10, AND
-4. The CI guard (`eval/recall_bench.lua --mode ci`) stays green.
+4. `MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/recall_bench.lua --mode ci`
+   still passes (run by hand — no workflow runs it).
 
 Otherwise the run is recorded in `eval/results/locomo.md` but the
 default stays unchanged.

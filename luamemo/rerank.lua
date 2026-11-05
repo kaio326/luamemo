@@ -36,6 +36,24 @@ local util            = require("luamemo.util")
 local cfg             = nil
 local _adapter_cache  = {}   -- [name] -> module; avoids repeated pcall+validation
 
+-- What reranking cost this process: per call, its wall time (ms) and — when the adapter
+-- reports them (ollama: the prompt + generated tokens) — the model's tokens. The
+-- benchmarks read it (stats) to set the reranker's cost against what it changes.
+-- A failed call is counted too: the search then keeps the baseline order, silently.
+local _calls = { ms = {}, tokens = {}, failed = 0 }
+function M.record_call(ms, tokens, failed)
+    _calls.ms[#_calls.ms + 1] = ms
+    if tokens then _calls.tokens[#_calls.tokens + 1] = tokens end
+    if failed then _calls.failed = _calls.failed + 1 end
+end
+--- { ms = { … }, tokens = { … }, failed = n } of every rerank call so far (reset = true:
+--- start again).
+function M.stats(reset)
+    local s = _calls
+    if reset then _calls = { ms = {}, tokens = {}, failed = 0 } end
+    return s
+end
+
 function M.configure(config)
     cfg = config
 end
@@ -99,7 +117,9 @@ function M.rerank(query, hits, opts)
     local adapter, aerr = load_adapter(view.rerank_adapter)
     if not adapter then return nil, aerr end
 
-    local scored, err = adapter.rerank(query, pool, view)
+    local t0 = util.now_us()
+    local scored, err, info = adapter.rerank(query, pool, view)
+    M.record_call((util.now_us() - t0) / 1000, type(info) == "table" and info.tokens or nil, not scored)
     if not scored then return nil, err end
     if type(scored) ~= "table" then
         return nil, "rerank: adapter returned non-table"

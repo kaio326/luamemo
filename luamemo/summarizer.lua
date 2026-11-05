@@ -1,14 +1,19 @@
 -- luamemo.summarizer
 --
 -- Orchestrator: selects candidate memories, dispatches them to the
--- configured summarizer adapter, and replaces the originals with one
--- summary row per batch. Used by the `memo summarize` CLI, the digest and
--- the federation aggregate / adopt paths.
+-- configured summarizer adapter, and archives the originals behind one summary
+-- row per batch (luamemo.fold reviews them after the grace period) — for
+-- memory_summarize / `memo summarize` and `memo consolidate`; memory_promote
+-- keeps its sources, or deletes them outright with delete_source (no archive,
+-- no review). All used through luamemo/ops.lua, and by the background
+-- `memo maintain` (luamemo.maintenance, through `claim` and `run`).
 
-local store  = require("luamemo.store")
-local util   = require("luamemo.util")
-local db     = require("luamemo.db")
-local policy = require("luamemo.federation.policy")
+local store    = require("luamemo.store")
+local util     = require("luamemo.util")
+local db       = require("luamemo.db")
+local policy   = require("luamemo.federation.policy")
+local settings = require("luamemo.settings")
+local maintenance = require("luamemo.maintenance")   -- (it requires this module only inside its functions: no cycle)
 
 local M = {}
 
@@ -35,7 +40,7 @@ function M.run(opts)
                  errors = { "summarizer: not configured" } }
     end
 
-    local adapter, aerr = load_adapter(cfg.summarizer_adapter)
+    local adapter, aerr = load_adapter(require("luamemo.summarizers._common").adapter_name(cfg))
     if not adapter then
         return { batches = 0, summarised = 0, replaced_ids = {},
                  errors = { aerr } }
@@ -93,23 +98,13 @@ function M.run(opts)
     return result
 end
 
--- Lazy, debounced summarization on writes (MEMO_SUMMARIZER_INTERVAL_SECONDS > 0): at
--- most one run per scope per interval, the slot claimed atomically in
--- lm_summarize_state (the digest's pattern — survives stateless CLI calls; a race
--- can't run it twice). Fail-soft: the run's result, or false when not due.
-local _running = false
-function M.maybe_run(scope)
-    local interval = math.floor(tonumber(cfg and cfg.summarizer_interval_seconds) or 0)
-    if interval <= 0 or _running or not scope or scope == "" or policy.replica(scope) then return false end
-    local now = util.now_us()
-    local claim = db.first("INSERT INTO lm_summarize_state (scope, last_summarized_at) VALUES (?, ?) "
-        .. "ON CONFLICT (scope) DO UPDATE SET last_summarized_at = excluded.last_summarized_at "
-        .. "WHERE lm_summarize_state.last_summarized_at <= ? RETURNING scope", scope, now, now - interval * 1000000)
-    if not claim then return false end
-    _running = true
-    local ok, res = pcall(M.run, { scope = scope })
-    _running = false
-    return ok and res or false
+--- Claim the scope's scheduled-summary slot (MEMO_SUMMARIZER_INTERVAL_SECONDS > 0) if it is due → true when this
+--- caller won it. At most one run per scope per interval, the slot in lm_summarize_state (the digest's pattern —
+--- survives stateless CLI calls; a race can't run it twice). The batch is summarized beside the agent, not inside
+--- the write: luamemo.maintenance.after_write starts a background `memo maintain`.
+function M.claim(scope)
+    if (settings.number(cfg, "summarizer_interval_seconds") or 0) <= 0 or policy.maintenance_skip(scope) then return false end
+    return maintenance.claim_slot("summarize", scope)
 end
 
 -- ---------------------------------------------------------------------------
@@ -156,7 +151,7 @@ function M.promote(opts)
         end
     end
 
-    local adapter, aerr = load_adapter(cfg and cfg.summarizer_adapter)
+    local adapter, aerr = load_adapter(require("luamemo.summarizers._common").adapter_name(cfg))
     if not adapter then
         return { promoted = 0, errors = { aerr } }
     end
@@ -216,6 +211,7 @@ function M.promote(opts)
         decay_rate     = sum.decay_rate or 0.0,
         -- Promoted summaries are first-class; never let dedup collapse them.
         dedup_strategy = "append",
+        no_miss        = true,   -- luamemo's own write: not a search that missed
     }
 
     local row
@@ -224,14 +220,10 @@ function M.promote(opts)
         local werr
         row, werr = store.write(insert_args)
         if not row then error("promote: insert failed: " .. tostring(werr), 0) end
-        local ids = {}
-        for _, id in ipairs(source_ids) do
-            if tonumber(id) then ids[#ids + 1] = math.floor(tonumber(id)) end
-        end
+        local ids = util.ints(source_ids)
         if opts.delete_source and #ids > 0 then
-            local excl = policy.maintenance_exclusion_sql()
             local dn, derr = h.run("DELETE FROM " .. store.table_name() .. " WHERE id IN ("
-                .. db.placeholders(#ids) .. ")" .. (excl and (" AND " .. excl) or ""), unpack(ids, 1, #ids))
+                .. db.placeholders(#ids) .. ")" .. policy.and_exclusion(), unpack(ids, 1, #ids))
             if not dn then error("promote: delete failed: " .. tostring(derr), 0) end
             deleted = true
         end
@@ -260,7 +252,8 @@ end
 --              cluster report even on dry_run (read-only diagnosis).
 --   Phase 3 — Merge clusters: if summarizer adapter ≠ "noop" and dry_run is
 --              false, call adapter.summarize() per cluster, write the merged
---              memory, delete the originals via replace_with_summary().
+--              memory, archive the originals via replace_with_summary()
+--              (luamemo.fold reviews them after the grace period).
 --
 -- max_rows caps the working set to bound pairwise clustering cost (O(N²)).
 -- At max_rows = 500 the worst case is 125 000 pairwise comparisons —
@@ -268,8 +261,9 @@ end
 -- is not recommended without a smarter clustering algorithm (e.g. mini-batch
 -- k-means or LSH-based candidate generation — see Plan 5 in copilot-planer.md).
 --
--- @param opts table  scope, dry_run, similarity_threshold, decay_threshold,
---                    max_rows
+-- @param opts table  scope (none: every scope, each grouped on its own — a cluster never
+--                    mixes scopes), dry_run, similarity_threshold, decay_threshold,
+--                    max_rows (in total, highest importance first, not per scope)
 -- @return table  { expired={ids}, clusters=[{ids,titles}],
 --                  merged={old_ids}, new_ids={new_ids}, errors={...} }
 -- ---------------------------------------------------------------------------
@@ -307,12 +301,20 @@ function M.consolidate(opts)
         return result
     end
 
+    -- A group is a set of memories linked one to the next by similarity (union-find), so a long chain of
+    -- related-but-different memories is one "group" however far its ends are apart. Past `max_group` it is
+    -- not a duplicate of anything: it is reported (too_large) and never merged. 0 lifts the limit.
+    local max_group = settings.number(cfg, "consolidate_max_group")
+    result.too_large = 0
+    local mergeable = {}
     for _, c in ipairs(clusters) do
-        table.insert(result.clusters, { ids = c.ids, titles = c.titles })
+        local big = max_group > 0 and #c.ids > max_group
+        if big then result.too_large = result.too_large + 1 else mergeable[#mergeable + 1] = c end
+        table.insert(result.clusters, { ids = c.ids, titles = c.titles, too_large = big or nil })
     end
 
     -- Phase 3: merge clusters via adapter (skip when noop or dry_run).
-    local adapter_name = cfg.summarizer_adapter or "noop"
+    local adapter_name = require("luamemo.summarizers._common").adapter_name(cfg)
     if not dry_run and adapter_name ~= "noop" then
         local adapter, aerr = load_adapter(adapter_name)
         if not adapter then
@@ -320,7 +322,7 @@ function M.consolidate(opts)
             return result
         end
 
-        for _, c in ipairs(clusters) do
+        for _, c in ipairs(mergeable) do   -- (a chain past the limit was only reported)
             local sum, serr = adapter.summarize(c.members, cfg)
             if not sum then
                 table.insert(result.errors,

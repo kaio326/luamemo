@@ -40,7 +40,8 @@
 #                   [--metadata JSON] [--importance F] [--decay-rate F]
 #
 #   memo delete     ID | --scope SCOPE [--kind KIND] [--meta JSON] [--yes]
-#                   (by filter: how many match and a few titles; --yes deletes them —
+#                   (by ID: the answer carries a "warning" when the observations made from it could not
+#                    be removed. By filter: how many match and a few titles; --yes deletes them —
 #                    an org replica / org directives are never matched)
 #
 #   memo context    QUERY [--scope SCOPE] [--limit N] [--no-kg] [--format text|json]
@@ -72,12 +73,25 @@
 #
 #   memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
 #                    [--decay-threshold F] [--max-rows N]
-#                    (cluster related memories into observations)
+#                    (expire decayed memories; merge each group of near-duplicates into one
+#                     summary — the originals are archived, then reviewed. With no --scope
+#                     it works over EVERY scope, each grouped on its own — a group never mixes
+#                     scopes — and --max-rows counts the rows examined in total)
 #
 #   memo digest     [--scope SCOPE] [--dry-run] [--threshold F]
-#                   (hippocampus digest: promote tiers, delete stale ephemeral rows)
+#                   (hippocampus digest: promote tiers, archive and review the ephemeral rows it folded;
+#                   --threshold F: the cosine at which it groups its tier-0 notes — default MEMO_CONSOLIDATE_THRESHOLD;
+#                   observations are still made at that setting)
 #
-#   memo sense      --scope SCOPE [--generative] [--min-similarity F]
+#   memo agent      install [--with-transcripts | --no-transcripts] [--dry-run] [--no-notes] [--force]
+#                   | uninstall | status
+#                   | import-notes [--dir PATH] [--dry-run]
+#                   (Claude Code: hooks in ~/.claude/settings.json — the brief at session start,
+#                    what you say reaches memory, no file memory in a luamemo project — a luamemo
+#                    block in ~/.claude/CLAUDE.md, the project's Claude memory notes moved into
+#                    luamemo; memo calibrate does it, memo agent --help)
+#
+#   memo sense     --scope SCOPE [--generative] [--min-similarity F]
 #                   (stdin: JSON array of {role,text} turns → record reinforcements)
 #
 #   memo learn      <scope> [--dry-run] [--min-samples N] [--margin F]
@@ -115,10 +129,11 @@
 #                   (dev: read-only org replica, feedback push + filtered knowledge
 #                   proposals — needs MEMO_ORG_URL, MEMO_ORG_FINGERPRINT; also refreshed
 #                   on session start / org search)
-#   memo org        status | devs [pending|list|approve CODE|remove REF]
-#                   | review [list|show ID|approve ID [--supersedes ORGID]|approve --top N
+#   memo org        status | probe | pair [--wait N]
+#                   | devs [pending|list|approve CODE|remove REF|clear-pending]
+#                   | review [list [--status S]|show ID|approve ID [--supersedes ORGID]|approve --top N
 #                   |reject ID [--reason T]|remove ORGID]
-#                   | directives <path> [--source N] [--project P] [--dry-run] [--no-prune]
+#                   | directives <path> [--source N] [--project P] [--dry-run] [--no-prune] [--allow-empty]
 #                   | aggregate [--dry-run] [--min-samples N]
 #                   (org central: device pairing; devs' knowledge proposals; Markdown
 #                   standards → protected core tier; digest + directives-gated
@@ -129,8 +144,9 @@
 #                   encrypted, key-authenticated — needs MEMO_ROLE=org, MEMO_ORG_NAME)
 #
 #   memo index      ingest [--root .] [--scope codeindex:proj] [--extensions csv|*]
-#                          [--no-symbols] [--embed-file-rows] [--exclude a,b] [--no-gitignore]
-#                          [--dry-run]   (--exclude adds to .git,vendor/,node_modules/;
+#                          [--no-symbols] [--no-ctags] [--embed-file-rows] [--exclude a,b]
+#                          [--no-gitignore] [--project NAME] [--dry-run]
+#                          (--exclude adds to .git,vendor/,node_modules/;
 #                          gitignored + credential files are skipped)
 #                   update [--root .] [--scope codeindex:proj]  (same scan flags as ingest)
 #                   search  <query>  [--scope codeindex:proj] [--kind symbol] [--limit N]
@@ -143,14 +159,16 @@
 #
 #   memo calibrate  [--scope SCOPE] [--root DIR] [--db NAME|PATH] [--no-git]
 #                   [--no-comments] [--probe-only] [--multilingual] [--long]
-#                   [--allow-hash] [--write PATH] [--no-mcp]
-#                   [--no-plugin] [--dry-run] [--keep-embedder] [--no-gguf]
-#                   [-h|--help]
+#                   [--allow-hash] [--no-mcp] [--no-plugin] [--no-agent]
+#                   [--dry-run] [--keep-embedder] [--no-gguf]
+#                   [--role solo|dev|org] [--org-url URL] [--org-fingerprint FP]
+#                   [--org-name NAME] [-h|--help]
 #                   (probe host + recommend embedder + the project's database +
 #                    ingest codebase)
 #                   --db: use this database (default: the project's own)
-#                   --keep-embedder: skip probe-and-persist, preserve existing
-#                   embedder config in .luamemorc
+#                   --keep-embedder: keep the embedder settings already in
+#                   .luamemorc (the probe still runs)
+#                   --no-agent: skip the Claude Code integration (see memo agent)
 #                   --no-gguf: never pick / suggest the in-process GGUF embedder
 #                   (gguf_ffi is only picked once a live test embedding succeeds)
 #                   --no-plugin: skip VS Code agent plugin install
@@ -174,6 +192,34 @@
 #                    loads; install downloads this release's prebuilt one for this machine,
 #                    checked against the checksum the install ships)
 #
+#   memo eval       status [--json] | install [--from CHECKOUT] | fetch NAME… [--yes]
+#                   | run [BENCH…] [--tier quick|standard|full|corpus] [--embedder E[,E…]] [--n N]
+#                   [--rerank R] [--prompts auto] [--out DIR] [--data DIR] [--keep-db] [--no-smoke]
+#                   | history [BENCH…] [--embedder LABEL[,LABEL…]] [--json]
+#                   | build-corpus [--stage …] [--out bench-NAME.db] …
+#                   (the retrieval benchmarks on this machine — R@k, MRR, miss rate, bytes
+#                    to the right memory; the eval kit is an optional, checksum-checked
+#                    download; the runners use a scratch database; the last 3 results of
+#                    each are kept in the project's memory, scope eval:<project>)
+#
+#   memo usage      [--scope SCOPE] [--days N] [--gap SECONDS] [--json]
+#                   (what the usage log says about real use — searches, follow-ups within a
+#                    couple of minutes, empty results, what was said afterwards, where a
+#                    memory confirmed useful stood; needs MEMO_FEEDBACK_ENABLED=true; reads only)
+#
+#   memo maintain   [--scope S] [--all] [--digest] [--summarize] [--review] [--learn] [--quiet]
+#                   [--max-seconds N]
+#                   (the maintenance that runs beside the agent — the digest, one batch of
+#                    summarizing, the review of folded memories whose grace period is over, the
+#                    learned reranker's training. A write that makes it due starts it in the
+#                    background, silent (so does the session brief, once a day, for a review
+#                    that is due or the usage log's prune); the result goes to
+#                    <database file>.maintenance.log.
+#                    Run by hand it prints a line per scope, and what went wrong.
+#                    --max-seconds N (default 900): no part is started after N seconds,
+#                    for the whole run however many scopes --all takes, and the review
+#                    stops there; N must be a positive number, else it is a usage error)
+#
 #   memo ping       [--db] [--table] [--embedder]   Health check: SQLite + libsodium
 #                   (versions, which copy), the database file, memories, embedder
 #                   (exit 0/1)
@@ -183,8 +229,9 @@
 #                   verification instructions for an AI agent. The file is
 #                   deleted automatically when `memo calibrate` succeeds.
 #
-#   memo doctor     [--json]
-#                   (corpus health: truncation counts, p95 row size)
+#   memo doctor
+#                   (health report: corpus truncation and row sizes, language model,
+#                    background maintenance, usage log, MCP clients, Claude Code hooks)
 #
 #   memo secret-store   NAME [--desc DESCRIPTION] [--file PATH]
 #   memo secret-list
@@ -356,8 +403,10 @@ if [[ ! -d "$_MEMO_PROJECT_DIR" ]]; then
     echo "memo: $_memo_project_from is not a directory: $_MEMO_PROJECT_DIR" >&2
     exit 2
 fi
-# The Lua side reads the same project (luamemo.settings.files, memo org link / adopt / leave).
+# The Lua side reads the same project (luamemo.settings.files, memo org link / adopt / leave) — and starts
+# `memo maintain` for it with this memo (luamemo.maintenance), whichever command the write came from.
 export MEMO__PROJECT_DIR="$_MEMO_PROJECT_DIR"
+export MEMO__BIN="$_MEMO_SELF"
 _MEMO_RC_UNTRUSTED=""
 # Re-read the project's .luamemorc (after memo changed it) — when memo may use it.
 _load_project_rc() {
@@ -862,7 +911,6 @@ require('luamemo.cli.api').dispatch('brief')" \
 
 # memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
 #                  [--decay-threshold F] [--max-rows N]
-# memo consolidate [--scope SCOPE] [--dry-run] [--similarity-threshold F]
 cmd_consolidate() {
     require_jq
     local json='{}'
@@ -905,7 +953,8 @@ cmd_digest() {
 # memo sense — record reinforcements from relayed conversation turns (Phase 9).
 # stdin: a JSON ARRAY of {role,text} turns (oldest first). The agent relays these
 # since luamemo can't read the chat. Heuristics always run; --generative also runs
-# the in-process instruct model (needs MEMO_GEN_MODEL + LuaJIT). Idempotent.
+# the in-process instruct model (needs MEMO_GEN_MODEL + LuaJIT). Idempotent. A standing
+# rule no memory holds is stored as a decision (MEMO_SENSE_CAPTURE): "captured" in the answer.
 cmd_sense() {
     require_jq
     local scope="${MEMO_SCOPE:-}"
@@ -1335,7 +1384,7 @@ SETUP_EOF
 # ---------------------------------------------------------------------------
 cmd_calibrate() {
     local root="$_MEMO_PROJECT_DIR" scope="" dry_run=false no_git=false no_comments=false probe_only=false
-    local no_mcp=false no_plugin=false keep_embedder=false db_flag=""
+    local no_mcp=false no_plugin=false no_agent=false keep_embedder=false db_flag=""
     local lua_extra_args=()
     local role="" org_url="" org_fingerprint="" org_name=""
 
@@ -1345,31 +1394,36 @@ cmd_calibrate() {
                 cat <<'EOF'
 Usage: memo calibrate [OPTIONS]
 
-Probe the environment, set up this project's database, configure luamemo, and
-write .vscode/mcp.json.
+Probe the environment, set up this project's database, configure luamemo, write
+the MCP client entries (VS Code, Cursor, Claude Desktop), and set up Claude Code.
 
 Options:
-  --scope SCOPE         Memory scope for calibration (default: repo:<basename>)
+  --scope SCOPE         Memory scope for calibration (default: $MEMO_SCOPE, else
+                        repo:<git remote name or directory name>)
   --root DIR            The project's directory (default: the nearest folder from
                         here up with a .luamemorc, else the current one) — DIR
                         becomes a project of its own
   --db NAME|PATH        The database to use (default: this project's own, a file
                         in ~/.local/share/luamemo named after the project)
-  --no-mcp              Skip writing .vscode/mcp.json
+  --no-mcp              Skip the MCP client configuration (VS Code, Cursor, Claude Desktop)
   --no-plugin           Skip installing the VS Code agent plugin
+  --no-agent            Skip the Claude Code integration (memo agent install: hooks in
+                        ~/.claude/settings.json, a luamemo block in ~/.claude/CLAUDE.md,
+                        the project's Claude memory notes moved into luamemo)
   --keep-embedder       Do not overwrite existing embedder config in .luamemorc
   --probe-only          Run host probe only; skip the database and codebase ingest
   --no-git              Skip git-history scan
   --no-comments         Skip code comment extraction
   --dry-run             Show what would be written without writing
-  --multilingual        Include non-Lua source files in scan
-  --long                Allow longer memory bodies
+  --multilingual        The content is not only English: favour a multilingual embedder
+                        in the recommendation
+  --long                Rows are long (over 4,000 characters): favour a long-context
+                        embedder in the recommendation
   --allow-hash          Allow hash embedder (normally skipped in calibrate)
   --no-gguf             Never pick / suggest the in-process GGUF embedder
-  --write PATH          Write scan output to a file instead of DB
   -h, --help            Show this help and exit
 
-Federation (optional — see README "Federation"):
+Federation (optional — see README "Team memory (federation)"):
   --org-url URL         Join an org central as a dev (local network / VPN only):
                         read-only org replica + feedback push. Creates this
                         device's key and asks the central to pair it — the org
@@ -1394,15 +1448,14 @@ EOF
             --dry-run)     dry_run=true;     shift   ;;
             --no-git)      no_git=true;      shift   ;;
             --no-comments) no_comments=true; shift   ;;
-            --probe-only)  probe_only=true;  shift   ;;
+            --probe-only)  probe_only=true;  lua_extra_args+=(--probe-only); shift ;;
             --db)          db_flag="$2";     shift 2 ;;
             --no-mcp)      no_mcp=true;      shift   ;;
             --no-plugin)   no_plugin=true;   shift   ;;
+            --no-agent)    no_agent=true;    shift   ;;
             --keep-embedder) keep_embedder=true; shift ;;
             --non-interactive|--multilingual|--long|--allow-hash|--no-gguf)
                 lua_extra_args+=("$1"); shift ;;
-            --write)
-                lua_extra_args+=(--write "$2"); shift 2 ;;
             --role)        role="$2";        shift 2 ;;
             --org-url)     org_url="$2";     shift 2 ;;
             --org-fingerprint) org_fingerprint="$2"; shift 2 ;;
@@ -1600,10 +1653,8 @@ EOF
         fi
         _save_rc_key_if_absent "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_EMBED_DIM" "$_probe_embed_dim"
         [[ -n "$_probe_emxc" ]] && _save_rc_key_if_absent "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_EMBED_MAX_CHARS"  "$_probe_emxc"
-        # Self-maintaining memory: a debounced digest piggybacks on writes so tier
-        # promotion / consolidation / decay run without any agent or scheduler
-        # having to call `memo digest`. Write-if-absent, so an explicit 0 is kept.
-        _save_rc_key_if_absent "$_MEMO_PROJECT_DIR/.luamemorc" "MEMO_AUTO_DIGEST" "1"
+        # (Self-maintaining memory — a debounced digest, in the background, on writes — is on by default now:
+        # calibrate no longer writes MEMO_AUTO_DIGEST=1 into the project, one default carries it for every project.)
     fi
     # Re-read the project config so every later phase runs with what was just
     # persisted: the codebase scan must embed with the chosen embedder at its
@@ -1726,6 +1777,11 @@ for _, l in ipairs(lines) do print('  ' .. (ok and '' or 'WARNING: ') .. l) end"
     # ── Phase 6: VS Code agent plugin install ────────────────────────────────
     if [[ "${no_plugin:-false}" != "true" ]]; then
         _calibrate_plugin_phase
+    fi
+
+    # ── Phase 7: Claude Code integration (hooks, CLAUDE.md, the project's memory notes) ──
+    if [[ "$no_agent" != true ]]; then
+        _calibrate_agent_phase "$dry_run"
     fi
 
     # ── Cleanup: remove SETUP_CHECK on successful first-run ──────────────────
@@ -1998,6 +2054,41 @@ _calibrate_mcp_phase() {
     echo ""
 }
 
+# memo agent …: luamemo.cli.agent — luamemo as the agent's memory in Claude Code (hooks in
+# ~/.claude/settings.json, a block in ~/.claude/CLAUDE.md, the project's memory notes moved
+# into luamemo). The shipped hooks/ are found beside the mcp/ directory memo runs.
+cmd_agent() {
+    local lua; lua=$(find_lua) || _no_lua
+    MEMO__HOOKS_DIR="$(_memo_hooks_dir)" _lua_run "$lua" agent "$@"
+}
+
+# The shipped hooks/ directory (beside mcp/ in a checkout and in a rock) | "" when not found.
+# memo agent and memo doctor both need it: doctor compares the installed copies with these.
+_memo_hooks_dir() {
+    local srv
+    if srv=$(_memo_server_path); then
+        (cd "$(dirname "$srv")/../hooks" 2>/dev/null && pwd) || true
+    fi
+}
+
+cmd_doctor() {
+    MEMO__HOOKS_DIR="$(_memo_hooks_dir)" cmd_local_lua doctor "$@"
+}
+
+# Phase 7 of calibrate: the Claude Code integration. Done without asking — it is what makes the
+# project's memory luamemo's rather than a file Claude Code keeps beside it — and said plainly;
+# `memo agent status` shows it, `memo agent uninstall` undoes it, --no-agent skips it. Without
+# Claude Code (no ~/.claude) it does nothing. Never makes calibrate fail.
+_calibrate_agent_phase() {
+    local dry="$1"
+    echo ""
+    echo "Claude Code integration"
+    echo "======================="
+    local extra=()
+    [[ "$dry" == true ]] && extra+=(--dry-run)
+    cmd_agent install --quiet ${extra[@]+"${extra[@]}"} || echo "  (the Claude Code integration failed — memo agent status; memo agent install to retry)"
+}
+
 # _memo_server_path → the absolute path of the mcp/server.lua that belongs with this
 # memo (exit 1 when none is found). In order:
 #   1. next to this script — a dev clone or the plugin (<root>/cli/memo → <root>/mcp);
@@ -2082,6 +2173,7 @@ EOF
     }
     # The settings are in the environment already (memo read the .luamemorc files):
     # the server doesn't read them a second time.
+    # (MEMO__BIN / MEMO__PROJECT_DIR, exported above, are how the server starts `memo maintain` — luamemo.maintenance)
     MEMO__SETTINGS_LOADED=1 exec "$lua" "$server"
 }
 
@@ -2156,7 +2248,8 @@ cmd_local_lua() {
     # exec: signals (e.g. SIGTERM to a `memo serve` daemon) reach Lua directly.
     # Consequence: this must be the LAST command of its caller — nothing after it
     # runs. Mid-function callers (e.g. calibrate) use _lua_run instead.
-    MEMO__ARGV="$(_lua_argv "$@")" MEMO__MODULE="$module" exec "$lua" -e "$_LUA_RUN"
+    # (MEMO__BIN: this memo — memo eval starts its MCP server, not another install's)
+    MEMO__ARGV="$(_lua_argv "$@")" MEMO__MODULE="$module" MEMO__BIN="$_MEMO_SELF" exec "$lua" -e "$_LUA_RUN"
 }
 
 # memo config …: luamemo.cli.config does the work; a setting it wrote into the
@@ -2208,12 +2301,16 @@ case "$sub" in
     secret-execute) cmd_secret_execute "$@" ;;
     config)  cmd_config "$@" ;;
     mcp)     cmd_mcp "$@" ;;
+    agent)   cmd_agent "$@" ;;
     gguf)    cmd_gguf "$@" ;;
     backup)  cmd_local_lua backup "$@" ;;
     export)  cmd_local_lua export "$@" ;;
     import)  cmd_local_lua import "$@" ;;
     serve)   cmd_local_lua serve "$@" ;;
     org)     cmd_local_lua org "$@" ;;
+    eval)    cmd_local_lua eval "$@" ;;
+    usage)   cmd_local_lua usage "$@" ;;
+    maintain) cmd_local_lua maintain "$@" ;;
     ping)
         # Show which config file named the database (MEMO_DB) so the user knows
         # which one is checked — critical when multiple projects are present.
@@ -2223,7 +2320,7 @@ case "$sub" in
             *)      echo "[INFO] config: environment" ;;
         esac
         cmd_local_lua ping "$@" ;;
-    doctor)  cmd_local_lua doctor "$@" ;;
+    doctor)  cmd_doctor "$@" ;;
     -h|--help|help) usage ;;
     *) echo "memo: unknown subcommand: $sub" >&2; usage ;;
 esac

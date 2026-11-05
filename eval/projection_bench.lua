@@ -16,9 +16,11 @@ local cjson   = require("luamemo.json")
 local hash    = require("luamemo.embedders.hash")
 local proj    = require("luamemo.projection_train")
 
-local DIM, K, EPOCHS, L2, LR, NEG = 128, 4, 30, 0.05, 0.05, 3
+local DIM, K, EPOCHS, L2, LR, NEG = nil, 4, 30, 0.05, 0.05, 3
+local EMBEDDER = "hash"
 do local i=1 while i<=#arg do local a=arg[i]
-    if a=="--dim" then DIM=tonumber(arg[i+1]); i=i+2
+    if a=="--embedder" then EMBEDDER=arg[i+1]; i=i+2
+    elseif a=="--dim" then DIM=tonumber(arg[i+1]); i=i+2
     elseif a=="--folds" then K=tonumber(arg[i+1]); i=i+2
     elseif a=="--epochs" then EPOCHS=tonumber(arg[i+1]); i=i+2
     elseif a=="--l2" then L2=tonumber(arg[i+1]); i=i+2
@@ -33,9 +35,20 @@ local corpus  = load_jsonl("eval/personalization/corpus.jsonl")
 local queries = load_jsonl("eval/personalization/queries.jsonl")
 
 -- precompute raw hash vectors
-for _,m in ipairs(corpus) do m.vec = hash.embed(m.body or "", { embed_dim=DIM }) end
+-- --embedder gguf: the in-process GGUF model (MEMO_GGUF_MODEL, else ~/models/EmbeddingGemma) at
+-- its full width by default (--dim N: its Matryoshka truncation); hash: 128.
+local embed = function(t) return hash.embed(t, { embed_dim=DIM }) end
+if EMBEDDER == "gguf" then
+    local g = require("luamemo.embedders.gguf_ffi")
+    local cfg = { embedder_model=os.getenv("MEMO_GGUF_MODEL") or (os.getenv("HOME").."/models/embeddinggemma-300M-Q8_0.gguf") }
+    DIM = DIM or g.dim(cfg)
+    cfg.embed_dim = DIM
+    embed = function(t) return assert(g.embed(t, cfg)) end
+end
+DIM = DIM or 128
+for _,m in ipairs(corpus) do m.vec = embed(m.body or "") end
 local idx_of={}; for i,m in ipairs(corpus) do idx_of[m.id]=i end
-for _,q in ipairs(queries) do q.vec = hash.embed(q.query, { embed_dim=DIM }); q.gold_idx = idx_of[q.gold_id] end
+for _,q in ipairs(queries) do q.vec = embed(q.query); q.gold_idx = idx_of[q.gold_id] end
 
 local function dot(a,b) local s=0; for i=1,#a do s=s+a[i]*b[i] end; return s end
 local function matvec(W,x) local d,m=W.dim,W.m; local y={}

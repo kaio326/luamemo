@@ -13,7 +13,7 @@ local shq, sh = util.shell_quote, util.sh
 M.REPO_URL = "https://github.com/kaio326/luamemo"
 -- The llama.cpp release the shim is built and tested against (eval/release/gguf_bundle.sh
 -- builds the prebuilt runtime from it; memo calibrate's build-from-source steps name it).
-M.LLAMA_TAG = "b9976"
+M.LLAMA_TAG = "b11829"
 
 --- "<os>-<arch>" of this machine (linux-x86_64, macos-arm64, …), or nil, why.
 function M.platform()
@@ -104,10 +104,14 @@ function M.install(version, opts)
 end
 
 --- Does the shim load here (in a separate luajit, so a crash can't take memo down)?
+--- → loads, stale (it loads but was built before luamemo 0.5.0: ffi_shim.stale).
 function M.loads(path)
-    local code = ("local ffi = require('ffi'); local ok = pcall(ffi.load, %q); io.write(ok and 'OK' or 'NO')")
-        :format(path)
-    return sh(("%s -e %s"):format(shq(os.getenv("MEMO_LUA") or "luajit"), shq(code))) == "OK"
+    local code = ("local ffi = require('ffi'); local ok, lib = pcall(ffi.load, %q); "
+        .. "if not ok then io.write('NO') return end; "
+        .. "ffi.cdef('int lmembed_last_truncated(void * handle);'); "
+        .. "io.write(pcall(function() return lib.lmembed_last_truncated end) and 'OK' or 'OLD')"):format(path)
+    local out = sh(("%s -e %s"):format(shq(os.getenv("MEMO_LUA") or "luajit"), shq(code)))
+    return out == "OK" or out == "OLD", out == "OLD"
 end
 
 return M

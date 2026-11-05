@@ -197,6 +197,11 @@ else
     check("overall R@5 = 1 (every target within k)", ov.r5 == 1, tostring(ov.r5))
     check("overall R@1 > 0", (ov.r1 or 0) > 0, tostring(ov.r1))
     check("overall MRR > 0", (ov.mrr or 0) > 0, tostring(ov.mrr))
+    -- eval/metrics.lua's figures beside the old keys; limit = min(k_max 5, 10).
+    check("overall carries miss_rate (0: every target within the limit) and limit 5",
+        ov.miss_rate == 0 and ov.limit == 5, tostring(ov.miss_rate) .. " " .. tostring(ov.limit))
+    check("overall carries bytes_to_hit (> 0, median ≤ p90)", (ov.bytes_to_hit_mean or 0) > 0
+        and (ov.bytes_to_hit_median or 0) <= (ov.bytes_to_hit_p90 or -1), tostring(ov.bytes_to_hit_mean))
 
     check("runner wrote one memory per turn (13) under the test prefix",
         scope_rows(PREFIX .. ":hash:%") == 13, "got " .. scope_rows(PREFIX .. ":hash:%"))

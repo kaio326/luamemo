@@ -46,7 +46,7 @@ local function _docstring(lines, def_idx)
         if s == "" then
             i = i + 1
         else
-            local q = s:match('^(""")') or s:match("^('''")
+            local q = s:match('^(""")') or s:match("^(''')")
             if not q then return "" end
             -- Single-line docstring: """text"""
             local single = s:match('^"""(.-)"""$') or s:match("^'''(.-)'''$")

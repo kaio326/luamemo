@@ -172,6 +172,9 @@ setenv("MEMO_RERANK_WEIGHTS", tmp .. "/rerank_w.json")
 setenv("LUA_PATH", child_path)
 setenv("LUA_CPATH", package.cpath)
 setenv("MEMO_TEST_TMP", tmp)
+-- (maintenance is on by default and a write that makes it due starts `memo maintain`: no test starts a real process
+-- unless it says so — test_maintenance runs with this unset)
+setenv("MEMO_NO_MAINTENANCE", "1")
 
 -- Each file runs under GNU timeout — macOS has none of its own: Homebrew's coreutils
 -- calls it gtimeout; without either the files run with no time limit.

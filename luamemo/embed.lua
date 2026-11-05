@@ -111,10 +111,56 @@ local function http_embed(text, wait_fn)
     return vec
 end
 
-local function embed_impl(text, wait_fn)
+-- ---------------------------------------------------------------------------
+-- Task prompts. Asymmetric embedders are trained with an instruction before a query and
+-- another before a stored text (EmbeddingGemma: "task: search result | query: …" /
+-- "title: none | text: …"; nomic-embed-text: "search_query: …" / "search_document: …").
+-- MEMO_EMBED_PROMPTS: none (the default — the text as it is), auto (the model's own, when
+-- it is one of AUTO's), or a JSON object {"query": "…{text}…", "document": "…{text}…"}.
+-- The prompts are part of the embedding space (federation.common.embedder_sig): turning
+-- them on needs memo reembed --all.
+-- ---------------------------------------------------------------------------
+local AUTO = {
+    { local_embedder = "gguf_ffi", model = "embeddinggemma",
+      query = "task: search result | query: {text}", document = "title: none | text: {text}" },
+    { model = "nomic%-embed", query = "search_query: {text}", document = "search_document: {text}" },
+}
+
+--- The prompts in force for a config: { query, document, id } | nil (none).
+function M.prompts(c)
+    c = c or cfg or {}
+    local p = c.embed_prompts
+    if p == nil or p == "" or p == "none" then return nil end
+    if type(p) == "string" and p:sub(1, 1) == "{" then
+        local ok, t = pcall(json.decode, p)
+        if not (ok and type(t) == "table" and type(t.query) == "string" and type(t.document) == "string") then
+            return nil
+        end
+        p = t
+    end
+    if type(p) == "table" then
+        return { query = p.query, document = p.document, id = "custom:" .. util.djb2_hex(p.query .. "\0" .. p.document) }
+    end
+    if p ~= "auto" then return nil end
+    local model = (c.embedder_local == "gguf_ffi" and (c.embedder_model or os.getenv("MEMO_GGUF_MODEL") or "")
+        or (c.embedder_model or "")):lower()
+    for _, a in ipairs(AUTO) do
+        if (not a.local_embedder or a.local_embedder == c.embedder_local) and model:find(a.model) then
+            return { query = a.query, document = a.document, id = "auto:" .. a.model:gsub("%%", "") }
+        end
+    end
+    return nil
+end
+
+local function embed_impl(text, wait_fn, purpose)
     if not cfg then return nil, "embed: not configured (call setup() first)" end
     if type(text) ~= "string" or #text == 0 then
         return nil, "embed: text must be a non-empty string"
+    end
+    local pr = M.prompts(cfg)
+    if pr then   -- (before the length cap: the instruction stays, the text's end is what goes)
+        local tmpl = purpose == "query" and pr.query or pr.document
+        text = tmpl:gsub("{text}", function() return text end)
     end
 
     local truncated = false
@@ -163,12 +209,14 @@ end
 -- input as too long gets it shortened (see above). The third return value
 -- signals whether truncation happened so callers can record it.
 -- @param text string
+-- @param purpose string|nil  "query" for a search; anything else is a stored text (see
+--   task prompts above — the same text without prompts either way)
 -- @return table|nil vector
 -- @return string|nil err
 -- @return boolean    truncated  true when the input was clipped to fit
 -- @return string|nil "too_long" when no vector could be had because of the length
-function M.embed(text)
-    return embed_impl(text, nil)
+function M.embed(text, purpose)
+    return embed_impl(text, nil, purpose)
 end
 
 --- Async variant of embed() for use inside luamemo.async task coroutines.
@@ -178,9 +226,9 @@ end
 -- falls back for HTTPS URLs). Returns the same values as embed().
 -- @param text    string
 -- @param wait_fn function  async.wait from luamemo.async
-function M.embed_async(text, wait_fn)
-    if impl_is_local then return M.embed(text) end
-    return embed_impl(text, wait_fn)
+function M.embed_async(text, wait_fn, purpose)
+    if impl_is_local then return M.embed(text, purpose) end
+    return embed_impl(text, wait_fn, purpose)
 end
 
 --- What the configured embedder makes of `text` (memo embed / memory_embed) →

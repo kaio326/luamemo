@@ -25,6 +25,7 @@ local socket   = require("socket")
 local json     = require("luamemo.json")
 local handlers = require("luamemo.federation.handlers")
 local netguard = require("luamemo.netguard")
+local maintenance = require("luamemo.maintenance")
 
 local M = {}
 
@@ -251,6 +252,7 @@ function M.run(opts)
     local bind_host = (host == "*") and "0.0.0.0" or host
     local srv = assert(socket.bind(bind_host, tonumber(opts.port) or 8765))
     srv:settimeout(0)
+    maintenance.cloexec(srv)   -- (a write here starts `memo maintain`: it must not inherit the listener or a client's socket)
     local bound_host, bound_port = srv:getsockname()
     local log = opts.log or function(s) io.stderr:write(s .. "\n") end
     log(("LISTENING %s %d"):format(bound_host, bound_port))
@@ -323,6 +325,7 @@ function M.run(opts)
             while not max or accepted < max do
                 local c = srv:accept()
                 if not c then break end
+                maintenance.cloexec(c)
                 accepted = accepted + 1
                 local ip, t0 = c:getpeername(), socket.gettime()
                 if not M.peer_allowed(ip) then

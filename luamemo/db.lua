@@ -72,6 +72,12 @@ end
 
 function M.path() return configured() end
 
+--- A file next to the database, named after it (`<database file><suffix>`: its maintenance log, its lock). The
+--- data directory holds every project's database, so what belongs to one must not be shared.
+function M.sibling(suffix)
+    return (M.path() or (M.data_dir() .. "/luamemo.db")) .. suffix
+end
+
 -- ---------------------------------------------------------------------------
 -- Opening: migrations, identity, ranker
 -- ---------------------------------------------------------------------------

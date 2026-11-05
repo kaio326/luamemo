@@ -49,7 +49,7 @@ usage:
         memo org adopt [--dry-run] [--no-switch] | leave
         (set MEMO_ORG_URL + MEMO_ORG_FINGERPRINT — see `memo calibrate --org-url`)
   org:  memo org status
-        memo org devs [pending | list] | approve <CODE> | remove <user:email | CODE | FINGERPRINT>
+        memo org devs [pending | list] | approve <CODE> | remove <user:email | CODE | FINGERPRINT> | clear-pending
         memo org review [list [--status S]] | show <id> | approve <id> [--supersedes <org id>]
                         | approve --top N | reject <id> [--reason …] | remove <org memory id>
         memo org directives <path> [--source NAME] [--project NAME] [--dry-run] [--no-prune] [--allow-empty]
@@ -145,7 +145,7 @@ local function org_embedder(e)
     local ecfg = {}
     for k, v in pairs(luamemo.config) do ecfg[k] = v end
     for _, k in ipairs({ "embedder_url", "embedder_local", "embedder_adapter", "embedder_model", "embed_dim",
-                         "embed_max_chars" }) do ecfg[k] = nil end
+                         "embed_max_chars", "embed_prompts" }) do ecfg[k] = nil end
     for k, v in pairs(require("luamemo.cli._common").embed_config(e.embed)) do ecfg[k] = v end
     local active   -- nil = not switched yet; false = the org's embedder can't load
     local function fn(text)
@@ -604,9 +604,10 @@ local function run_org(sub, argv)
             line("rejected", "#" .. pos[2] .. " (the same content won't come back unless it changes)")
         elseif action == "remove" then
             if not pos[2] then die("usage: memo org review remove <org memory id>") end
-            local ok, err = k.remove(pos[2], by)
-            if not ok then die(err, 1) end
+            local ok, err_or_warning = k.remove(pos[2], by)
+            if not ok then die(err_or_warning, 1) end
             line("removed", "org memory #" .. pos[2] .. " (leaves devs' replicas with their next pull)")
+            if err_or_warning then line("warning", err_or_warning) end
         else
             die("usage: memo org review [list [--status S]] | show <id> | approve <id> | approve --top N | "
                 .. "reject <id> [--reason …] | remove <org memory id>")

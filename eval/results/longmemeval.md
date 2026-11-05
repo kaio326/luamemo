@@ -1,5 +1,10 @@
 # LongMemEval — retrieval-side recall through luamemo
 
+> Historical record, kept as measured: runs on luamemo 0.2–0.4 and the previous
+> (PostgreSQL) store, so the reproduce commands are that era's (`PG*` variables,
+> `lua5.1`). The current numbers, and how to measure them with `memo eval run`, are in
+> [eval/README.md](../README.md#results).
+
 End-to-end run of the public LongMemEval benchmark
 ([Lin et al., 2024](https://arxiv.org/abs/2410.10813),
 [xiaowu0162/longmemeval](https://huggingface.co/datasets/xiaowu0162/longmemeval))

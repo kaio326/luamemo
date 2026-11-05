@@ -14,20 +14,6 @@ local _common = require("luamemo.summarizers._common")
 
 local M = {}
 
-local function build_prompt(memories)
-    local lines = {
-        "Summarise the following memories into a single concise note.",
-        "Preserve concrete facts (names, IDs, dates, decisions).",
-        "Output JSON: { \"title\": \"...\", \"body\": \"...\" }.",
-        "",
-        "Memories:",
-    }
-    for _, line in ipairs(_common.build_memory_lines(memories, 1500)) do
-        lines[#lines + 1] = line
-    end
-    return table.concat(lines, "\n")
-end
-
 function M.summarize(memories, cfg)
     if type(memories) ~= "table" or #memories == 0 then
         return nil, "ollama.summarize: no memories"
@@ -37,7 +23,7 @@ function M.summarize(memories, cfg)
 
     local req_body = json.encode({
         model  = cfg.summarizer_model or "llama3.2",
-        prompt = build_prompt(memories),
+        prompt = _common.summary_prompt(memories),
         stream = false,
         format = "json",
     })

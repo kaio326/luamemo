@@ -16,7 +16,7 @@
 --   profile.multilingual  boolean   non-English content expected
 --   profile.long_rows     boolean   typical title+body > 4_000 chars
 --   profile.allow_hash    boolean   user explicitly opted into hash
---   profile.gguf_capable  boolean   LuaJIT + C toolchain present (can BUILD the gguf path)
+--   profile.gguf_capable  boolean   LuaJIT + a runtime: built already, prebuilt for this machine, or buildable (toolchain)
 --   profile.gguf_ready    boolean   gguf path works NOW: shim built, model found, live selftest passed
 --   profile.gguf_model    string    path of the .gguf that passed the selftest
 --   profile.gguf_dim      number    its native embedding dim (default 768)
@@ -78,7 +78,7 @@ function M.decide(profile)
     local multilingual  = profile.multilingual
     local long_rows     = profile.long_rows
     local allow_hash    = profile.allow_hash
-    local gguf_capable  = profile.gguf_capable        -- LuaJIT + C toolchain present
+    local gguf_capable  = profile.gguf_capable        -- LuaJIT + a runtime (built, prebuilt, or buildable)
     local allow_gguf    = profile.allow_gguf ~= false -- opt-out via --no-gguf / --embedder
     local gguf_ready    = profile.gguf_ready and profile.gguf_model ~= nil
 
@@ -97,22 +97,26 @@ function M.decide(profile)
             local dim = tonumber(profile.gguf_dim) or 768
             note("In-process GGUF embedder is set up (shim built, model found, selftest passed) -> "
                 .. "self-contained, no sidecar, owned weights -> recommended default")
+            -- The text cap fits the model's context (EmbeddingGemma 2: 8K tokens, the 300M: 2K) and
+            -- EmbeddingGemma 2 is used with its task prompts (luamemo.embed.prompts).
+            local st = require("luamemo.cli.probe").gguf_model_settings(profile.gguf_model)
             result = {
                 adapter = "gguf",
                 model   = profile.gguf_model:match("[^/\\]+$") or profile.gguf_model,
                 dim     = dim,
-                embed_max_chars = 8000,          -- ~2048-token context
+                embed_max_chars = st.max_chars,
                 gguf = true,
                 setup_keys = {
                     embedder_local  = "gguf_ffi",
                     embedder_model  = profile.gguf_model,
                     embed_dim       = dim,
-                    embed_max_chars = 8000,
+                    embed_max_chars = st.max_chars,
+                    embed_prompts   = st.prompts,
                 },
             }
         else
             gguf_upgrade = true
-            note("LuaJIT + C toolchain detected -> the in-process GGUF embedder is the best fit but is "
+            note("LuaJIT and a GGUF runtime (prebuilt or buildable) found -> the in-process GGUF embedder is the best fit but is "
                 .. "not set up yet (" .. (profile.gguf_not_ready or "shim/model missing")
                 .. ") -> recommending a working embedder now; follow the one-time GGUF setup to upgrade")
         end
@@ -208,7 +212,7 @@ function M.decide(profile)
             if gguf_capable and not allow_gguf then
                 gguf_hint = "drop --no-gguf to get the in-process GGUF embedder (calibrate prints its setup)"
             else
-                gguf_hint = "install LuaJIT + a C toolchain for the recommended in-process GGUF embedder"
+                gguf_hint = "install LuaJIT, then `memo gguf install` (prebuilt runtime) or a C toolchain + cmake + git (to build it) for the recommended in-process GGUF embedder"
             end
             note("No working embedder on this host: no set-up in-process GGUF embedder and no running "
                 .. "Ollama / TEI answering embeddings. Options: " .. gguf_hint

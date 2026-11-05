@@ -66,11 +66,14 @@ local function cut(s, n) return util.cut_utf8(s, n) end   -- titles: on a charac
 -- Each call prints one JSON line to stdout for the bash wrapper to POST.
 -- ---------------------------------------------------------------------------
 
+-- Where the rows go: stdout as NDJSON (the bash wrapper writes them), or — M.scan — a list.
+local sink = function(row) print(json.encode(row)) end
+
 local function emit(scope, kind, title, body, importance, tags, meta)
     if not title or trim(title) == "" then return end
     body = trim(body or "")
     if #body < 20 then return end   -- skip trivial stubs
-    print(json.encode({
+    sink({
         scope          = scope,
         kind           = kind or "fact",
         title          = cut(trim(title), 200),
@@ -80,7 +83,7 @@ local function emit(scope, kind, title, body, importance, tags, meta)
         tags           = tags or {},
         metadata       = meta or {},
         dedup_strategy = "update",   -- reruns refresh content, never duplicate
-    }))
+    })
 end
 
 -- ---------------------------------------------------------------------------
@@ -294,15 +297,13 @@ end
 
 local function scan_git_commits(root, scope, since_sha, limit)
     limit = limit or 200
-    local range
-    if since_sha and since_sha ~= "" then
-        range = since_sha .. "..HEAD"
-    else
-        range = "HEAD~" .. limit .. "..HEAD"
-    end
+    -- since a commit: the commits after it; else the newest `limit` (a range such as
+    -- HEAD~200..HEAD is an error in a repository with fewer commits — and its error was
+    -- dropped, so a young repository's history was never scanned).
+    local range = (since_sha and since_sha ~= "") and (shell_quote(since_sha .. "..HEAD") .. " ") or ""
     local cmd = string.format(
-        "git -C %s log %s --no-merges --format='%%H\t%%as\t%%s' 2>/dev/null | head -%d",
-        shell_quote(root), shell_quote(range), limit)
+        "git -C %s log %s-n %d --no-merges --format='%%H\t%%as\t%%s' 2>/dev/null | head -%d",
+        shell_quote(root), range, limit, limit)
     local out = pread(cmd)
     if out == "" then return end
 
@@ -339,6 +340,7 @@ local function rec_settings(rec)
     add(s.embedder_local == "gguf_ffi" and "MEMO_GGUF_MODEL" or "MEMO_EMBEDDER_MODEL", s.embedder_model)
     add("MEMO_EMBED_DIM", s.embed_dim)
     add("MEMO_EMBED_MAX_CHARS", s.embed_max_chars)
+    add("MEMO_EMBED_PROMPTS", s.embed_prompts)
     return out
 end
 
@@ -390,6 +392,31 @@ end
 -- Public entry point
 -- ---------------------------------------------------------------------------
 
+local function scan_all(root, scope, flags)
+    scan_agent_files(root, scope)
+    scan_adr_files(root, scope)
+    scan_readme_files(root, scope)
+    if not flags.no_comments then
+        scan_source_comments(root, scope)
+    end
+    if not flags.no_git then
+        scan_git_commits(root, scope, flags.since_commit)
+    end
+end
+
+--- What `memo calibrate`'s scan would write for a project, as rows (the tables `memo write`
+--- takes: scope, kind, title, body, importance, tags, metadata, dedup_strategy), without
+--- touching the project or any database — the same code, the same rows. flags: no_comments,
+--- no_git, since_commit. (The benchmark corpus builds its memories with this.)
+function M.scan(root, scope, flags)
+    local rows, saved = {}, sink
+    sink = function(row) rows[#rows + 1] = row end
+    local ok, err = pcall(scan_all, root, scope, flags or {})
+    sink = saved
+    if not ok then return nil, tostring(err) end
+    return rows
+end
+
 function M.run(argv)
     local flags = parse_flags(argv or {})
 
@@ -402,15 +429,7 @@ function M.run(argv)
         io.stderr:write("memo calibrate: scanning " .. root
             .. " → scope=" .. scope .. "\n")
 
-        scan_agent_files(root, scope)
-        scan_adr_files(root, scope)
-        scan_readme_files(root, scope)
-        if not flags.no_comments then
-            scan_source_comments(root, scope)
-        end
-        if not flags.no_git then
-            scan_git_commits(root, scope, flags.since_commit)
-        end
+        scan_all(root, scope, flags)
         return
     end
 
@@ -471,9 +490,10 @@ function M.run(argv)
     elseif gguf_state.ready then
         gguf_line = "ready — in-process embedder works (model: " .. gguf_state.model .. ")"
     elseif flags.no_gguf then
-        gguf_line = "capable (LuaJIT + C toolchain) — opted out with --no-gguf"
+        gguf_line = "capable (LuaJIT + the prebuilt runtime or a C toolchain) — opted out with --no-gguf"
     else
-        gguf_line = "capable (LuaJIT + C toolchain) but not set up yet — " .. gguf_state.reason
+        gguf_line = "capable (LuaJIT + the prebuilt runtime or a C toolchain) but not set up yet — "
+            .. gguf_state.reason
     end
     io.write(string.format("  GGUF:   %s\n", gguf_line))
 
@@ -573,9 +593,11 @@ embedder above; memo is usable now. Upgrade whenever you like:
 
 ]] .. step1 .. [[
 
-  2. Download the model (EmbeddingGemma-300M recommended; ~320 MB):
-       mkdir -p ~/models && curl -sL -o ~/models/embeddinggemma-300M-Q8_0.gguf \
-         https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf
+  2. Download the model (EmbeddingGemma 2 recommended; ~300 MB, needs the runtime of
+     step 1 from luamemo 0.5.2 or newer):
+       mkdir -p ~/models && curl -sL -o ~/models/embeddinggemma-2-Q8_0.gguf \
+         ]] .. require("luamemo.cli.probe").GGUF_DEFAULT_URL .. [[
+
      Want a different / newer open-weights model instead? Point MEMO_GGUF_MODEL
      at ANY llama.cpp-compatible GGUF embedding model — gemma is just the default.
 
@@ -585,6 +607,8 @@ embedder above; memo is usable now. Upgrade whenever you like:
        memo config set MEMO_EMBEDDER gguf_ffi
        memo config set MEMO_GGUF_MODEL <path-to.gguf>
        memo config set MEMO_EMBED_DIM 768
+       memo config set MEMO_EMBED_MAX_CHARS 24000
+       memo config set MEMO_EMBED_PROMPTS auto    (EmbeddingGemma 2's task prompts)
        memo config unset MEMO_EMBEDDER_URL        (and MEMO_EMBEDDER_ADAPTER, if set)
      Then restart the MCP server in your client, and re-embed what is already
      stored:  memo reembed --all

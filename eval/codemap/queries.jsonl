@@ -1,0 +1,40 @@
+{"q": "where are search results made compact before the MCP server returns them", "gold": ["ops.lua"]}
+{"q": "how does memo config unset remove a setting luamemo no longer reads", "gold": ["cli/config.lua"]}
+{"q": "where is a project's .luamemorc trusted after memo writes it", "gold": ["settings.lua"]}
+{"q": "which code decides whether a project's settings file may be used", "gold": ["settings.lua"]}
+{"q": "where does memo eval download the eval kit and check its checksum", "gold": ["cli/eval.lua"]}
+{"q": "where is the prebuilt GGUF runtime downloaded and verified", "gold": ["embedders/native/bundle.lua"]}
+{"q": "how is a GGUF shim built before 0.5.0 recognised", "gold": ["embedders/native/ffi_shim.lua"]}
+{"q": "where are embeddings computed in process through llama.cpp", "gold": ["embedders/gguf_ffi.lua"]}
+{"q": "the pure Lua hash embedder", "gold": ["embedders/hash.lua"]}
+{"q": "how are vectors packed into blobs and compared by cosine similarity", "gold": ["vectors.lua"]}
+{"q": "reciprocal rank fusion of ranked lists", "gold": ["temporal.lua"]}
+{"q": "where are dates in a question turned into a time window", "gold": ["temporal.lua"]}
+{"q": "hybrid search that blends vector and full-text scores", "gold": ["store.lua"]}
+{"q": "where are near-duplicate memories merged when one is written", "gold": ["store.lua"]}
+{"q": "opening the SQLite database and applying migrations", "gold": ["db.lua", "schema.lua"]}
+{"q": "the table definitions of the memories and the learned weights", "gold": ["schema.lua"]}
+{"q": "building an FTS5 match query from a search string", "gold": ["fts.lua"]}
+{"q": "where is the secrets vault encrypted", "gold": ["secrets.lua", "native/sodium.lua"]}
+{"q": "how secret_execute puts a stored key into an HTTP request on the server side", "gold": ["secrets.lua"]}
+{"q": "redacting credentials from text before it is stored", "gold": ["util.lua"]}
+{"q": "the session brief an agent gets at session start", "gold": ["brief.lua"]}
+{"q": "clustering related memories into observations", "gold": ["consolidate.lua"]}
+{"q": "the digest that promotes tiers and deletes stale memories", "gold": ["digest.lua"]}
+{"q": "knowledge graph facts that hold over a time window", "gold": ["kg.lua"]}
+{"q": "the reranker that asks an Ollama chat model to score candidates", "gold": ["rerankers/ollama.lua"]}
+{"q": "training the learned reranker's weights", "gold": ["rerank_train.lua"]}
+{"q": "the gate that promotes learned weights only when they beat the current ones", "gold": ["promote.lua"]}
+{"q": "detecting that the user corrected the agent in a conversation", "gold": ["sensing/heuristics.lua", "sensing/init.lua"]}
+{"q": "the prompt that asks a generative model to extract memories from a chat", "gold": ["sensing/extract.lua"]}
+{"q": "approving a device's pairing code on the org central", "gold": ["federation/devs.lua"]}
+{"q": "the encrypted, authenticated channel between a dev and the org central", "gold": ["federation/channel.lua"]}
+{"q": "the org admin's review queue of knowledge proposals", "gold": ["federation/knowledge.lua"]}
+{"q": "walking the repository and skipping gitignored files for the code index", "gold": ["index/walker.lua"]}
+{"q": "parsing Lua source into symbols for the code map", "gold": ["index/parsers/lua.lua"]}
+{"q": "parsing a unified diff for incremental index updates", "gold": ["index/digester.lua", "index/differ.lua"]}
+{"q": "formatting code map results as path:line lines", "gold": ["index/format.lua"]}
+{"q": "probing the host for a GPU, Docker and Ollama during calibrate", "gold": ["cli/probe.lua"]}
+{"q": "recommending an embedder from what the host has", "gold": ["cli/recommend.lua"]}
+{"q": "moving memories between databases as JSON Lines", "gold": ["transfer.lua", "cli/export.lua", "cli/import.lua"]}
+{"q": "refusing requests to private network addresses", "gold": ["netguard.lua"]}

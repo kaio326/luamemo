@@ -22,7 +22,10 @@ sessions, and a map of the codebase.
 - **Code:** when the brief shows a map, use `index_search` / `index_outline` before
   grepping or reading whole files — and still read a file before you edit it.
 - **Learning:** when the user corrects you, sets a standing rule or confirms
-  something, call `memory_sense` with the recent turns.
+  something, call `memory_sense` with the recent turns (a standing rule no memory
+  holds is stored for you).
+- **One store:** luamemo is the only place you keep memory — not also a memory
+  directory or notes file of your own, which luamemo's search can't see.
 - **Secrets:** never ask for a key, token or password in the chat. The user stores
   it with `memo secret-store NAME` in a terminal; you use it through `secret_execute`,
   which fills it in server-side.

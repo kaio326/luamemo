@@ -2,10 +2,11 @@
 -- Phase 12.3 + 12F.3 — dev client (luamemo.federation.client) against a real
 -- central over the encrypted, key-paired local-network channel.
 --
---   Setup: a throwaway central database (a second SQLite file, removed at
---   the end), seeded through a subprocess running as the org (directive
---   capability for the core tier) and served by luamemo.cli.serve on an
---   ephemeral loopback port, with its own keyring. THIS process is the dev:
+--   Setup: the mock central of eval/tests/_org.lua — a throwaway central
+--   database (a second SQLite file, removed at the end), seeded through a
+--   subprocess running as the org (directive capability for the core tier)
+--   and served by luamemo.cli.serve on an ephemeral loopback port, with its
+--   own keyring. THIS process is the dev:
 --   MEMO_DB is its database, its keyring is a temp dir, the replica lives
 --   in org:fedcli, personal rows in repo:fedcli.
 --
@@ -47,14 +48,11 @@ local ls      = require("luamemo.learner_store")
 
 local ORG, MINE = "org:fedcli", "repo:fedcli"
 math.randomseed(os.time() + math.floor(os.clock() * 1e6))
-local SUFFIX  = ("%d_%04d"):format(os.time(), math.random(0, 9999))
-local CDB     = "lm_fedcli_" .. SUFFIX
-local CKDIR   = os.tmpname(); os.remove(CKDIR)      -- the central's keyring
-local DKDIR   = os.tmpname(); os.remove(DKDIR)      -- this dev's keyring
+local Org      = require("eval.tests._org")
+local DKDIR   = H.tmp_path("fedcli_dev_keys_" .. os.time())   -- this dev's keyring
 local keys    = require("luamemo.federation.keys")
 keys.set_dir(DKDIR)
 local FP                                            -- the central's fingerprint (what the admin hands out)
-local central_db = H.db_path(CDB)
 
 local function q1(sql) return db.first(sql) or {} end
 local function state()
@@ -67,41 +65,17 @@ local function stale()
     db.run("UPDATE lm_federation_state SET last_pull_at = ? WHERE org_scope = ?", util.now_us() - 7200 * 1000000, ORG)
 end
 
--- Run Lua on the CENTRAL (a subprocess set up as the org). `result(v)` returns v.
-local PRELUDE = [[
-package.path = "./?.lua;./?/init.lua;" .. package.path
-local luamemo = require("luamemo")
-luamemo.setup({ embedder_local = "hash", embed_dim = 384, skip_embed_probe = true,
-                patterns_enabled = false, role = "org", org_name = "fedcli" })
-local store, db, json = luamemo.store, require("luamemo.db"), require("luamemo.json")
-local DIR = require("luamemo.federation.policy").capability("directive")
-local ls  = require("luamemo.learner_store")
-local devs = require("luamemo.federation.devs")
-local function result(v) io.write("\n@@RESULT@@" .. json.encode(v or {}) .. "\n") end
-]]
-local function central(code)
-    local path = os.tmpname()
-    local f = assert(io.open(path, "w")); f:write(PRELUDE, "\n", code, "\n"); f:close()
-    local out = sh(("MEMO_DB=%q MEMO_FEDERATION_DIR=%q %s %q"):format(central_db, CKDIR, lua_bin, path))
-    os.remove(path)
-    local body = out:match("@@RESULT@@([^\n]*)")
-    if not body then error("central helper failed: " .. out:sub(1, 600), 0) end
-    return json.decode(body)
-end
+-- Run Lua on the CENTRAL (a subprocess set up as the org, eval/tests/_org.lua). `result(v)` returns v; DIR and ls are
+-- extra locals of this test's central.
+local org
+local function central(code) return org:call(code) end
 
 -- The dev configuration (this process).
 local PORT
 local function dev(extra)
-    local cfg = { embedder_local = "hash", embed_dim = 384, skip_embed_probe = true, patterns_enabled = false,
-                  org_url = PORT and ("http://127.0.0.1:" .. PORT) or nil, org_fingerprint = FP,
-                  org_identity = "user:dev@corp.io", org_share = "triples", org_sync_ttl = 900 }
-    for k, v in pairs(extra or {}) do cfg[k] = v end
-    if type(luamemo.config) == "table" then luamemo.config.embedder_model = nil end   -- setup merges
-    luamemo.setup(cfg)
+    H.setup(extra, { org_url = PORT and ("http://127.0.0.1:" .. PORT) or nil, org_fingerprint = FP,
+                     org_identity = "user:dev@corp.io", org_share = "triples", org_sync_ttl = 900 })
     client._reset_session()
-end
-local function approve(code)
-    return central(("result({ ok = devs.approve(%q, 'test') ~= nil })"):format(code)).ok
 end
 local function wipe_dev()
     db.run("DELETE FROM lm_reinforcements WHERE scope IN (?, ?)", ORG, MINE)
@@ -122,20 +96,29 @@ check("solo: maybe_sync is a no-op", client.maybe_sync() == false)
 luamemo.setup({ org_url = "http://localhost:1", org_fingerprint = "0000-0000-0000-0000-0000" })
 local ngm = require("luamemo.netguard")
 local real_res, nres = ngm.resolve, 0
-ngm.resolve = function(h) nres = nres + 1; return real_res(h) end
-for _ = 1, 3 do client.probe_central(300) end
-ngm.resolve = real_res
+H.with(ngm, "resolve", function(h) nres = nres + 1; return real_res(h) end, function()
+    for _ = 1, 3 do client.probe_central(300) end
+end)
 check("one DNS resolution serves consecutive calls", nres == 1, nres)
 end)
 
 -- ---------------------------------------------------------------------------
 -- Central: create, migrate, seed, serve.
-local seed, SERVER_PID, LOG
+local seed
 local up = false
 section("setup central", function()
 dev()
 wipe_dev()
-H.create_db(CDB)
+local org_err
+org, org_err = Org.start({ name = "fedcli", timeout = 900, prelude = [[
+local DIR = require("luamemo.federation.policy").capability("directive")
+local ls  = require("luamemo.learner_store")
+]] })
+check("central started (memo serve; its own identity: the admin hands out its fingerprint)",
+    org ~= nil and type(org.fp) == "string" and #org.fp == 24, org_err or (org and org.fp))
+if not org then return end
+FP, PORT = org.fp, org.port
+dev()
 seed = central([[
 local D  = store.write({ scope = "org:fedcli", title = "Directive: tests", importance = 1.0,
                          body = "Every change ships with tests.", _cap = DIR })   -- a directive: tier 3
@@ -146,20 +129,7 @@ local t = db.query("SELECT tier FROM lm_memories WHERE id = " .. D.id)[1].tier
 result({ D = D.id, N1 = N1.id, N2 = N2.id, E = E.id, tierD = t })
 ]])
 check("central seeded (directive at the core tier)", seed.D and tonumber(seed.tierD) == 3, seed.tierD)
-FP = central([[
-local k = require("luamemo.federation.keys")
-result({ fp = k.fingerprint(assert(k.ensure_identity("central"))) })
-]]).fp
-check("central identity created (the admin hands out its fingerprint)", type(FP) == "string" and #FP == 24, FP)
-
-LOG = os.tmpname()
-local code_s = "package.path='./?/init.lua;'..package.path; require('luamemo.cli.serve').run({'--port','0'})"
-local out = sh(("MEMO_DB=%q MEMO_EMBEDDER=hash MEMO_ROLE=org MEMO_ORG_NAME=fedcli MEMO_FEDERATION_DIR=%q "
-    .. "%s%s -e %q >/dev/null 2>%q & echo \"PID=$!\""):format(central_db, CKDIR, H.timeout(900), lua_bin, code_s, LOG))
-SERVER_PID = tonumber(out:match("PID=(%d+)"))
-PORT = H.wait_port(LOG)
-check("central serving (memo serve)", PORT ~= nil)
-up = PORT ~= nil
+up = true
 end)
 
 if up then
@@ -195,8 +165,8 @@ check("the device key lives in this user's keyring", keys.public_key("dev") ~= n
     and pr and pr.device_fingerprint == keys.fingerprint(keys.public_key("dev")))
 local s1, e1 = client.pull()
 check("pending device: pull refused (admin hasn't approved)", s1 == nil and tostring(e1):find("pending", 1, true), e1)
-check("admin approval with a wrong code fails", approve("0000-0000") == false)
-check("admin approves the code the dev reads out", pr and approve(pr.code) == true)
+check("admin approval with a wrong code fails", org:approve("0000-0000") == false)
+check("admin approves the code the dev reads out", pr and org:approve(pr.code) == true)
 local p2 = client.pair()
 check("pairing again → approved", p2 and p2.status == "approved")
 end)
@@ -249,16 +219,13 @@ check("central hashes the manifest only when the dev sent a digest",
 -- looking each row up (a full resync re-applies every row). Counted on the
 -- database handle itself, so statements inside a transaction count too.
 local h, lookups = assert(db.get()), 0
-local real_first, real_query = h.first, h.query
 local function counting(real)
     return function(sql, ...)
         if type(sql) == "string" and sql:find("'$.lm_org_id') = ", 1, true) then lookups = lookups + 1 end
         return real(sql, ...)
     end
 end
-h.first, h.query = counting(real_first), counting(real_query)
-local sf = client.pull({ full = true }) or {}
-h.first, h.query = real_first, real_query
+local sf = H.with(h, "first", counting(h.first), H.with, h, "query", counting(h.query), function() return client.pull({ full = true }) or {} end)
 check("a pull does no per-row replica lookups", sf.upserted == 3 and lookups == 0,
     ("upserted=%s lookups=%d"):format(tostring(sf.upserted), lookups))
 
@@ -496,7 +463,7 @@ local s2c, e2c = client.pull()
 check("revoked device: refused", s2c == nil and tostring(e2c):find("403", 1, true), e2c)
 local rp = client.pair()
 check("re-pair after revocation → pending again", rp and rp.status == "pending")
-check("… and the admin approves it again", rp and approve(rp.code) == true)
+check("… and the admin approves it again", rp and org:approve(rp.code) == true)
 dev()
 local s3 = client.sync()
 check("back online: sync pulls and pushes the pending event",
@@ -540,9 +507,7 @@ store.search({ query = "anything", scope = MINE })
 check("personal search never syncs", local_of(c2.id) == nil)
 client._reset_throttle()
 local real_push, pushes = client.push, 0
-client.push = function(...) pushes = pushes + 1; return real_push(...) end
-store.search({ query = "org search", scopes = { MINE, ORG } })
-client.push = real_push
+H.with(client, "push", function(...) pushes = pushes + 1; return real_push(...) end, store.search, { query = "org search", scopes = { MINE, ORG } })
 check("search touching the org scope refreshes the stale replica", local_of(c2.id) ~= nil)
 check("… by pulling only (no push / proposals while the search waits)", pushes == 0, pushes)
 
@@ -592,15 +557,14 @@ end
 -- ---------------------------------------------------------------------------
 -- Teardown (always).
 client.PAGE = 200
-if SERVER_PID then os.execute("kill " .. SERVER_PID .. " 2>/dev/null") end
-if LOG then
-    local s = H.slurp(LOG) or ""
+if org then
+    local s = H.slurp(org.log) or ""
     check("central log carries method + path only (no envelopes / bodies)",
         s:find("POST /federation/call 200", 1, true) ~= nil and not s:find("LMC2", 1, true))
-    os.remove(LOG)
+    org:stop()
 end
 pcall(function() dev(); wipe_dev() end)
 H.drop_dbs()
-os.execute(("rm -rf %q %q"):format(CKDIR, DKDIR))
+os.execute(("rm -rf %q"):format(DKDIR))
 keys.set_dir(nil)
 finish()

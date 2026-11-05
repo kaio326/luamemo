@@ -32,7 +32,9 @@ if not (exists(model) and exists(shim)) then
     return
 end
 
-local cfg = { embedder_model = model }
+-- (a 2,048-token context whatever the model: EmbeddingGemma 2 would otherwise read 8K,
+-- and the truncation checks below would need a text four times as long)
+local cfg = { embedder_model = model, gguf_n_ctx = 2048 }
 local v, err = g.embed("Never commit or push autonomously.", cfg)
 check("embed returns a vector", type(v) == "table" and #v > 0, tostring(err))
 if type(v) == "table" and #v > 0 then

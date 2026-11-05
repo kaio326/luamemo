@@ -125,6 +125,19 @@ do
         local r2 = R.decide({ gguf_capable=true, gguf_ready=true, gguf_model=model, gguf_dim=512 })
         check("recommend: non-768 gguf model -> its own dim", r2 and r2.setup_keys.embed_dim == 512)
 
+        -- EmbeddingGemma 2: its 8K context (24,000 characters) and task prompts; the 300M model as before.
+        local eg2 = "/m/embeddinggemma-2-Q8_0.gguf"
+        local r3 = R.decide({ gguf_capable=true, gguf_ready=true, gguf_model=eg2, gguf_dim=768 })
+        check("recommend: EmbeddingGemma 2 -> 24,000-character cap and task prompts (auto)",
+            r3 and r3.setup_keys.embed_max_chars == 24000 and r3.setup_keys.embed_prompts == "auto")
+        check("recommend: the 300M model -> 8,000 characters, no prompts (as before)",
+            r.setup_keys.embed_max_chars == 8000 and r.setup_keys.embed_prompts == nil)
+        local probe = require("luamemo.cli.probe")
+        check("probe: the default model is EmbeddingGemma 2, the 300M one is still looked for",
+            probe.GGUF_DEFAULT_MODEL == "embeddinggemma-2-Q8_0.gguf"
+            and probe.GGUF_PREVIOUS_MODELS[1] == "embeddinggemma-300M-Q8_0.gguf"
+            and probe.GGUF_DEFAULT_URL:find("embeddinggemma-2-GGUF", 1, true) ~= nil)
+
         local h = R.decide({ gguf_capable=true, gguf_not_ready="native shim not built" })
         check("recommend: interim hash runs at the gguf dim (768)",
             h and h.dim == 768 and h.setup_keys.embed_dim == 768)
@@ -340,6 +353,79 @@ do
 end
 
 -- =========================================================================
+-- The Ollama reranker and the rerank stats (what the benchmarks report as its cost)
+-- =========================================================================
+header("Ollama reranker")
+
+do
+    local cjson = require("luamemo.json")
+    local sent, reply
+    local real_http = package.loaded["luamemo.http"]
+    package.loaded["luamemo.http"] = {
+        request = function(_, o) sent = cjson.decode(o.body); return 200, reply, nil end,
+    }
+    package.loaded["luamemo.rerankers.ollama"] = nil
+    local rerank = require("luamemo.rerank")
+    rerank.stats(true)
+    local hits = { { id = 1, title = "a", body = "deploys go through staging" }, { id = 2, title = "b", body = "lunch" } }
+    reply = cjson.encode({ response = cjson.encode({ scores = { { index = 2, score = 0.9 }, { index = 1, score = 0.1 } } }),
+        prompt_eval_count = 100, eval_count = 20 })
+    local out = rerank.rerank("where do deploys go", hits, { rerank_adapter = "ollama",
+        rerank_url = "http://x/api/generate", rerank_model = "gemma4:e4b" })
+    check("ollama: the request asks for JSON without thinking (think = false), the model named",
+        sent and sent.think == false and sent.format == "json" and sent.model == "gemma4:e4b", cjson.encode(sent))
+    check("ollama: the scores reorder the hits", out and out[1].id == 2 and out[2].id == 1)
+    reply = cjson.encode({ response = "not json", prompt_eval_count = 50, eval_count = 5 })
+    local kept = rerank.rerank("q", hits, { rerank_adapter = "ollama", rerank_url = "http://x/api/generate" })
+    check("ollama: a reply that isn't the JSON fails the rerank (nil)", kept == nil)
+    local s = rerank.stats()
+    check("rerank stats: both calls timed, the model's tokens counted (prompt + generated), one failed",
+        #s.ms == 2 and s.tokens[1] == 120 and s.tokens[2] == 55 and s.failed == 1, cjson.encode(s))
+    package.loaded["eval.metrics"] = nil
+    local rs = require("eval.metrics").rerank_summary()
+    check("metrics.rerank_summary: ms mean / p90, tokens mean, failures",
+        rs.rerank_ms_mean and rs.rerank_ms_p90 and rs.rerank_tokens_mean == 87.5 and rs.rerank_failed == 1,
+        cjson.encode(rs))
+    rerank.stats(true)
+    check("metrics.rerank_summary: nothing reranked → {}", next(require("eval.metrics").rerank_summary()) == nil)
+    package.loaded["luamemo.http"] = real_http
+    package.loaded["luamemo.rerankers.ollama"] = nil
+end
+
+-- =========================================================================
+-- Task prompts (luamemo.embed): the embedder's own query / document instructions
+-- =========================================================================
+header("Embedding task prompts")
+
+do
+    local embed, common = require("luamemo.embed"), require("luamemo.federation.common")
+    local gemma = { embedder_local = "gguf_ffi", embedder_model = "/m/embeddinggemma-300M-Q8_0.gguf", embed_dim = 768 }
+    check("prompts: none by default", embed.prompts(gemma) == nil)
+    gemma.embed_prompts = "auto"
+    local p = embed.prompts(gemma)
+    check("prompts auto: EmbeddingGemma's own", p and p.query == "task: search result | query: {text}"
+        and p.document == "title: none | text: {text}")
+    local nomic = embed.prompts({ embed_prompts = "auto", embedder_adapter = "ollama", embedder_model = "nomic-embed-text" })
+    check("prompts auto: nomic-embed-text's own", nomic and nomic.query == "search_query: {text}"
+        and nomic.document == "search_document: {text}")
+    check("prompts auto: none for an embedder without known prompts (hash)",
+        embed.prompts({ embed_prompts = "auto", embedder_local = "hash" }) == nil)
+    check("prompts: a custom JSON pair", (embed.prompts({ embed_prompts = '{"query":"Q: {text}","document":"D: {text}"}' })
+        or {}).query == "Q: {text}")
+    check("prompts: part of the embedding space (embedder_sig); without them the signature as before",
+        common.embedder_sig(gemma) == "gguf_ffi|embeddinggemma-300M-Q8_0.gguf|768|auto:embeddinggemma"
+        and common.embedder_sig({ embedder_local = "hash" }) == "hash||384")
+    -- Applied: the query and the stored text get their own instruction.
+    embed.configure({ embedder_local = "hash", embed_dim = 64, embed_prompts = '{"query":"Q: {text}","document":"D: {text}"}' })
+    local q, d = embed.embed("deploys go through staging", "query"), embed.embed("deploys go through staging")
+    embed.configure({ embedder_local = "hash", embed_dim = 64 })
+    local q2, d2 = embed.embed("Q: deploys go through staging"), embed.embed("D: deploys go through staging")
+    local function same(a, b) for i = 1, #a do if math.abs(a[i] - b[i]) > 1e-12 then return false end end return #a == #b end
+    check("prompts: a query is embedded as its prompt, a stored text as its own", q and d and same(q, q2) and same(d, d2)
+        and not same(q, d))
+end
+
+-- =========================================================================
 -- index.format number rendering
 -- =========================================================================
 header("Index format numbers")
@@ -495,6 +581,21 @@ do
         os.clock() - t0)
     check("util.exists / is_dir", util.exists("luamemo/util.lua") and not util.exists("luamemo/nope.lua")
         and util.is_dir("luamemo") and not util.is_dir("luamemo/util.lua"))
+    -- util.ints: the values of a list that are numbers, as whole numbers (ids a caller or stored metadata hands in)
+    check("util.ints: numbers and numeric strings floored, the rest left out; nil and {} give {}",
+        table.concat(util.ints({ 3, "4", 5.9, "6.2", "x", true, {}, "0x10" }), ",") == "3,4,5,6,16"
+        and #util.ints(nil) == 0 and #util.ints({}) == 0)
+    -- util.is_symlink: the link itself, whatever it points at (and a name with spaces and quotes is quoted)
+    local link_dir = os.tmpname(); os.remove(link_dir); os.execute(("mkdir -p %q"):format(link_dir))
+    local plain, weird = link_dir .. "/plain file", link_dir .. "/it's a \"link\" $HOME"
+    local pf = assert(io.open(plain, "w")); pf:write("x"); pf:close()
+    local q = util.shell_quote
+    os.execute(("ln -s %s %s; ln -s %s %s"):format(q(plain), q(weird), q(link_dir .. "/nowhere"), q(link_dir .. "/dangling")))
+    check("util.is_symlink: a link (also dangling, also with a hostile name) is; a file, a directory, a missing path and nil are not",
+        util.is_symlink(weird) and util.is_symlink(link_dir .. "/dangling") and not util.is_symlink(plain)
+        and not util.is_symlink(link_dir) and not util.is_symlink(link_dir .. "/missing") and not util.is_symlink(nil)
+        and not util.is_symlink(""))
+    os.execute(("rm -rf %q"):format(link_dir))
     local r1, r2 = util.random_hex(16), util.random_hex(16)
     check("util.random_hex: 2n hex digits, a new value each call (one helper: db id, temp names)",
         #r1 == 32 and r1:match("^%x+$") ~= nil and r1 ~= r2, r1)
@@ -509,6 +610,67 @@ do
     check("common.manifest_digest: order-independent, version-sensitive",
         common.manifest_digest({ { 1, 10 }, { 2, 20 } }) == common.manifest_digest({ { 2, 20 }, { 1, 10 } })
         and common.manifest_digest({ { 1, 10 } }) ~= common.manifest_digest({ { 1, 11 } }))
+end
+
+-- =========================================================================
+-- Benchmark metrics (eval/metrics.lua): miss rate, bytes to the hit
+-- =========================================================================
+header("Benchmark metrics")
+
+do
+    local metrics = require("eval.metrics")
+    local ops, json = require("luamemo.ops"), require("luamemo.json")
+    local function row(i, body)
+        return { id = i, title = "t" .. i, body = body or ("body " .. i), kind = "fact", scope = "s",
+                 tier = 1, score = 0.5, metadata = { lm_rank = 3, sid = "x/" .. i },
+                 created_at = "2026-10-21 10:00:00.123+00" }
+    end
+    local rows = {}
+    for i = 1, 12 do rows[i] = row(i) end
+
+    -- The agent's bytes: the server's list of compact rows, as its tool result text.
+    local compact = {}
+    for i = 1, 10 do compact[i] = ops.compact_row(rows[i], ops.BODY_CAP) end
+    local text = json.encode(json.list(compact))
+    if json.encode("/") == '"\\/"' then text = text:gsub("\\/", "/") end
+    local sum = 0
+    for i = 1, 10 do sum = sum + metrics.row_bytes(rows[i]) end
+    check("row_bytes: 10 rows = the server's JSON array of them ('[' + ']' − the last comma)",
+        sum + 1 == #text, ("sum=%d text=%d"):format(sum, #text))
+    local long = row(1, ("é"):rep(3000))
+    check("row_bytes: a long body is counted at the server's cap (BODY_CAP), not whole",
+        metrics.row_bytes(long) < 6000 / 2 + 400 and metrics.row_bytes(long) > ops.BODY_CAP,
+        metrics.row_bytes(long))
+    check("row_bytes: internal lm_* metadata is not counted (the server drops it)",
+        metrics.row_bytes(row(1)) == metrics.row_bytes((function() local r = row(1)
+            r.metadata = { sid = "x/1" }; return r end)()))
+
+    local m = metrics.new()
+    metrics.record(m, 1, rows)       -- hit at 1
+    metrics.record(m, 3, rows)       -- hit at 3
+    metrics.record(m, 12, rows)      -- found, but past the limit: a miss for the agent
+    metrics.record(m, nil, rows)     -- not found
+    metrics.record(m, nil, {})       -- nothing returned
+    local s = metrics.summary(m)
+    local b1, b3 = metrics.row_bytes(rows[1]), 0
+    for i = 1, 3 do b3 = b3 + metrics.row_bytes(rows[i]) end
+    local b10 = 0
+    for i = 1, 10 do b10 = b10 + metrics.row_bytes(rows[i]) end
+    check("summary: R@k and MRR as before", s["recall@1"] == 1 / 5 and s["recall@5"] == 2 / 5
+        and s["recall@20"] == 3 / 5 and math.abs(s.mrr - (1 + 1 / 3 + 1 / 12) / 5) < 1e-9, json.encode(s))
+    check("summary: miss_rate = 1 − R@limit (a rank past the limit is a miss)",
+        s.miss_rate == 3 / 5 and math.abs(s.miss_rate - (1 - s["recall@10"])) < 1e-9, s.miss_rate)
+    check("summary: bytes_to_hit = rows 1..rank, hits only", s.bytes_to_hit_mean == (b1 + b3) / 2
+        and s.bytes_to_hit_median == (b1 + b3) / 2 and s.bytes_to_hit_p90 == b3, json.encode(s))
+    check("summary: est_tokens = bytes / 4", s.est_tokens_to_hit_mean == s.bytes_to_hit_mean / 4)
+    check("summary: bytes_on_miss = the limit's rows (an empty result costs 0)",
+        s.bytes_on_miss_mean == (b10 + b10 + 0) / 3, s.bytes_on_miss_mean)
+    check("summary: tail_misses only counts the not-found", s.tail_misses == 2 and s.limit == 10)
+    local e = metrics.summary(metrics.new({ ks = { 1, 3 } }))
+    check("summary: no questions — zeros, absent byte figures, the line says —",
+        e.n_questions == 0 and e.miss_rate == 0 and e.bytes_to_hit_mean == nil and e["recall@3"] == 0
+        and metrics.line(e):find("mean=—", 1, true) ~= nil, metrics.line(e))
+    check("line: the figures in one line", metrics.line(s):find("miss=60.0%", 1, true) ~= nil, metrics.line(s))
 end
 
 -- =========================================================================

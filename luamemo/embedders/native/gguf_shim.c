@@ -30,7 +30,8 @@ typedef struct {
 static int g_backend_ready = 0;
 
 /* Load a GGUF embedding model. CPU only (n_gpu_layers = 0). Returns an opaque
- * handle, or NULL on failure. n_ctx <= 0 uses a 2048 default. */
+ * handle, or NULL on failure. n_ctx <= 0: the context the model was trained with,
+ * at most 8192 (EmbeddingGemma-300M 2048, EmbeddingGemma 2 8192). */
 void * lmembed_load(const char * path, int n_ctx, int n_gpu_layers) {
     if (!g_backend_ready) { llama_backend_init(); g_backend_ready = 1; }
 
@@ -43,7 +44,11 @@ void * lmembed_load(const char * path, int n_ctx, int n_gpu_layers) {
 
     struct llama_context_params cp = llama_context_default_params();
     cp.embeddings   = true;
-    cp.n_ctx        = (n_ctx > 0) ? (uint32_t) n_ctx : 2048u;
+    if (n_ctx <= 0) {
+        int32_t trained = llama_model_n_ctx_train(model);
+        n_ctx = (trained > 0 && trained < 8192) ? trained : 8192;
+    }
+    cp.n_ctx        = (uint32_t) n_ctx;
     cp.n_batch      = cp.n_ctx;
     cp.n_ubatch     = cp.n_ctx;
     cp.pooling_type = LLAMA_POOLING_TYPE_MEAN;   /* EmbeddingGemma uses mean pooling */
@@ -56,7 +61,10 @@ void * lmembed_load(const char * path, int n_ctx, int n_gpu_layers) {
     h->model  = model;
     h->ctx    = ctx;
     h->vocab  = llama_model_get_vocab(model);
-    h->n_embd = llama_model_n_embd(model);
+    /* The embedding's width: after the model's projection when it has one (EmbeddingGemma
+     * 2: 512 inside, 768 out) — the hidden width alone took its first 512 values. */
+    h->n_embd = llama_model_n_embd_out(model);
+    if (h->n_embd <= 0) h->n_embd = llama_model_n_embd(model);
     h->last_truncated = 0;
     return h;
 }
@@ -209,6 +217,14 @@ int lmgen_complete(void * handle, const char * prompt, char * out, int max_out, 
     }
     out[out_len] = '\0';
     return out_len;
+}
+
+/* The chat template the model ships (its GGUF's tokenizer.chat_template), or NULL. The
+ * caller picks the turn markup from it — Gemma 4's `<|turn>` is not Gemma 1–3's
+ * `<start_of_turn>`, and llama_chat_apply_template knows only the latter. */
+const char * lmgen_chat_template(void * handle) {
+    if (!handle) return NULL;
+    return llama_model_chat_template(((lmgen_t *) handle)->model, NULL);
 }
 
 void lmgen_free(void * handle) {

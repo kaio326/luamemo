@@ -143,4 +143,28 @@ function M.maintenance_exclusion_sql(cap)
     return nil
 end
 
+--- The same as text to append to a WHERE clause: " AND <exclusion>", or "" when nothing is excluded.
+function M.and_exclusion(cap)
+    local excl = M.maintenance_exclusion_sql(cap)
+    return excl and (" AND " .. excl) or ""
+end
+
+--- The SQL twin of maintenance_skip's "codeindex" (a `scope` column that is not the code map's): the one spelling of it.
+M.NOT_CODEINDEX_SQL = "scope NOT GLOB 'codeindex:*'"
+
+--- Is this scope the code map's? (the Lua twin of NOT_CODEINDEX_SQL)
+function M.is_codeindex(scope)
+    return tostring(scope):find("^codeindex:") ~= nil
+end
+
+--- Why the maintenance passes (digest, summaries, the fold review, observations) leave a whole scope alone, or nil:
+--- "no scope" (none given), "codeindex" (the code map is rebuilt from the source, not remembered) or "replica" (a
+--- dev's mirror of the org central). The SQL twin, for rows, is store.maintenance_where.
+function M.maintenance_skip(scope)
+    if scope == nil or scope == "" then return "no scope" end
+    if M.is_codeindex(scope) then return "codeindex" end
+    if M.replica(scope) then return "replica" end
+    return nil
+end
+
 return M

@@ -198,45 +198,19 @@ end
 
 local list = json.list   -- an empty list encodes as []
 
--- What an agent reads of a memory (search, recent, get): its text and where it lives —
--- not the scoring internals (vec_score, fts_score, weight, decay_rate, …), empty tags /
--- metadata left out, the time to the second. About half the tokens of the whole row;
--- `verbose` returns the whole row. In a list (search, recent) a body is at most
--- BODY_CAP bytes (`truncated`: memory_get has it whole) — one long memory (an imported
--- document) cost its full length in every search it matched.
-local BODY_CAP = 2000
-local function compact(r, cap)
-    local out = { id = r.id, observation_id = r.observation_id, title = r.title, body = r.body, kind = r.kind,
-                  scope = r.scope, tier = r.tier }
-    if cap and type(r.body) == "string" and #r.body > cap then
-        out.body, out.truncated = util.cut_utf8(r.body, cap) .. "…", true
-    end
-    if type(r.tags) == "table" and next(r.tags) ~= nil then out.tags = r.tags end
-    -- luamemo's own bookkeeping (lm_*: replica ids, sync clocks, proposal links) and an org
-    -- memory's proposers (people's e-mail identities) stay out: half of an org search's
-    -- answer, sent to the model on every call (verbose keeps them).
-    if type(r.metadata) == "table" then
-        local m
-        for k, v in pairs(r.metadata) do
-            if type(k) ~= "string" or (k:sub(1, 3) ~= "lm_" and k ~= "proposers") then
-                m = m or {}
-                m[k] = v
-            end
-        end
-        out.metadata = m
-    end
-    if r.created_at ~= nil then out.created_at = tostring(r.created_at):sub(1, 19) end
-    if tonumber(r.score) then out.score = tonumber(("%.3f"):format(tonumber(r.score))) end
-    return out
-end
+-- What an agent reads of a memory (search, recent, get): luamemo.ops.compact_row — the
+-- same function the benchmarks measure. `verbose` returns the whole row; a list's bodies
+-- are capped at ops.BODY_CAP (memory_get has them whole).
+local BODY_CAP = ops.BODY_CAP
+local compact = ops.compact_row
 local function rows_out(rows, verbose)
     if verbose or type(rows) ~= "table" then return list(rows) end
     local out = {}
     for i, r in ipairs(rows) do out[i] = type(r) == "table" and compact(r, BODY_CAP) or r end
     return list(out)
 end
--- What a write / update answers (the agent sent the text): the row's handle, and the
--- store's note when it kept the row otherwise (no vector: too long for the embedder).
+-- What a write / update answers (the agent sent the text): the row's handle, and the store's `warning` when it kept or
+-- changed the row otherwise (no vector: too long for the embedder; something derived from it could not be removed or moved).
 local function ack(r)
     return { id = r.id, scope = r.scope, kind = r.kind, title = r.title, tier = r.tier, warning = r.warning }
 end
@@ -425,7 +399,9 @@ Tools.memory_get = {
 }
 
 Tools.memory_update = {
-    description = "Change fields of a memory by id (re-embedded when the text changes).",
+    description = "Change fields of a memory by id (re-embedded when the text changes). New text, or a new `scope`, "
+        .. "retires what was distilled from the memory in its old scope; a `warning` in the answer says that "
+        .. "its embedding is degraded, or that something derived from it could not be removed or moved with it.",
     inputSchema = {
         type = "object",
         properties = {
@@ -495,7 +471,9 @@ end
 Tools.memory_delete = {
     description = "Delete one memory by `id`, or every memory matching a filter (`scope`, optionally "
         .. "`kind` / `metadata_filter`): a filter's first call only previews and returns a `confirm` "
-        .. "token — show the user, then call again with it to delete.",
+        .. "token — show the user, then call again with it to delete. What was derived from the memory goes "
+        .. "with it; if the answer to a delete by `id` carries a `warning`, the observations made from it could "
+        .. "not be removed (they may still serve its text). A delete by filter answers with the count only.",
     inputSchema = {
         type = "object",
         properties = {
@@ -510,9 +488,9 @@ Tools.memory_delete = {
         ensure_setup()
         local store = require("luamemo.store")
         if args.id ~= nil then
-            local ok, err = store.delete(tonumber(args.id))
-            if not ok then return nil, err end
-            return { ok = true }
+            local res, err = store.delete(tonumber(args.id))
+            if not res then return nil, err end
+            return { ok = true, warning = res.warning }
         end
         if type(args.scope) ~= "string" or args.scope == "" then
             return nil, "memory_delete: give an id — or a scope (and optionally kind / metadata_filter) to "
@@ -567,11 +545,11 @@ Tools.memory_consolidate = {
     inputSchema = {
         type = "object",
         properties = {
-            scope = { type = "string", description = "Default: every scope." },
+            scope = { type = "string", description = "Default: every scope, each grouped on its own." },
             dry_run = { type = "boolean" },
-            similarity_threshold = { type = "number", minimum = 0.5, maximum = 1.0, description = "Default 0.85." },
+            similarity_threshold = { type = "number", minimum = 0.5, maximum = 1.0, description = "Default: MEMO_CONSOLIDATE_THRESHOLD, else MEMO_DEDUP_THRESHOLD (0.95)." },
             decay_threshold = { type = "number", minimum = 0, maximum = 1, description = "Default 0.05." },
-            max_rows = { type = "integer", minimum = 1, maximum = 5000, description = "Default 500." },
+            max_rows = { type = "integer", minimum = 1, maximum = 5000, description = "Default 500, in total across scopes (highest importance first)." },
         },
     },
     handler = function(args) ensure_setup(); return ops.consolidate(args) end,
@@ -623,7 +601,7 @@ Tools.memory_embed = {
 
 Tools.memory_tune_weights = {
     description = "Measure the vector / full-text blend that finds a scope's memories best (no model "
-        .. "calls). A report for the user, who applies it with the `apply` command.",
+        .. "calls). A report for the user: its `apply` field is the `memo config set` command.",
     inputSchema = {
         type = "object",
         properties = {
@@ -665,7 +643,7 @@ Tools.memory_digest = {
         properties = {
             scope = { type = "string" },
             dry_run = { type = "boolean" },
-            threshold = { type = "number", minimum = 0.5, maximum = 1.0, description = "Default 0.80." },
+            threshold = { type = "number", minimum = 0.5, maximum = 1.0, description = "Cosine at which the digest groups the tier-0 notes (which group is escalated, which are archived together; observations are still made at MEMO_CONSOLIDATE_THRESHOLD). Default: MEMO_CONSOLIDATE_THRESHOLD, else MEMO_DEDUP_THRESHOLD (0.95)." },
         },
     },
     handler = function(args) ensure_setup(); return ops.digest(args, scope_of(args)) end,
@@ -674,7 +652,8 @@ Tools.memory_digest = {
 Tools.memory_sense = {
     description = "How memory learns from use: relay the recent turns (oldest first) after the user "
         .. "corrects you, sets a standing rule or confirms something; corrections, rules and praise are "
-        .. "recorded on the memories they concern. Re-sending the same turns records nothing new.",
+        .. "recorded on the memories they concern; a rule no memory holds is stored as a decision. "
+        .. "Re-sending the same turns records nothing new.",
     inputSchema = {
         type = "object",
         properties = {

@@ -66,7 +66,12 @@ object, `dedup_strategy`); `items` writes several turns in one call.
 
 In Claude Code the capture hooks do the session part for you: they save the last
 messages into `session:<session id>` before a compaction and every few minutes
-while the agent works (README → *Session continuity and hooks*).
+while the agent works (`memo agent install --with-transcripts`; README → *Session
+continuity and hooks*). Those saves are tier 0 — raw material for `memo digest`;
+`memory_promote` folds what the agent wrote itself (tier 1 and up). `memo calibrate`
+sets up the rest by itself: what you say
+reaches memory (a correction, a standing rule), the brief opens each session, and
+Claude Code's own file memory gives way to luamemo in the project.
 
 ---
 
@@ -171,15 +176,21 @@ summarizer's.
 |---|---|---|---|
 | `from_scope` | `--from` | required | the session scope |
 | `to_scope` | `--to` | required | the long-term scope (must differ) |
-| `delete_source` | `--delete-source` | false | delete the session's memories after folding them |
+| `delete_source` | `--delete-source` | false | delete the memories that were folded (tier 1 and up) |
 | `dry_run` | `--dry-run` | false | report what would happen, write nothing |
 | `limit` | `--limit N` | 200 (at most 1,000) | the most memories folded, oldest first |
 | `min_rows` | `--min-rows N` | 1 | do nothing below this many |
 
-Result: `{ promoted = 1, summary_id, source_ids, dry_run, deleted_source }`;
-nothing to fold: `{ promoted = 0, source_ids = [], reason = "no_rows" }`; an
-error: `{ promoted = 0, errors = [...] }`. Summaries already in the session
-scope (kind `summary`) are not folded again. A dev's read-only org replica can be
+Result: `{ ok, result = { promoted = 1, summary_id, source_ids, dry_run, deleted_source } }`
+(`ok` is true when `promoted` is 1 or there was nothing to fold); nothing to fold:
+`result = { promoted = 0, source_ids = [], reason = "no_rows" }`; an error:
+`ok = false`, `result = { promoted = 0, errors = [...] }`. Only memories of tier 1 or
+higher are folded: the transcript chunks the capture hooks save
+(`--with-transcripts`) are tier 0, so promotion leaves them alone, `delete_source`
+does not delete them (a session with only chunks answers `reason = "no_rows"`),
+and `memo digest` turns them into notes (`memo delete --scope session:<id> --yes`
+removes them). Summaries already in the session scope (kind `summary`) are not
+folded again. A dev's read-only org replica can be
 promoted from, but `delete_source` is refused there.
 
 ---
@@ -199,8 +210,11 @@ promoted from, but `delete_source` is refused there.
 ## Cost & quality notes
 
 - The summary's quality depends on the summarizer (`MEMO_SUMMARIZER_ADAPTER`).
-  The default `noop` joins the source memories (no cost, nothing lost, no
-  compression); `ollama` or `openai` compress them (see
+  The default `auto` uses your `MEMO_GEN_MODEL` when one is configured (a call
+  in this process: seconds to a minute on a CPU) and otherwise joins the source
+  memories (no cost, nothing lost, no compression); `noop` always joins them;
+  `gguf` uses the in-process model; `ollama` and `openai` compress them with the
+  model at `MEMO_SUMMARIZER_URL` / `MEMO_SUMMARIZER_MODEL` (see
   [SETTINGS.md](SETTINGS.md) → Summarizer).
 - Promotion makes **one** summarizer call however many memories it folds (up to
   `limit`). If your model's context is smaller than the session, lower `limit`

@@ -1,7 +1,7 @@
 -- luamemo.sensing.generate  (Phase 9 — in-process generation for "dreams" extraction)
 --
 -- A general complete(prompt) primitive via LuaJIT FFI over the SAME gguf_shim.so
--- (llama.cpp) used by the embedder — a small instruct GGUF (e.g. gemma-3-1b-it)
+-- (llama.cpp) used by the embedder — an instruct GGUF (e.g. gemma-4-E4B-it; Gemma 1–3 work too)
 -- loaded ON-DEMAND (cached, not resident during normal embedding). Greedy /
 -- deterministic. Without a model or the shim it is unavailable and the sensing
 -- pipeline degrades to heuristics-only.
@@ -22,6 +22,8 @@ pcall(ffi.cdef, [[
     int    lmgen_complete(void * handle, const char * prompt, char * out, int max_out, int max_tokens);
     void   lmgen_free(void * handle);
 ]])
+-- (apart: a shim built before this symbol still loads; asking for it is what fails, and markup() catches that)
+pcall(ffi.cdef, "const char * lmgen_chat_template(void * handle);")
 
 local ffishim = require("luamemo.embedders.native.ffi_shim")
 
@@ -32,7 +34,19 @@ local function env(name)
 end
 
 local function model_path(cfg)
-    return (cfg and cfg.gen_model) or env("MODEL")
+    return require("luamemo.llm").model(cfg)   -- (luamemo.llm: the one place the model is named)
+end
+
+--- `text` as a user turn in the model's own markup (`markup`: M.markup(cfg) — "gemma4", Gemma 4's `<|turn>` turns, or
+--- "gemma", Gemma 1–3's `<start_of_turn>`), ready for M.complete. The shim tokenizes with special tokens parsed, so
+--- a control marker inside `text` (a stored memory, a user's turn) would be read as one and could close the turn and
+--- write the model's own: every `<…>` tag-looking token in it is defanged first (`< …>`; a token has no space in
+--- it, so `<|"|>` is one and `<a href="…">` is not), and a NUL is dropped (the prompt is a C string: it would end there,
+--- cutting off the closing markup).
+function M.wrap(text, markup)
+    local body = (tostring(text):gsub("%z", ""):gsub("<([^<>%s]+>)", "< %1"))
+    if markup == "gemma4" then return "<|turn>user\n" .. body .. "<turn|>\n<|turn>model\n" end
+    return "<start_of_turn>user\n" .. body .. "<end_of_turn>\n<start_of_turn>model\n"
 end
 
 local _handle, _outbuf
@@ -60,18 +74,31 @@ function M.available(cfg)
     return (m ~= nil and m ~= "") and ffishim.exists(ffishim.shim_path(cfg)) and ffishim.exists(m)
 end
 
---- complete(prompt, cfg) -> string | nil, err. Greedy/deterministic.
-function M.complete(prompt, cfg)
+--- complete(prompt, cfg, opts) -> string | nil, err. Greedy/deterministic. opts.max_tokens (cfg.max_tokens, 256).
+function M.complete(prompt, cfg, opts)
     local ok, res = pcall(function()
         local lib = ffishim.load(cfg)
         local h   = ensure(cfg)
-        local max_tokens = tonumber(cfg and cfg.max_tokens) or 256
+        local max_tokens = tonumber(opts and opts.max_tokens) or tonumber(cfg and cfg.max_tokens) or 256
         local n = lib.lmgen_complete(h, prompt or "", _outbuf, OUTCAP, max_tokens)
         if n < 0 then error("generation failed") end
         return ffi.string(_outbuf, n)
     end)
     if not ok then return nil, "generate: " .. tostring(res) end
     return res
+end
+
+--- The turn markup of the model's own chat template: "gemma4" (`<|turn>user … <turn|>`) or
+--- "gemma" (`<start_of_turn>`, Gemma 1–3 — also when the template can't be read: a
+--- shim built before lmgen_chat_template, or a model without one).
+function M.markup(cfg)
+    local ok, tmpl = pcall(function()
+        local lib = ffishim.load(cfg)
+        local p = lib.lmgen_chat_template(ensure(cfg))
+        return p ~= nil and ffi.string(p) or ""
+    end)
+    if ok and tmpl:find("<|turn>", 1, true) then return "gemma4" end
+    return "gemma"
 end
 
 function M.reset()

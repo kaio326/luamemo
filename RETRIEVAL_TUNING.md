@@ -142,7 +142,7 @@ second pass that re-scores the hybrid top N against the query.
 | Adapter | Cost | Notes |
 |---|---|---|
 | `noop` | ~zero, in-process | Word overlap between query and memory. A surprisingly strong baseline |
-| `learned` | ~zero, in-process | Trained per scope on how memories were used ([README → Learning from use](README.md#learning-from-use)); `memo learn` promotes it only when it beats the current one |
+| `learned` | ~zero, in-process | Trained per scope on how memories were used ([README → Learning from use](README.md#learning-from-use)); `memo learn` promotes it only when it beats the current one. Needs `MEMO_FEEDBACK_ENABLED=true` (off by default); until a model is promoted the order is unchanged |
 | `ollama` | a local LLM call | Ollama with JSON output (`MEMO_RERANK_MODEL`, default `llama3.2`) |
 | `openai` | a hosted LLM call | OpenAI chat completions with JSON output; the key as `{secret:NAME}` in `MEMO_RERANK_HEADERS` |
 | `cross_encoder` | a sidecar call | A TEI / Cohere / Jina `/rerank` endpoint |
@@ -171,12 +171,15 @@ more time. R@20 doesn't move: a reranker only **reorders** the candidates — it
 can't recall what the hybrid search missed. For that, improve the embedder or the
 blend (priorities 1 and 4).
 
-Reproduce (any scratch database — the runner wipes its own scopes):
+Reproduce (any scratch database — the runner wipes its own scopes). Get the
+dataset once with `memo eval fetch longmemeval_s --yes` (278 MB; it lands in
+`~/.local/share/luamemo/eval-data`, so pass that path as `--corpus`; `eval/data/`
+is git-ignored):
 
 ```bash
-MEMO_DB=bench luajit eval/longmemeval_run.lua --embedder ollama \
+MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/longmemeval_run.lua --embedder ollama \
     --corpus eval/data/longmemeval_s.json --n 50 --out /tmp/baseline.json
-MEMO_DB=bench luajit eval/longmemeval_run.lua --embedder ollama \
+MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/longmemeval_run.lua --embedder ollama \
     --corpus eval/data/longmemeval_s.json --n 50 \
     --rerank --rerank-adapter noop --rerank-top-n 20 --out /tmp/rerank-noop.json
 ```

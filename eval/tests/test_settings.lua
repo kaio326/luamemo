@@ -311,6 +311,24 @@ check("list --json: every setting, its value and its source", #(list.settings or
 local o8 = memo("config unset dedup_threshold")
 check("unset: gone from the project's file — the user's value applies", o8:find("~/.luamemorc sets 0.8", 1, true) ~= nil
     and (memo("config get dedup_threshold")) == "0.8", o8)
+-- A name 0.4 read (MEMO_DB_URL, in every upgraded project's file): the warning names the
+-- command, and unset removes it (memo's own writer: the file stays trusted).
+local put = ("local ok, e = require('luamemo.cli._common').rc_set(%q, 'MEMO_DB_URL', 'postgres://u:pw@h/db') "
+    .. "assert(ok, e)"):format(proj .. "/.luamemorc")
+memo("config set dedup_threshold 0.9")
+sh(("cd %q && %s %q -e %q"):format(proj, ENV, H.lua_bin(), put))
+local w, cw = memo("config check")
+check("a retired setting: config check names it and the command that removes it", cw == 1
+    and w:find("MEMO_DB_URL is no longer read", 1, true) and w:find("memo config unset MEMO_DB_URL", 1, true)
+    and not w:find("pw@", 1, true), w)
+local u, cu = memo("config unset MEMO_DB_URL")
+check("unset a retired setting: removed, the other settings kept, the value never shown", cu == 0
+    and u:find("MEMO_DB_URL removed from .luamemorc", 1, true) and not u:find("pw@", 1, true)
+    and rc("MEMO_DB_URL") == nil and rc("MEMO_DEDUP_THRESHOLD") == "0.9", u)
+local _, cc = memo("config check")
+local u2 = memo("config unset db_url")
+check("… then check is clean again, and a second unset says it isn't set", cc == 0
+    and u2:find("MEMO_DB_URL is not set", 1, true) ~= nil, u2)
 local o9, c9 = sh(("cd %q && MEMO_DEDUP_TRESHOLD=1 %s %q config check"):format(proj, ENV, REPO .. "/cli/memo"))
 check("check: names a variable luamemo doesn't read (exit 1)", c9 == 1
     and o9:find("did you mean MEMO_DEDUP_THRESHOLD", 1, true) ~= nil, o9)

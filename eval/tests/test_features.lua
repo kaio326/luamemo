@@ -15,7 +15,7 @@ package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 local db     = require("luamemo.db")
 local memory = require("luamemo")
 local now_us = require("luamemo.util").now_us
-local DAY_US = 86400 * 1000000
+local DAY_US = require("luamemo.util").DAY_US
 local function count(sql, ...) return tonumber((db.value(sql, ...))) or 0 end
 
 local pass = 0
@@ -297,6 +297,22 @@ do
     memory.delete(parent.id)
     check("patterns store: a deleted memory's companions go with it", had >= 1 and companions() == 0,
         "had=" .. had .. " left=" .. companions())
+    -- … a move to another scope (same text) takes them along, unconsolidated, to be digested there; new text takes them (they
+    -- were written from the old text)
+    local mover = memory.write({ scope = SCOPE, kind = "fact", title = "Editor moved",
+        body = "I prefer tabs over spaces for indentation in every project, always." })
+    local OTHER = SCOPE .. "-moved-to"
+    local mover_had = count("SELECT count(*) FROM lm_memories WHERE scope = ? AND json_extract(metadata, '$.source_id') = ?", SCOPE, mover.id)
+    assert(memory.update(mover.id, { scope = OTHER }))
+    check("patterns store: a moved memory's companions move with it, unconsolidated",
+        mover_had >= 1
+        and count("SELECT count(*) FROM lm_memories WHERE scope = ? AND json_extract(metadata, '$.source_id') = ?", SCOPE, mover.id) == 0
+        and count("SELECT count(*) FROM lm_memories WHERE scope = ? AND json_extract(metadata, '$.source_id') = ? AND consolidated_at IS NULL",
+            OTHER, mover.id) == mover_had, "had=" .. mover_had)
+    assert(memory.update(mover.id, { body = "I like spaces now, never tabs, and I prefer them everywhere." }))
+    check("patterns store: new text takes the companions written from the old text",
+        count("SELECT count(*) FROM lm_memories WHERE json_extract(metadata, '$.source_id') = ? AND body LIKE '%tabs over spaces%'", mover.id) == 0)
+    memory.delete(mover.id)
     count_after = count("SELECT count(*) FROM lm_memories WHERE scope = ?", SCOPE)
 
     -- patterns_enabled=false suppresses extraction
@@ -571,6 +587,21 @@ do
         merged[1] and tostring(merged[1].id) == "2",
         merged[1] and ("got id=" .. tostring(merged[1].id)) or "empty")
     check("temporal: rrf_merge has 3 unique ids", #merged == 3, tostring(#merged))
+    -- Ties (1st/2nd in one list, 2nd/1st in the other score the same) keep the order the
+    -- rows first appear in — never pairs() order, which LuaJIT randomises per process.
+    local first, swapped, want = {}, {}, {}
+    for p = 1, 6 do                                        -- 6 tied pairs: a chance pass is 1/64
+        local a, b = { id = "p" .. p .. "a" }, { id = "p" .. p .. "b" }
+        first[#first + 1], first[#first + 2] = a, b
+        swapped[#swapped + 1], swapped[#swapped + 2] = b, a
+        want[#want + 1], want[#want + 2] = a.id, b.id
+    end
+    local tie = temporal.rrf_merge({ first, swapped })
+    local got = {}
+    for i, r in ipairs(tie) do got[i] = r.id end
+    check("temporal: rrf_merge ties keep the first list's order (deterministic)",
+        table.concat(got, ",") == table.concat(want, ",") and tie[1].rrf_score == tie[2].rrf_score
+        and tie[1]._rrf_pos == nil, table.concat(got, ","))
 
     -- Integration: temporal routing
     local function search_t(query, extra)

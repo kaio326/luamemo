@@ -130,6 +130,11 @@ luajit eval/tests/run.lua --only convomem
 
 ### Live download + corpus build
 
+From a release install, `memo eval fetch convomem` downloads the same three
+batches (size and sha256 checked) and builds the corpus in
+`~/.local/share/luamemo/eval-data`; `memo eval run convomem` runs it. The steps
+below are for a checkout, and for running one runner by hand.
+
 ```bash
 mkdir -p eval/data/convomem_raw
 # Sample three batches from user_evidence/1_evidence (cs=1,2,3; ~36 MB total).
@@ -152,14 +157,14 @@ verbatim as part of `dialogue_id`.
 Hash baseline:
 
 ```bash
-MEMO_DB=bench luajit eval/convomem_run.lua --embedder hash \
+MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/convomem_run.lua --embedder hash \
   --out eval/results/convomem_hash.json
 ```
 
 Ollama:
 
 ```bash
-MEMO_DB=bench OLLAMA_URL=http://127.0.0.1:11434/api/embeddings \
+MEMO_NO_MAINTENANCE=1 MEMO_DB=bench OLLAMA_URL=http://127.0.0.1:11434/api/embeddings \
   OLLAMA_MODEL=nomic-embed-text OLLAMA_DIM=768 \
   luajit eval/convomem_run.lua --embedder ollama \
   --out eval/results/convomem_ollama.json
@@ -169,7 +174,6 @@ MEMO_DB=bench OLLAMA_URL=http://127.0.0.1:11434/api/embeddings \
 
 ## Decision rule for promotion
 
-Same as the LoCoMo decision rule: a config is promoted only when both
-benches agree within ±2 pp R@1 / ±5 pp R@10 on the same embedder
-delta, no category regresses materially, and the CI guard stays
-green. ConvoMem alone is not sufficient — it is the cross-validator.
+Same as the LoCoMo decision rule (see [`locomo.md`](locomo.md)): ConvoMem
+`overall` must agree within ±2 pp with LoCoMo's delta on the same embedder.
+ConvoMem alone is not sufficient — it is the cross-validator.

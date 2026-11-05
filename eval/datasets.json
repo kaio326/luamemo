@@ -1,0 +1,89 @@
+{
+  "_comment": "The public datasets `memo eval fetch` downloads (eval kit). Each file is checked against the SHA-256 of the copy the baselines were measured on; one that differs is refused. The data is not luamemo's: each dataset's own license and terms apply (see source).",
+  "datasets": {
+    "locomo": {
+      "title": "LoCoMo (Maharana et al., 2024) — long multi-session conversations",
+      "source": "https://github.com/snap-research/locomo",
+      "tier": "standard",
+      "files": [
+        { "path": "locomo.json", "bytes": 2805274,
+          "url": "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json",
+          "sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4" }
+      ]
+    },
+    "convomem": {
+      "title": "ConvoMem (Salesforce, 2025) — user-evidence batches 005 / 020 / 030",
+      "source": "https://huggingface.co/datasets/Salesforce/ConvoMem",
+      "tier": "standard",
+      "build": "convomem",
+      "files": [
+        { "path": "convomem_raw/ue1_b005.json", "bytes": 6395671,
+          "url": "https://huggingface.co/datasets/Salesforce/ConvoMem/resolve/main/core_benchmark/pre_mixed_testcases/user_evidence/1_evidence/batched_005.json",
+          "sha256": "dd534e879932bb7cb853bff544d7fc31588b5285f2ebdbbbc9ddc9e733e79b1d" },
+        { "path": "convomem_raw/ue1_b020.json", "bytes": 12036141,
+          "url": "https://huggingface.co/datasets/Salesforce/ConvoMem/resolve/main/core_benchmark/pre_mixed_testcases/user_evidence/1_evidence/batched_020.json",
+          "sha256": "76c89dabdaa1618babde3c495d92b08e14124c91d1498fe351660d3f9ff1300c" },
+        { "path": "convomem_raw/ue1_b030.json", "bytes": 17944442,
+          "url": "https://huggingface.co/datasets/Salesforce/ConvoMem/resolve/main/core_benchmark/pre_mixed_testcases/user_evidence/1_evidence/batched_030.json",
+          "sha256": "1646e740730ef15ded074618593415d8fbc0adac0a87041d497a661524b7dca6" }
+      ]
+    },
+    "longmemeval_oracle": {
+      "title": "LongMemEval oracle (Wu et al., 2024) — 500 questions, evidence sessions only",
+      "source": "https://huggingface.co/datasets/xiaowu0162/longmemeval",
+      "tier": "standard",
+      "files": [
+        { "path": "longmemeval_oracle.json", "bytes": 15388478,
+          "url": "https://huggingface.co/datasets/xiaowu0162/longmemeval/resolve/main/longmemeval_oracle",
+          "sha256": "821a2034d219ab45846873dd14c14f12cfe7776e73527a483f9dac095d38620c" }
+      ]
+    },
+    "longmemeval_s": {
+      "title": "LongMemEval _s (Wu et al., 2024) — 500 questions, ~50 sessions of haystack each",
+      "source": "https://huggingface.co/datasets/xiaowu0162/longmemeval",
+      "tier": "full",
+      "files": [
+        { "path": "longmemeval_s.json", "bytes": 278025796,
+          "url": "https://huggingface.co/datasets/xiaowu0162/longmemeval/resolve/main/longmemeval_s",
+          "sha256": "08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894" }
+      ]
+    },
+    "membench": {
+      "title": "MemBench (ACL 2025) — the standard 8,500 questions (FirstAgent)",
+      "source": "https://github.com/import-myself/Membench",
+      "tier": "full",
+      "files": [
+        { "path": "membench/aggregative.json", "bytes": 60875198,
+          "url": "https://raw.githubusercontent.com/import-myself/Membench/main/MemData/FirstAgent/aggregative.json",
+          "sha256": "a05de17960dd41f298a5bf58df47e161526045ca4cc71fe2af6e9a3c5a9be97b" },
+        { "path": "membench/comparative.json", "bytes": 60389448,
+          "url": "https://raw.githubusercontent.com/import-myself/Membench/main/MemData/FirstAgent/comparative.json",
+          "sha256": "aae21a7a0b9a755d3fba7ab212f6ab7f4b8bcad6cbbe94b1a6c70d3ab8099e2a" },
+        { "path": "membench/conditional.json", "bytes": 66632463,
+          "url": "https://raw.githubusercontent.com/import-myself/Membench/main/MemData/FirstAgent/conditional.json",
+          "sha256": "9fa454f02b4f4fda075ef6cdc9199a9ec3e6243dacab5651d440d1b9876ced11" },
+        { "path": "membench/highlevel.json", "bytes": 13832415,
+          "url": "https://raw.githubusercontent.com/import-myself/Membench/main/MemData/FirstAgent/highlevel.json",
+          "sha256": "60a93a286c28bce01863f2f79ec4c6f5d0ad10905b030b13227c14d0c6385521" },
+        { "path": "membench/highlevel_rec.json", "bytes": 25132429,
+          "url": "https://raw.githubusercontent.com/import-myself/Membench/main/MemData/FirstAgent/highlevel_rec.json",
+          "sha256": "81c19f8913cd905f53cec24e9c658e57afc99428cd0d9b8fd503bed438cf69a0" },
+        { "path": "membench/knowledge_update.json", "bytes": 69972511,
+          "url": "https://raw.githubusercontent.com/import-myself/Membench/main/MemData/FirstAgent/knowledge_update.json",
+          "sha256": "ab4851ff4689777bd620895aa0080ba94f3c499c34be6b90df2c5bfbd006d074" },
+        { "path": "membench/lowlevel_rec.json", "bytes": 15343187,
+          "url": "https://raw.githubusercontent.com/import-myself/Membench/main/MemData/FirstAgent/lowlevel_rec.json",
+          "sha256": "ff8d4a97021f483223354b57c6f524231906b5202a51068b9f3ded4327165d64" },
+        { "path": "membench/noisy.json", "bytes": 66760891,
+          "url": "https://raw.githubusercontent.com/import-myself/Membench/main/MemData/FirstAgent/noisy.json",
+          "sha256": "64ac646966b165fddad6c2ab3d858a9714a6b6997550338bb2a01200df75f1a2" },
+        { "path": "membench/post_processing.json", "bytes": 66724583,
+          "url": "https://raw.githubusercontent.com/import-myself/Membench/main/MemData/FirstAgent/post_processing.json",
+          "sha256": "81070f1fd6bf394d92dc347e888a4b83ed6579e139846d42f0beb054ce371377" },
+        { "path": "membench/simple.json", "bytes": 60779676,
+          "url": "https://raw.githubusercontent.com/import-myself/Membench/main/MemData/FirstAgent/simple.json",
+          "sha256": "0e3bc668d5fb4f012ac0f7f07013bd87f14fbd309faeaf33f6798a46a799490a" }
+      ]
+    }
+  }
+}

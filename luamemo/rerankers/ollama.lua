@@ -41,11 +41,14 @@ function M.rerank(query, hits, cfg)
     local url = cfg.rerank_url
     if not url then return nil, "ollama.rerank: rerank_url not set" end
 
+    -- think = false: a thinking model (gemma4, qwen3…) would reason before every score —
+    -- 1,000+ characters and ~10× the time per search for the same JSON.
     local req_body = json.encode({
         model  = cfg.rerank_model or "llama3.2",
         prompt = build_prompt(query, hits),
         stream = false,
         format = "json",
+        think  = false,
     })
 
     local status, body, err = http.request(url, {
@@ -61,12 +64,15 @@ function M.rerank(query, hits, cfg)
     if not payload or type(payload.response) ~= "string" then
         return nil, "ollama.rerank: missing 'response' field"
     end
+    -- The model's tokens for this call (Ollama counts them), for luamemo.rerank's stats.
+    local info = { tokens = (tonumber(payload.prompt_eval_count) or 0) + (tonumber(payload.eval_count) or 0) }
     local parsed = json.decode(payload.response)  -- luacheck: ignore
     if type(parsed) ~= "table" or type(parsed.scores) ~= "table" then
-        return nil, "ollama.rerank: model output not valid JSON {scores:[...]}"
+        return nil, "ollama.rerank: model output not valid JSON {scores:[...]}", info
     end
 
-    return util.parse_scores(parsed.scores)
+    local scores, serr = util.parse_scores(parsed.scores)
+    return scores, serr, info
 end
 
 return M

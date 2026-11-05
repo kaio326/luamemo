@@ -12,8 +12,9 @@
 -- answer. That isolates luamemo's contribution from the downstream
 -- generator.
 --
--- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes):
---   MEMO_DB=bench luajit eval/recall_bench.lua \
+-- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes;
+-- MEMO_NO_MAINTENANCE=1: its writes start no `memo maintain` on it):
+--   MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/recall_bench.lua \
 --       --embedder hash --n 20 --out eval/results/recall_hash.json
 --
 -- Embedders:

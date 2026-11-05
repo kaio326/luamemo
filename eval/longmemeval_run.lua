@@ -13,8 +13,9 @@
 -- This is **retrieval-side only** — we do not score generated answers.
 -- The metric isolates luamemo's contribution from the downstream LLM.
 --
--- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes):
---   MEMO_DB=bench luajit eval/longmemeval_run.lua \
+-- Usage (MEMO_DB: the database — a scratch name or path; the run wipes its own scopes;
+-- MEMO_NO_MAINTENANCE=1: its writes start no `memo maintain` on it):
+--   MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/longmemeval_run.lua \
 --       --embedder hash --out eval/results/longmemeval_hash.json
 --
 -- Dataset: `eval/data/longmemeval_oracle.json` (15 MB, 500 questions).
@@ -175,6 +176,7 @@ if args.summarizer_model then
     setup_opts.summarizer_model   = args.summarizer_model
 end
 
+setup_opts.embed_prompts = os.getenv("EMBED_PROMPTS")   -- none | auto | JSON (luamemo.embed)
 memory.setup(setup_opts)
 
 if args.rerank then
@@ -230,16 +232,9 @@ local function set_of(list)
     return s
 end
 
--- --- per-type accumulator ------------------------------------------------
-local function new_bucket()
-    return {
-        n            = 0,
-        sum_mrr      = 0,
-        hits         = { [1] = 0, [5] = 0, [10] = 0, [20] = 0 },
-        rank_list    = {},
-        miss_count   = 0,
-    }
-end
+-- --- per-type accumulator (eval/metrics.lua: R@k, MRR, miss rate, bytes to the hit)
+local metrics = require("eval.metrics")
+local new_bucket = metrics.new
 local overall = new_bucket()
 local by_type = {}
 
@@ -353,18 +348,7 @@ for qi, q in ipairs(rows) do
         end
         return nil
     end
-    local function record(b, rank)
-        b.n = b.n + 1
-        if rank then
-            b.sum_mrr = b.sum_mrr + (1.0 / rank)
-            b.rank_list[#b.rank_list + 1] = rank
-            for _, k in ipairs({ 1, 5, 10, 20 }) do
-                if rank <= k then b.hits[k] = b.hits[k] + 1 end
-            end
-        else
-            b.miss_count = b.miss_count + 1
-        end
-    end
+    local record = metrics.record   -- (bucket, rank, the rows searched)
 
     local qtype = q.question_type or "unknown"
     by_type[qtype] = by_type[qtype] or new_bucket()
@@ -374,7 +358,7 @@ for qi, q in ipairs(rows) do
         -- per_question records the rank under the FIRST grid point only
         -- (acts as the canonical pointer); per-point ranks live in their
         -- own buckets only.
-        local first_rank
+        local first_rank, first_results
         for pi, p in ipairs(sweep_points) do
             local results, serr = memory.search({
                 query          = q.question,
@@ -388,11 +372,11 @@ for qi, q in ipairs(rows) do
                 os.exit(1)
             end
             local rank = rank_for(results)
-            record(point_buckets[point_key(p)], rank)
-            if pi == 1 then first_rank = rank end
+            record(point_buckets[point_key(p)], rank, results)
+            if pi == 1 then first_rank, first_results = rank, results end
         end
-        record(overall, first_rank)
-        record(by_type[qtype], first_rank)
+        record(overall, first_rank, first_results)
+        record(by_type[qtype], first_rank, first_results)
         per_question[#per_question + 1] = {
             question_id   = q.question_id,
             question_type = qtype,
@@ -415,8 +399,8 @@ for qi, q in ipairs(rows) do
             os.exit(1)
         end
         local rank = rank_for(results)
-        record(overall, rank)
-        record(by_type[qtype], rank)
+        record(overall, rank, results)
+        record(by_type[qtype], rank, results)
         per_question[#per_question + 1] = {
             question_id   = q.question_id,
             question_type = qtype,
@@ -433,29 +417,7 @@ end
 print("")
 
 -- --- aggregate -----------------------------------------------------------
-local function median(t)
-    if #t == 0 then return nil end
-    local sorted = {}
-    for _, v in ipairs(t) do sorted[#sorted + 1] = v end
-    table.sort(sorted)
-    local mid = math.floor(#sorted / 2) + 1
-    if #sorted % 2 == 1 then return sorted[mid] end
-    return (sorted[mid - 1] + sorted[mid]) / 2
-end
-
-local function summarise(b)
-    local n = b.n
-    return {
-        n_questions   = n,
-        ["recall@1"]  = n > 0 and (b.hits[1]  / n) or 0,
-        ["recall@5"]  = n > 0 and (b.hits[5]  / n) or 0,
-        ["recall@10"] = n > 0 and (b.hits[10] / n) or 0,
-        ["recall@20"] = n > 0 and (b.hits[20] / n) or 0,
-        mrr           = n > 0 and (b.sum_mrr  / n) or 0,
-        median_rank   = median(b.rank_list),
-        tail_misses   = b.miss_count,
-    }
-end
+local summarise = metrics.summary
 
 local report = {
     embedder      = args.embedder,
@@ -473,6 +435,7 @@ local report = {
 for qtype, b in pairs(by_type) do
     report.by_type[qtype] = summarise(b)
 end
+for k, v in pairs(metrics.rerank_summary()) do report.overall[k] = v end   -- the reranker's cost
 
 if sweep_points then
     report.sweep = {
@@ -494,11 +457,12 @@ end
 -- --- print ---------------------------------------------------------------
 local function fmt_pct(x) return string.format("%5.1f%%", x * 100) end
 local function print_row(label, s)
-    print(string.format("  %-28s n=%4d  R@1=%s  R@5=%s  R@10=%s  R@20=%s  MRR=%.3f  miss=%d",
+    print(string.format("  %-28s n=%4d  R@1=%s  R@5=%s  R@10=%s  R@20=%s  MRR=%.3f  not-found=%d",
         label, s.n_questions,
         fmt_pct(s["recall@1"]),  fmt_pct(s["recall@5"]),
         fmt_pct(s["recall@10"]), fmt_pct(s["recall@20"]),
         s.mrr, s.tail_misses))
+    print(string.format("  %-28s %s", "", metrics.line(s)))
 end
 
 print(string.rep("-", 96))

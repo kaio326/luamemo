@@ -89,6 +89,7 @@ end)
 local INTERNAL = {   -- arguments no surface takes, with the reason
     _cap              = "a capability token for luamemo's own writers (replica sync, directive ingest)",
     _reembed          = "memo reembed's own path",
+    no_miss           = "luamemo's own writes (calibrate's rows, a promoted summary, org knowledge, the benchmark ledger) — not a search that missed",
     skip_feedback     = "system searches (training, gating, evaluation) — not a retrieval anyone acted on",
     skip_observations = "internal searches that don't want observation rows appended",
     skip_temporal     = "internal searches that don't parse time expressions in the query",
@@ -216,11 +217,29 @@ check("memory_brief is memo brief (the hooks' digest): both call luamemo.brief",
 -- server doesn't have is silently dropped.
 local agent = assert(slurp("agents/luamemo.agent.md"))
 local listed_n, unknown = 0, {}
+local listed = {}
 for name in agent:match("^%-%-%-\n(.-)\n%-%-%-"):gmatch("\n%s*%- luamemo/([%w_]+)") do
     listed_n = listed_n + 1
+    listed[name] = true
     if not tools[name] then unknown[#unknown + 1] = name end
 end
 check("every tool the luamemo agent lists exists", listed_n > 0 and #unknown == 0, table.concat(unknown, ", "))
+-- The rules the agent file carries send it to secret_execute (and secret_list to see the
+-- names): a tool the rules name but the list omits is one VS Code won't let it call.
+-- (the names come from the rules block itself, so a tool added to the rules without the list is caught;
+-- secret_list is only named in prose around it, so it is added)
+local rules_block = agent:match("<!%-%- luamemo:core%-rules:begin %-%->\n(.-)<!%-%- luamemo:core%-rules:end %-%->") or ""
+local required, required_n = { secret_list = true }, 1
+for name in rules_block:gmatch("`([%l_]+)`") do
+    if (name:match("^memory_") or name:match("^index_") or name:match("^secret_")) and not required[name] then
+        required[name] = true; required_n = required_n + 1
+    end
+end
+local missing = {}
+for name in pairs(required) do if not listed[name] then missing[#missing + 1] = name end end
+table.sort(missing)
+check("the luamemo agent lists every tool its rules send it to (read from the rules block: " .. required_n .. " tools)",
+    required_n >= 7 and #missing == 0, table.concat(missing, ", "))
 end)
 
 -- ---------------------------------------------------------------------------
@@ -235,6 +254,8 @@ local function block(path)
 end
 local canon = block("mcp/instructions.md")
 check("mcp/instructions.md holds the core-rules block", canon ~= nil and #canon > 200)
+check("… and it says luamemo is the only memory store, and that a standing rule is stored for the agent (Phase 23.4)",
+    canon ~= nil and canon:find("**One store:**", 1, true) ~= nil and canon:find("a standing rule no memory\n  holds is stored for you", 1, true) ~= nil)
 for _, path in ipairs({ "skills/session-memory/SKILL.md", "agents/luamemo.agent.md" }) do
     local b = block(path)
     check(path .. ": the same block, word for word", canon ~= nil and b == canon,

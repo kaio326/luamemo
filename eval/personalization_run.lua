@@ -18,7 +18,8 @@
 -- Database: MEMO_DB (a scratch name or path; the run wipes its own scope).
 -- Usage: the embedder defaults to hash (self-contained). Override with --embedder.
 --
---   MEMO_DB=bench luajit eval/personalization_run.lua --embedder hash
+--   MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/personalization_run.lua --embedder hash
+-- (MEMO_NO_MAINTENANCE=1: its writes start no `memo maintain` on the scratch database)
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 local cjson  = require("luamemo.json")
@@ -35,6 +36,9 @@ do
         elseif a == "--out"      then args.out      = arg[i + 1]; i = i + 2
         elseif a == "--corpus"   then args.corpus   = arg[i + 1]; i = i + 2
         elseif a == "--queries"  then args.queries  = arg[i + 1]; i = i + 2
+        elseif a == "--rerank"   then args.rerank   = true; i = i + 1
+        elseif a == "--rerank-adapter" then args.rerank_adapter = arg[i + 1]; i = i + 2
+        elseif a == "--rerank-top-n"   then args.rerank_top_n   = tonumber(arg[i + 1]); i = i + 2
         else io.stderr:write("unknown arg: " .. tostring(a) .. "\n"); os.exit(2) end
     end
 end
@@ -77,10 +81,30 @@ elseif args.embedder == "tei" then
     setup_opts.embedder_model   = os.getenv("TEI_MODEL") or "BAAI/bge-m3"
     setup_opts.embed_dim        = tonumber(os.getenv("TEI_DIM") or "1024")
     setup_opts.embed_timeout_ms = tonumber(os.getenv("EMBED_TIMEOUT_MS") or "120000")
+elseif args.embedder == "gguf" then
+    -- In-process GGUF embedder (EmbeddingGemma via LuaJIT FFI), as the other runners.
+    setup_opts.embedder_local = "gguf_ffi"
+    setup_opts.embedder_model = os.getenv("MEMO_GGUF_MODEL")
+        or (os.getenv("HOME") .. "/models/embeddinggemma-300M-Q8_0.gguf")
+    setup_opts.embed_dim      = tonumber(os.getenv("MEMO_GGUF_DIM") or "768")
 else
     io.stderr:write("unknown --embedder: " .. tostring(args.embedder) .. "\n"); os.exit(2)
 end
+setup_opts.embed_prompts = os.getenv("EMBED_PROMPTS")   -- none | auto | JSON (luamemo.embed)
 memory.setup(setup_opts)
+if args.rerank then   -- as the other runners: the endpoint from OLLAMA_RERANK_* / RERANK_*
+    memory.config.rerank_enabled = true
+    memory.config.rerank_adapter = args.rerank_adapter or "noop"
+    memory.config.rerank_top_n   = args.rerank_top_n or 20
+    if memory.config.rerank_adapter == "ollama" then
+        memory.config.rerank_url   = os.getenv("OLLAMA_RERANK_URL") or "http://127.0.0.1:11434/api/generate"
+        memory.config.rerank_model = os.getenv("OLLAMA_RERANK_MODEL") or "llama3.2"
+        memory.config.rerank_timeout_ms = tonumber(os.getenv("RERANK_TIMEOUT_MS") or "180000")
+    elseif memory.config.rerank_adapter == "cross_encoder" then
+        memory.config.rerank_url   = os.getenv("RERANK_URL") or "http://127.0.0.1:8080/rerank"
+        memory.config.rerank_model = os.getenv("RERANK_MODEL") or "BAAI/bge-reranker-v2-m3"
+    end
+end
 
 local scope = "perso:" .. args.embedder
 
@@ -113,23 +137,13 @@ local function item_id_of(row)
     return (type(md) == "table") and md.item_id or nil
 end
 
-local KS = { 1, 3, 5, 10 }
-local function new_bucket()
-    local b = { n = 0, sum_mrr = 0, hits = {}, ranks = {} }
-    for _, k in ipairs(KS) do b.hits[k] = 0 end
-    return b
-end
-local function record(b, rank)
-    b.n = b.n + 1
-    b.ranks[#b.ranks + 1] = rank or 0
-    if rank then
-        b.sum_mrr = b.sum_mrr + 1 / rank
-        for _, k in ipairs(KS) do if rank <= k then b.hits[k] = b.hits[k] + 1 end end
-    end
-end
+-- eval/metrics.lua: R@k, MRR, miss rate, bytes to the hit
+local metrics = require("eval.metrics")
+local function new_bucket() return metrics.new({ ks = { 1, 3, 5, 10 } }) end
+local record = metrics.record
 local function finalize(b)
-    local o = { n = b.n, mrr = b.n > 0 and (b.sum_mrr / b.n) or 0 }
-    for _, k in ipairs(KS) do o["recall@" .. k] = b.n > 0 and (b.hits[k] / b.n) or 0 end
+    local o = metrics.summary(b)
+    o.n = b.n
     return o
 end
 
@@ -151,10 +165,10 @@ for _, q in ipairs(queries) do
         if item_id_of(row) == q.gold_id then rank = idx; break end
     end
 
-    record(overall, rank)
+    record(overall, rank, rows)
     local ov = q.lexical_overlap or "unknown"
     by_overlap[ov] = by_overlap[ov] or new_bucket()
-    record(by_overlap[ov], rank)
+    record(by_overlap[ov], rank, rows)
 
     per_query[#per_query + 1] = { query = q.query, gold_id = q.gold_id,
         lexical_overlap = ov, rank = rank or 0, hit = rank ~= nil }
@@ -162,15 +176,17 @@ end
 
 -- --- report --------------------------------------------------------------
 local O = finalize(overall)
-print(string.format("\nOVERALL  n=%d  R@1=%.1f%%  R@3=%.1f%%  R@5=%.1f%%  R@10=%.1f%%  MRR=%.3f  miss=%d",
-    O.n, 100*O["recall@1"], 100*O["recall@3"], 100*O["recall@5"], 100*O["recall@10"], O.mrr,
-    O.n - math.floor(O["recall@10"] * O.n + 0.5)))
+for k, v in pairs(metrics.rerank_summary()) do O[k] = v end   -- the reranker's cost
+print(string.format("\nOVERALL  n=%d  R@1=%.1f%%  R@3=%.1f%%  R@5=%.1f%%  R@10=%.1f%%  MRR=%.3f",
+    O.n, 100*O["recall@1"], 100*O["recall@3"], 100*O["recall@5"], 100*O["recall@10"], O.mrr))
+print("         " .. metrics.line(O))
 local overlap_report = {}
 for ov, b in pairs(by_overlap) do
     local f = finalize(b)
     overlap_report[ov] = f
     print(string.format("  overlap=%-7s n=%2d  R@1=%.1f%%  R@5=%.1f%%  R@10=%.1f%%  MRR=%.3f",
         ov, f.n, 100*f["recall@1"], 100*f["recall@5"], 100*f["recall@10"], f.mrr))
+    print(string.format("  %-17s %s", "", metrics.line(f)))
 end
 
 -- --- write result --------------------------------------------------------

@@ -9,8 +9,9 @@
 --   rerank the SAME retrieved pool for the held-out queries and compare the
 --   gold's rank vs the baseline order.
 --
--- Usage (MEMO_DB: a scratch name or path; the run wipes its own scope):
---   MEMO_DB=bench luajit eval/rerank_bench.lua [--folds 4] [--epochs 300]
+-- Usage (MEMO_DB: a scratch name or path; the run wipes its own scope; MEMO_NO_MAINTENANCE=1: its writes
+-- start no `memo maintain` on it):
+--   MEMO_NO_MAINTENANCE=1 MEMO_DB=bench luajit eval/rerank_bench.lua [--folds 4] [--epochs 300]
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 local cjson   = require("luamemo.json")
@@ -20,8 +21,10 @@ local learned = require("luamemo.rerankers.learned")
 local trainer = require("luamemo.rerank_train")
 
 local K, EPOCHS, L2, LR = 4, 300, 0.02, 0.1
+local EMBEDDER = "hash"
 do local i=1 while i<=#arg do
-    if arg[i]=="--folds" then K=tonumber(arg[i+1]); i=i+2
+    if arg[i]=="--embedder" then EMBEDDER=arg[i+1]; i=i+2
+    elseif arg[i]=="--folds" then K=tonumber(arg[i+1]); i=i+2
     elseif arg[i]=="--epochs" then EPOCHS=tonumber(arg[i+1]); i=i+2
     elseif arg[i]=="--l2" then L2=tonumber(arg[i+1]); i=i+2
     elseif arg[i]=="--lr" then LR=tonumber(arg[i+1]); i=i+2
@@ -35,7 +38,13 @@ end
 local corpus  = load_jsonl("eval/personalization/corpus.jsonl")
 local queries = load_jsonl("eval/personalization/queries.jsonl")
 
-memory.setup({ embedder_local="hash", embed_dim=384, skip_embed_probe=true })
+-- --embedder gguf: the in-process GGUF model (MEMO_GGUF_MODEL, else ~/models/EmbeddingGemma).
+if EMBEDDER == "gguf" then
+    memory.setup({ embedder_local="gguf_ffi", embed_dim=768, skip_embed_probe=true,
+        embedder_model=os.getenv("MEMO_GGUF_MODEL") or (os.getenv("HOME").."/models/embeddinggemma-300M-Q8_0.gguf") })
+else
+    memory.setup({ embedder_local="hash", embed_dim=384, skip_embed_probe=true })
+end
 local SCOPE = "perso:rrbench"
 
 -- Ingest corpus; map item_id -> memory row id.
@@ -114,6 +123,7 @@ db.run("DELETE FROM lm_memories WHERE scope = ?", SCOPE)
 local function line(tag,b,l) local B,L=fin(b),fin(l)
     print(string.format("%-9s  base R@1=%.1f%% R@5=%.1f%% MRR=%.3f   |  learned R@1=%.1f%% R@5=%.1f%% MRR=%.3f   |  dR@1=%+.1f dMRR=%+.3f",
         tag,100*B[1],100*B[5],B.mrr, 100*L[1],100*L[5],L.mrr, 100*(L[1]-B[1]), L.mrr-B.mrr)) end
-print(string.format("\n%d-fold CV, %d epochs, %d queries, %d-item corpus (hash embedder)\n", K, EPOCHS, #queries, #corpus))
+print(string.format("\n%d-fold CV, %d epochs, %d queries, %d-item corpus (%s embedder)\n", K, EPOCHS, #queries,
+    #corpus, EMBEDDER))
 line("OVERALL", base.all, lrn.all)
 for _,name in ipairs({"low","med","high"}) do if base[name] then line("  "..name, base[name], lrn[name]) end end

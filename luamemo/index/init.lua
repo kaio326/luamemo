@@ -341,6 +341,9 @@ function M.ingest(root, opts)
         warn_fn           = opts.warn_fn,
     })
     if not files then return nil, "ingest: walker failed: " .. tostring(werr) end
+    -- opts.select_files(files) → the files to ingest (a sample of a huge tree: the benchmark
+    -- corpus bounds each project's size with it).
+    if type(opts.select_files) == "function" then files = opts.select_files(files) or files end
 
     local total_syms, total_reqs, total_files = 0, 0, #files
     local errors = {}

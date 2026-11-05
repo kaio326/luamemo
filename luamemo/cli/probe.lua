@@ -178,7 +178,8 @@ function M.scan_project(root)
 end
 
 -- gguf: can this host run the in-process GGUF embedder (luamemo.embedders.gguf_ffi)?
--- Needs LuaJIT (FFI) at runtime, plus a C toolchain + cmake to build the shim
+-- Needs LuaJIT (FFI) at runtime, plus a runtime: the shim already built, a prebuilt one for this machine, or a C
+-- toolchain + cmake + git to build the shim
 -- (and llama.cpp, if not already built). Reports which pieces are missing so the
 -- guide can tell the user exactly what to install.
 --- Can the in-process GGUF embedder run here? LuaJIT, and a shim — already there (built,
@@ -208,23 +209,42 @@ function M.gguf()
     }
 end
 
--- The model the gguf setup guide downloads (step 2).
-M.GGUF_DEFAULT_MODEL = "embeddinggemma-300M-Q8_0.gguf"
+-- The model the gguf setup guide downloads (step 2): EmbeddingGemma 2 (8K context; it
+-- needs llama.cpp b11829 or newer — this release's runtime — and its task prompts,
+-- MEMO_EMBED_PROMPTS=auto). The one before it is still found, and works as it did.
+M.GGUF_DEFAULT_MODEL = "embeddinggemma-2-Q8_0.gguf"
+M.GGUF_DEFAULT_URL = "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main/embeddinggemma-2-Q8_0.gguf"
+M.GGUF_PREVIOUS_MODELS = { "embeddinggemma-300M-Q8_0.gguf" }
 
 local file_exists = require("luamemo.util").exists
 
 -- Where a gguf embedding model already sits: MEMO_GGUF_MODEL / MEMO_GEMMA_MODEL /
 -- MEMO_EMBEDDER_MODEL when they name an existing file, else the guide's default
--- download path (~/models/<GGUF_DEFAULT_MODEL>). nil when none exists.
+-- download path (~/models/<GGUF_DEFAULT_MODEL>), else the model it replaced. nil when
+-- none exists.
 function M.gguf_model_path()
     for _, var in ipairs({ "MEMO_GGUF_MODEL", "MEMO_GEMMA_MODEL", "MEMO_EMBEDDER_MODEL" }) do
         local v = os.getenv(var)
         if file_exists(v) then return v end
     end
     local home = os.getenv("HOME")
-    local p = home and (home .. "/models/" .. M.GGUF_DEFAULT_MODEL)
-    if file_exists(p) then return p end
+    if not home then return nil end
+    local names = { M.GGUF_DEFAULT_MODEL }
+    for _, n in ipairs(M.GGUF_PREVIOUS_MODELS) do names[#names + 1] = n end
+    for _, n in ipairs(names) do
+        local p = home .. "/models/" .. n
+        if file_exists(p) then return p end
+    end
     return nil
+end
+
+--- The settings a GGUF model is used with: { max_chars, prompts } — EmbeddingGemma 2 reads
+--- 8K tokens (24,000 characters) and is trained with task prompts; the 300M model reads 2K
+--- (8,000) and gains little from them, so it is left as it was.
+function M.gguf_model_settings(path)
+    local name = tostring(path or ""):lower()
+    if name:find("embeddinggemma%-2") then return { max_chars = 24000, prompts = "auto" } end
+    return { max_chars = 8000 }
 end
 
 -- Directory holding the luamemo/ module tree this file was loaded from, so a
@@ -278,7 +298,7 @@ local VRAM_MB_FOR_4B = 3800   -- gemma-3-4b Q4_K_M weights (~2.6GB) + context/KV
 function M.generative()
     local g = M.gguf()
     if not g.ok then
-        return { ok = false, err = "generative sensing needs the gguf runtime (LuaJIT + toolchain)",
+        return { ok = false, err = "generative sensing needs the gguf runtime (LuaJIT + the GGUF runtime: memo gguf status)",
                  missing = g.missing }
     end
     local gpu = M.gpu()

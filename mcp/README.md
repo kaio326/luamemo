@@ -23,7 +23,7 @@ with `MEMO_*` settings in `env`; an entry you wrote yourself is kept.
 
 | Client | Where | Notes |
 |---|---|---|
-| Claude Code | the luamemo plugin (`.claude-plugin/`, starts `memo mcp` and adds the session-start hook), or `claude mcp add luamemo -s user -- /path/to/memo mcp` | started in the project's folder — one registration serves every project |
+| Claude Code | the luamemo plugin (`.claude-plugin/`, starts `memo mcp` and adds the SessionStart, UserPromptSubmit and PreToolUse hooks), or `claude mcp add luamemo -s user -- /path/to/memo mcp` | started in the project's folder — one registration serves every project |
 | VS Code | `.vscode/mcp.json`: `"servers"`, with `"type": "stdio"` | `"args": ["mcp", "--project", "${workspaceFolder}"]`; add `"chat.mcp.autoStart": true` to VS Code's settings |
 | Cursor | `~/.cursor/mcp.json`: `"mcpServers"` | `"args": ["mcp", "--project", "${workspaceFolder}"]` |
 | Claude Desktop | `claude_desktop_config.json` — macOS `~/Library/Application Support/Claude/`, Linux `~/.config/Claude/` | no project of its own: one entry per project, `"args": ["mcp", "--project", "/path/to/project"]` |
@@ -89,17 +89,21 @@ and `instructions`.
 
 ## Tools
 
-27 tools. When a call names no scope, the project's `MEMO_SCOPE` applies (else
-`MEMO_DEFAULT_SCOPE`).
+27 tools. When a call names no scope, the project's `MEMO_SCOPE` applies. Without
+one, a write goes to `MEMO_DEFAULT_SCOPE` (default `global`), search and recent look
+at every scope, and the tools that work on one scope (`memory_summarize`,
+`memory_digest`, `memory_sense`, `memory_learn`) ask for it.
 
 **Token cost.** A client puts every tool's description in each session's context (an
 API-billed agent pays for it on every request unless it is cached), so they are short —
 the usage rules come once, as the server's instructions. The whole list is about
-15 KB of JSON; `MEMO_MCP_TOOLS=core` offers only the 16 everyday tools (brief, search,
+16 KB of JSON; `MEMO_MCP_TOOLS=core` offers only the 16 everyday tools (brief, search,
 write, recent, get, update, delete, promote, sense, status, the `index_*` tools,
-`secret_list`, `secret_execute`; about 10 KB) and leaves the rest on `memo`. Answers are
+`secret_list`, `secret_execute`; about 11 KB) and leaves the rest on `memo`. Answers are
 compact too: search, recent and get rows carry the text and where it lives, not the
-scoring internals (`verbose: true` returns whole rows), a write answers with the new
+scoring internals (`verbose: true` returns whole rows); a list row's body is cut at
+2,000 bytes and marked `truncated: true` (`memory_get`, or `verbose: true`, returns it
+whole), a write answers with the new
 memory's id, scope, kind, title and tier, not the text the agent just sent, and the
 `index_*` tools answer in plain text.
 
@@ -111,16 +115,16 @@ memory's id, scope, kind, title and tier, not the text the agent just sent, and 
 | `memory_search` | `query`; `scope` or `scopes` (a list, searched together); `kind`, `limit`, `since`, `until` (ISO 8601 or Unix seconds), `tier_min` (default 1 — hides ephemeral tier 0), `tier_max`, `metadata_filter` (`{"key": value}`), `min_score`, `rerank` (true / false), `hybrid_weights` (`{"vector": …, "fts": …}`), `project` (narrows an `org:` scope to one project), `ignore_decay`, `verbose` | Hybrid vector + full-text search, weighted by importance, age and tier. Compact rows (id, title, body, kind, scope, tier, created_at, score; tags / metadata when set). The result also carries `facts`: the knowledge-graph facts the query is about — current value, since when, the previous value ([KG.md](../KG.md)) |
 | `memory_write` | `title`, `body`, `scope`, `kind`, `tags`, `metadata`, `importance` (0–10, default 1), `decay_rate` (per day), `tier` (0–3), `dedup_strategy` (`update` merges a near-duplicate, `skip`, `append`), `created_at`, `verbose` — or `items`: up to 100 memories, each answered on its own | Answers with the memory's id, scope, kind, title and tier (`verbose`: the whole row) |
 | `memory_recent` | `scope`, `kind`, `limit`, `offset`, `tier_min` (default 1 — hides ephemeral tier 0), `verbose` | The newest first, compact rows as search's |
-| `memory_get` | `id`, `verbose` | A compact row as search's (`verbose`: the whole row) |
+| `memory_get` | `id`, `verbose` | The memory with its whole body, as a compact row (`verbose`: every field) |
 | `memory_update` | `id` + the fields to change, `verbose` | Re-embedded when title or body change; answers with the memory's id, scope, kind, title and tier (`verbose`: the whole row) |
-| `memory_delete` | `id` — or `scope` (+ `kind`, `metadata_filter`) to delete by filter | By filter, the first call previews (how many, a few titles) and returns a `confirm` token; the same call with the token deletes. The token is bound to the filter, the count and the database and lasts 5 minutes. A dev's org replica and approved org knowledge never match |
+| `memory_delete` | `id` — or `scope` (+ `kind`, `metadata_filter`) to delete by filter | By filter, the first call previews (how many, a few titles) and returns a `confirm` token; the same call with the token deletes. The token is bound to the filter, the count and the database and lasts 5 minutes. A dev's org replica scope is refused (it is read-only); approved org knowledge and directives on the central are never matched |
 
 ### Sessions and maintenance
 
 | Tool | Parameters | Notes |
 |---|---|---|
 | `memory_promote` | `from_scope`, `to_scope`, `delete_source`, `dry_run`, `limit`, `min_rows` | Fold a session scope into one summary in a long-term scope ([SESSION_CONTINUITY.md](../SESSION_CONTINUITY.md)) |
-| `memory_digest` | `scope`, `threshold`, `dry_run` | Consolidate ephemeral memories, promote proven ones |
+| `memory_digest` | `scope`, `threshold`, `dry_run` | Consolidate ephemeral memories, promote proven ones (`threshold`: the cosine at which the digest groups its tier-0 notes; observations are still made at `MEMO_CONSOLIDATE_THRESHOLD`) |
 | `memory_consolidate` | `scope`, `similarity_threshold`, `decay_threshold`, `max_rows`, `dry_run` | Expire decayed memories, group near-duplicates (merged by the summarizer) |
 | `memory_summarize` | `scope`, `weight_threshold`, `retention_days`, `batch_size`, `max_batches`, `dry_run` | Fold old, low-weight memories into summaries (`MEMO_SUMMARIZER_ADAPTER`; `noop` joins them without a model) |
 | `memory_status` | `verbose`, `details` | Rows per scope; `details`: every setting, its value and where it came from |
@@ -131,7 +135,7 @@ memory's id, scope, kind, title and tier, not the text the agent just sent, and 
 
 | Tool | Parameters | Notes |
 |---|---|---|
-| `memory_sense` | `turns` (`[{role, text}]`, oldest first), `scope`, `generative`, `min_similarity` | Corrections, standing rules and praise from the conversation the agent relays, recorded on the memories they concern. Idempotent |
+| `memory_sense` | `turns` (`[{role, text}]`, oldest first), `scope`, `generative`, `min_similarity` | Corrections, standing rules and praise from the conversation the agent relays, recorded on the memories they concern; a standing rule no memory holds is stored as a `decision` (`captured`, `captured_ids` in the result; `MEMO_SENSE_CAPTURE`). Idempotent |
 | `memory_learn` | `action` (`run`, `status`, `rollback`), `scope`, `dry_run`, `min_samples`, `margin` | The scope's learned reranker: trained on that feedback, promoted only if it beats the current one on held-out data |
 | `memory_tune_weights` | `scope`, `samples` (50), `metric` (`r_at_1`, `r_at_3`, `r_at_5`, `r_at_10`, `mrr`) | Which vector / full-text blend finds the scope's memories best — a report with the `memo config set` command a person runs to apply it |
 | `memory_embed` | `text`, `compare_to`, `include_vector` | The embedder's model and vector size; the cosine of two texts |

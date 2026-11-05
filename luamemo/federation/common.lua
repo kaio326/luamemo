@@ -29,7 +29,10 @@ function M.embedder_sig(cfg)
         model = cfg.embedder_model or ""
     end
     local dim = tonumber(cfg.embed_dim) or ((name == "hash") and 384) or 0
-    return ("%s|%s|%d"):format(name, model, dim)
+    -- Task prompts change every vector (luamemo.embed.prompts): their own space. Without
+    -- them the signature is what it always was.
+    local pr = require("luamemo.embed").prompts(cfg)
+    return ("%s|%s|%d"):format(name, model, dim) .. (pr and ("|" .. pr.id) or "")
 end
 
 --- Constant-time string equality (length leaks, content does not).

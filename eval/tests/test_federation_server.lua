@@ -217,14 +217,8 @@ local devs     = require("luamemo.federation.devs")
 
 local KDIR = os.tmpname(); os.remove(KDIR)
 keys.set_dir(KDIR)
-local BASE = { embedder_local = "hash", embed_dim = 384, skip_embed_probe = true,
-               patterns_enabled = false, role = "org", org_name = "fedsrv" }
-local function setup(extra)
-    local cfg = {}
-    for k, v in pairs(BASE) do cfg[k] = v end
-    for k, v in pairs(extra or {}) do cfg[k] = v end
-    luamemo.setup(cfg)
-end
+local BASE = { role = "org", org_name = "fedsrv" }
+local function setup(extra) H.setup(extra, BASE) end
 local function wipe()
     db.run("DELETE FROM lm_reinforcements WHERE scope IN ('org:fedsrv','repo:fedsrv')")
     db.run("DELETE FROM lm_retrieval_feedback WHERE scope IN ('org:fedsrv','repo:fedsrv')")

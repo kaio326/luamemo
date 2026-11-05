@@ -14,9 +14,9 @@
 #   docker compose -f eval/sidecars/docker-compose.yml down
 #
 # GPU build (default): the host has the NVIDIA Container Toolkit and a
-# Turing-class GPU (RTX 2060, sm_75), so we use the `turing-1.5` image.
-# For other GPUs swap the tag: `:1.5` (Ampere/Ada default), `:hopper-1.5`
-# (H100). For CPU-only fallback, use `:cpu-1.5` and remove the
+# Turing-class GPU (RTX 2060, sm_75), so we use the `turing-1.7` image.
+# For other GPUs swap the tag: `:1.7` (Ampere/Ada default), `:hopper-1.7`
+# (H100). For CPU-only fallback, use `:cpu-1.7` and remove the
 # `deploy.resources` block.
 
 services:
@@ -25,7 +25,7 @@ services:
   # Native endpoint: POST http://127.0.0.1:8081/embed  {"inputs":"..."}
   tei-embed:
     image: ghcr.io/huggingface/text-embeddings-inference:turing-1.7
-    container_name: lapis-tei-embed
+    container_name: tei-embed
     environment:
       MODEL_ID: BAAI/bge-m3
       DTYPE: float16
@@ -61,10 +61,9 @@ services:
 
   # Phase 16.3 — bge-reranker-v2-m3 cross-encoder rerank.
   # Native endpoint: POST http://127.0.0.1:8082/rerank
-  # (Port 8080 is reserved for the portfolio app container.)
   tei-reranker:
     image: ghcr.io/huggingface/text-embeddings-inference:turing-1.7
-    container_name: lapis-tei-reranker
+    container_name: tei-reranker
     environment:
       MODEL_ID: BAAI/bge-reranker-v2-m3
       DTYPE: float16

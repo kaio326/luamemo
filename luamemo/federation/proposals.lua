@@ -231,7 +231,7 @@ function M.candidates(org_scope, opts)
     params[#params + 1] = M.SCAN_LIMIT
     local rows = db.query("SELECT m.id, m.scope, m.kind, m.title, m.body, m.tier, "
         .. "(SELECT count(*) FROM lm_reinforcements r WHERE r.memory_id = m.id AND r.delta > 0 "
-        .. " AND r.event_type IN ('praise', 'direct_command', 'miss')) AS pos, "
+        .. " AND (r.event_type IN " .. require("luamemo.feedback").POSITIVE_SQL .. " OR r.event_type = 'miss')) AS pos, "
         .. "(SELECT count(*) FROM lm_reinforcements r WHERE r.memory_id = m.id AND r.event_type = 'miss') AS misses "
         .. "FROM lm_memories m WHERE " .. scope_sql .. " AND m.tier >= 1 AND m.kind IN ('fact', 'decision') "
         .. "AND m.importance > 0 "

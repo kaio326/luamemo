@@ -46,13 +46,16 @@ description = {
         in later sessions, through the Model Context Protocol: Claude Code,
         VS Code (Copilot agent mode), Cursor, Claude Desktop and other MCP
         clients use it — every client with the same entry, `memo mcp`. The
-        `memo` CLI sets it up and keeps the decisions that belong to people:
-        settings, backups, which devices join a team's memory and which
-        knowledge the team shares.
+        `memo` CLI sets it up (`memo calibrate` probes the machine, picks and
+        configures an embedder, writes the client entries) and keeps the
+        decisions that belong to people: settings, backups, which devices join a
+        team's memory and which knowledge the team shares.
 
         No database server, no Docker, no account: each project's memory is one
-        SQLite file in ~/.local/share/luamemo. Runs on LuaJIT with two system
-        libraries, libsqlite3 and libsodium (Linux, macOS, Windows through WSL).
+        SQLite file in ~/.local/share/luamemo. Runs on LuaJIT; it reaches two
+        system libraries, libsqlite3 and libsodium, through the FFI, and the
+        `memo` command needs bash and jq (Linux, macOS, Windows through WSL).
+        https endpoints (OpenAI, Voyage, Cohere ...) also need luasec.
 
           * MCP server (`memo mcp`, 27 tools; MCP 2026-07-28 and earlier
             revisions): write, search (with the knowledge-graph facts the query
@@ -64,19 +67,38 @@ description = {
             plus FTS5 full-text ranking, blended and weighted by importance, age
             and tier; multi-scope search, time and metadata filters, rerankers.
           * Embedders: an in-process GGUF model (EmbeddingGemma via llama.cpp,
-            no service), Ollama, TEI, OpenAI / Voyage / Cohere / any
-            OpenAI-compatible endpoint, and a pure-Lua hash embedder.
+            no service; `memo gguf install` downloads a prebuilt runtime for
+            Linux x86_64 and macOS arm64, other machines build it), Ollama,
+            TEI, OpenAI / Voyage / Cohere / DeepSeek / Anthropic / any
+            OpenAI-compatible endpoint, any HTTP API through the generic
+            adapter, and a pure-Lua hash embedder.
           * Codebase index (`memo index`): files, symbols, dependencies and
             commit diffs, so an agent finds where code lives before grepping.
-          * Learns from use (opt-in): corrections, rules, praise and retrieval
-            misses train a per-scope reranker, promoted only when it beats the
-            current one on held-out data.
+          * Claude Code integration (`memo agent install`, done by `memo
+            calibrate` unless you pass --no-agent): hooks that open each
+            session with the project's brief, learn from what you say
+            (corrections and praise adjust the memories they concern;
+            standing rules like "always ..." are kept as decisions), keep
+            file-based memory out of the project and,
+            optionally, save the conversation before a compaction; Claude's
+            existing memory notes are moved into luamemo.
+          * Learns from use (opt-in, MEMO_FEEDBACK_ENABLED: the usage log keeps
+            what was asked): corrections, praise and retrieval misses train a
+            per-scope reranker, promoted only when it beats the current one on
+            held-out data.
+          * Keeps itself tidy (on by default, a silent background `memo
+            maintain`): near-duplicates are folded into summaries, archived,
+            reviewed after a grace period and then deleted; every deletion is
+            logged. `memo config set MEMO_MAINTENANCE_BACKGROUND false` and
+            `MEMO_AUTO_DIGEST_ENABLED false` turn it off.
           * Secrets vault (libsodium): agents use keys via secret_execute
             without ever seeing them.
           * Team memory on your LAN / VPN: an org central, admin-reviewed
             knowledge, devices paired with a key and a spoken code.
-          * `memo config` (every setting checked before it is written),
-            `memo backup`, `memo export` / `memo import`.
+          * `memo doctor`, `memo config` (every setting checked before it is
+            written), `memo backup`, `memo export` / `memo import`, `memo
+            usage` (how memory is really used), `memo eval` (retrieval
+            benchmarks, from an install).
     ]],
     homepage   = "https://github.com/kaio326/luamemo",
     issues_url = "https://github.com/kaio326/luamemo/issues",
@@ -84,7 +106,7 @@ description = {
     maintainer = "Kaio Fernandes <contact@kaiofernandes.com>",
     labels     = { "memory", "agents", "ai", "mcp", "embeddings", "rag",
                    "sqlite", "luajit", "ffi", "libsodium", "secrets", "temporal",
-                   "code-index", "code-search", "ctags", "federation" },
+                   "code-index", "code-search", "ctags", "federation", "claude-code" },
 }
 
 dependencies = {
@@ -93,7 +115,8 @@ dependencies = {
     -- 5.1, not "luajit": the LuaRocks most systems package runs on Lua 5.1 and could
     -- never provide "luajit" — the rock would not install.
     "lua ~> 5.1",
-    -- lua-cjson is optional (the bundled dkjson is the fallback); luasec only for https.
+    -- lua-cjson is optional (the bundled dkjson is the fallback); luasec only for https
+    -- (a user install, not a dependency); jq is a system tool the memo command needs.
     "luasocket >= 3.0",
 }
 
@@ -106,7 +129,8 @@ build = {
         bin = { ["memo"] = "cli/memo" },
     },
     -- mcp/: the server and its usage rules (instructions.md); hooks/: the Claude Code
-    -- capture hooks; luamemo/embedders/native: the GGUF shim's source and build.sh
+    -- hooks `memo agent install` wires (brief, sensing, file-memory guard, optional
+    -- transcript capture); luamemo/embedders/native: the GGUF shim's source and build.sh
     -- (built on demand — a built gguf_shim.so is never shipped).
     copy_directories = { "examples", "hooks", "mcp", "luamemo/embedders/native" },
 }

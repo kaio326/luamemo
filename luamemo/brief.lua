@@ -7,6 +7,23 @@
 
 local M = {}
 
+local RULES_DAYS = 7 -- (the brief lists the standing rules sensing stored in this many days)
+
+-- The titles of `rows`, each in quotes, cut at `cap` characters. Show the full title up to a generous cap; only ellipsize
+-- when genuinely longer, so a mid-word cut doesn't read as "incomplete — go fetch the rest" (which makes the agent
+-- re-query and defeats the digest's purpose).
+local function quoted_titles(rows, cap)
+    local out = {}
+    for _, r in ipairs(rows or {}) do
+        local t = r.title
+        if t and t ~= "" then
+            if #t > cap then t = require("luamemo.util").cut_utf8(t, cap):gsub("%s+%S*$", "") .. "…" end
+            out[#out + 1] = '"' .. t .. '"'
+        end
+    end
+    return out
+end
+
 --- The brief's text for `scope` (nil: no memory summary, the line says how to get one).
 --- opts.extra: more lines, before the end marker (the MCP server's client warnings).
 function M.text(scope, opts)
@@ -19,6 +36,11 @@ function M.text(scope, opts)
         local store = require("luamemo.store")
         local tbl   = store.table_name()
 
+        -- A folded memory whose grace period is over gets reviewed beside the session (at most once a day) — and,
+        -- with the usage log on, that run is also what prunes the log: a session that only reads writes nothing.
+        -- (required here: the brief is read by `memo brief` and the hook, which need no maintenance code otherwise)
+        pcall(function() require("luamemo.maintenance").kick(scope) end)
+
         -- Memory summary for the scope.
         if scope then
             local n, cerr = db.value("SELECT COUNT(*) FROM " .. tbl .. " WHERE scope = ?", scope)
@@ -26,20 +48,21 @@ function M.text(scope, opts)
             n = tonumber(n) or 0
             local rows = db.query("SELECT title FROM " .. tbl .. " WHERE scope = ? "
                 .. "AND tier >= 1 ORDER BY created_at DESC, id DESC LIMIT 3", scope)
-            local titles = {}
-            for _, r in ipairs(rows or {}) do
-                if r.title and r.title ~= "" then
-                    -- Show the full title up to a generous cap; only ellipsize
-                    -- when genuinely longer, so a mid-word cut doesn't read as
-                    -- "incomplete — go fetch the rest" (which makes the agent
-                    -- re-query and defeats the digest's purpose).
-                    local t = r.title
-                    if #t > 110 then t = require("luamemo.util").cut_utf8(t, 110):gsub("%s+%S*$", "") .. "…" end
-                    titles[#titles + 1] = '"' .. t .. '"'
-                end
-            end
+            local titles = quoted_titles(rows, 110)
             local latest = (#titles > 0) and (" · latest: " .. table.concat(titles, ", ")) or ""
             lines[#lines + 1] = ("memory: %s — %d memories%s"):format(scope, n, latest)
+
+            -- Standing rules luamemo stored by itself from what the user said (sensing.process): the user should see them,
+            -- since nobody asked for each one — a wrong one is a memory_delete away.
+            local util = require("luamemo.util")
+            local since = util.now_us() - RULES_DAYS * util.DAY_US
+            local from = " FROM " .. tbl .. " WHERE scope = ? AND created_at >= ? AND json_extract(metadata, '$.source') = 'sensing'"
+            local stored = tonumber(db.value("SELECT COUNT(*)" .. from, scope, since)) or 0
+            if stored > 0 then
+                local rules = quoted_titles(db.query("SELECT title" .. from .. " ORDER BY created_at DESC, id DESC LIMIT 3", scope, since), 80)
+                lines[#lines + 1] = ("rules:  %d stored automatically from what the user said (last %d days) · %s — a wrong one: memory_delete")
+                    :format(stored, RULES_DAYS, table.concat(rules, ", "))
+            end
         else
             lines[#lines + 1] = "memory: pass --scope repo:<name> to summarise a project"
         end

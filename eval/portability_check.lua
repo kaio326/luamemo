@@ -13,8 +13,9 @@
 --      path (store.reembed_scope — `memo reembed`), even to another dimension.
 --      Content is never lost.
 --
--- Usage (MEMO_DB: a scratch database — the run wipes its own scope):
---   MEMO_DB=portcheck luajit eval/portability_check.lua
+-- Usage (MEMO_DB: a scratch database — the run wipes its own scope; MEMO_NO_MAINTENANCE=1: its writes start no
+-- background `memo maintain`):
+--   MEMO_NO_MAINTENANCE=1 MEMO_DB=portcheck luajit eval/portability_check.lua
 
 package.path = "./?/init.lua;./?.lua;" .. package.path
 local memory = require("luamemo")

@@ -95,5 +95,33 @@ local again = bundle.install()
 check("installing again reuses it (no download)", again == shim)
 end)
 
+section("a shim built before 0.5.0 is recognised", function()
+io.write("\n--- a stale shim ---\n")
+-- Before 0.5.0 the shim had no lmembed_last_truncated and failed on any text longer than
+-- the context; an upgrade keeps one built next to the modules.
+local ffi_shim = require("luamemo.embedders.native.ffi_shim")
+local old = setmetatable({}, { __index = function(_, k) error("undefined symbol: " .. k) end })
+check("stale(): a library without lmembed_last_truncated", ffi_shim.stale(old)
+    and not ffi_shim.stale({ lmembed_last_truncated = function() return 0 end }))
+check("… its message names the fix", ffi_shim.STALE:find("build.sh", 1, true)
+    and ffi_shim.STALE:find("memo gguf install", 1, true))
+if (sh("command -v cc")) == "" then T.pass("SKIP: no C compiler for a stand-in shim"); return end
+local src, so = base .. "-old.c", base .. "-old.so"
+local f = assert(io.open(src, "w"))
+f:write("int lmembed_dim(void *h) { (void) h; return 768; }\n"); f:close()
+local _, cc = sh(("cc -shared -fPIC -o %q %q"):format(so, src))
+local loads, stale = bundle.loads(so)
+check("loads(): a pre-0.5.0 shim loads, and is reported stale", cc == 0 and loads and stale)
+local here = require("luamemo.embedders.native.ffi_shim").shim_path()
+if require("luamemo.util").exists(here) then
+    local l2, s2 = bundle.loads(here)
+    check("loads(): this checkout's shim is current", l2 and not s2)
+end
+local out = sh(("MEMO_GGUF_SHIM=%q ./cli/memo gguf status 2>&1"):format(so))
+check("memo gguf status says it was built before 0.5.0 and how to fix it",
+    out:find("built before luamemo 0.5.0", 1, true) ~= nil, out)
+os.remove(src); os.remove(so)
+end)
+
 os.execute(("rm -rf %q %q"):format(data, releases))
 finish()

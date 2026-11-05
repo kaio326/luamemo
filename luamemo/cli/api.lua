@@ -142,7 +142,8 @@ handlers["write-many"] = function(_p)
             else
                 local fields, werr = ops.write_fields(p, write_scope(p.scope))
                 local row, action
-                if fields then row, werr, action = store.write(fields) end
+                -- (a bulk ingest: running it again refreshes the rows, it is not a search that missed them)
+                if fields then fields.no_miss = true; row, werr, action = store.write(fields) end
                 if not row then
                     io.stderr:write("write-many: " .. tostring(werr) .. "\n")
                     errors = errors + 1
@@ -200,9 +201,9 @@ handlers["delete"] = function(p)
     local store = require("luamemo.store")
     local id = p.id or p[1]
     if not id then return err_out("delete: id is required") end
-    local ok, err = store.delete(tonumber(id))
-    if not ok then return err_out(err) end
-    out({ ok = true })
+    local res, err = store.delete(tonumber(id))
+    if not res then return err_out(err) end
+    out({ ok = true, warning = res.warning })
 end
 
 -- embed (memo embed TEXT [--compare-to TEXT] [--json]): the embedder's view of a text.

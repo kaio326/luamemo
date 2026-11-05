@@ -9,13 +9,18 @@ without any filtering on the client's side.
 For every candidate at search time:
 
 ```
-weight = importance × exp(−decay_rate × days_since_updated)
+weight = curve(importance) × exp(−decay_rate × days_since_updated)
 score  = (vector_weight × vector_score + fts_weight × text_score) × weight
 ```
 
+`curve` is set by `MEMO_IMPORTANCE_CURVE`: `sqrt` (the default: √importance),
+`linear` (the importance itself) or `log` (log₂(1 + importance)). All three are 1
+at importance 1 and 0 at 0; `sqrt` and `log` compress the range so a clearly
+better match can still beat a more important memory.
+
 | Field | Range | Default | Notes |
 |---|---|---|---|
-| `importance` | 0–10 | 1.0 | A static multiplier; higher = more pull. It also sets the tier: `< 0.3` → 0 (ephemeral, hidden from search by default), `< 5` → 1, `< 9` → 2, `≥ 9` → 3 |
+| `importance` | 0–10 | 1.0 | Higher = more pull, shaped by the curve above. It also sets the tier: `< 0.3` → 0 (ephemeral; `memory_search` and `memory_recent` hide it by default, `memo search` shows it unless you pass `--tier-min 1`), `< 5` → 1, `< 9` → 2, `≥ 9` → 3 |
 | `decay_rate` | 0–1 per day | 0.0 | Exponential decay; 0 turns it off |
 
 `days_since_updated` counts from `updated_at`, so editing a memory restarts its
@@ -42,15 +47,16 @@ memo write --scope demo --title med  --body "how to deploy the app" --importance
 memo write --scope demo --title high --body "how to deploy it"      --importance 10 --decay-rate 0.1
 
 memo search deploy --scope demo | jq -c '.results[] | {title, weight, score, tier}'
-# {"title":"high","weight":9.99…,"score":9.67…,"tier":3}
-# {"title":"med","weight":5,"score":4.45…,"tier":2}
+# {"title":"high","weight":3.16…,"score":3.06…,"tier":3}
+# {"title":"med","weight":2.23…,"score":1.99…,"tier":2}
 # {"title":"low","weight":1,"score":1,"tier":1}
 
 memo search deploy --scope demo --ignore-decay 1     # raw hybrid scores, for debugging
 ```
 
-Each result carries its `weight`, so you can check the math: in a month the
-`high` memory weighs `10 × e^(−0.1 × 30) ≈ 0.50` and falls below `low`.
+(With the default `sqrt` curve; the scores depend on the embedder.) Each result
+carries its `weight`, so you can check the math: in a month the `high` memory
+weighs `√10 × e^(−0.1 × 30) ≈ 0.16` and falls below `low`.
 
 ## End-to-end (MCP)
 
@@ -64,9 +70,11 @@ The model passes the right arguments.
 
 ## Expected weights
 
-- `importance = 5, decay_rate = 0`, any age → 5
-- `importance = 5, decay_rate = 0.1`, 30 days → ≈ 0.249 (5·e⁻³)
-- `importance = 5, decay_rate = 0.5`, 10 days → ≈ 0.034 (5·e⁻⁵)
+With the default `sqrt` curve (`MEMO_IMPORTANCE_CURVE=linear` would give 5, 0.249 and 0.034):
+
+- `importance = 5, decay_rate = 0`, any age → ≈ 2.24 (√5)
+- `importance = 5, decay_rate = 0.1`, 30 days → ≈ 0.111 (√5·e⁻³)
+- `importance = 5, decay_rate = 0.5`, 10 days → ≈ 0.015 (√5·e⁻⁵)
 
 Faded memories aren't deleted by decay alone: maintenance (`memo consolidate`,
 `memory_consolidate`) expires the ones whose weight has fallen below its

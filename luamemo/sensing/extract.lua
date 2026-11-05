@@ -65,15 +65,17 @@ local function turn_text(t)
     return t.text or t[1] or ""
 end
 
---- Build a gemma-instruct chat prompt from the relayed turns.
-function M.build_prompt(turns)
+--- Build a Gemma instruct prompt from the relayed turns. markup: "gemma4" (Gemma 4's
+--- `<|turn>` turns) or "gemma" (Gemma 1–3's `<start_of_turn>`; the default) —
+--- luamemo.sensing.generate.markup reads it from the model's chat template.
+function M.build_prompt(turns, markup)
     local lines = {}
     for _, t in ipairs(turns) do
         local role = (type(t) == "table" and t.role == "assistant") and "ASSISTANT" or "USER"
         lines[#lines + 1] = role .. ": " .. turn_text(t)
     end
     local body = INSTRUCTION .. "\n\nConversation:\n" .. table.concat(lines, "\n") .. "\n\nSignals:"
-    return "<start_of_turn>user\n" .. body .. "<end_of_turn>\n<start_of_turn>model\n"
+    return generate.wrap(body, markup)
 end
 
 --- Parse the model completion into signal events (tolerant of markdown / quoting).
@@ -135,7 +137,7 @@ function M.run(turns, cfg)
     if not turns or #turns == 0 then return {} end
     if not generate.available(cfg) then return {} end
     local ok, res = pcall(function()
-        local raw  = M.parse(generate.complete(M.build_prompt(turns), cfg))
+        local raw  = M.parse(generate.complete(M.build_prompt(turns, generate.markup(cfg)), cfg))
         local vocab = user_vocab(turns)
         local kept = {}
         for _, e in ipairs(raw) do

@@ -34,7 +34,7 @@ reads `.luamemorc` when it starts).
 ## 3. Verify
 
 ```bash
-memo ping --embedder                                  # [PASS] Embedder … ollama
+memo ping --embedder                                  # [PASS] Embedder http://localhost:11434/api/embeddings → dim=768
 memo embed "hello world"                              # embedder, model, dimension: 768
 curl -s http://localhost:11434/api/embeddings \
      -d '{"model":"nomic-embed-text","prompt":"hello world"}' | jq '.embedding | length'

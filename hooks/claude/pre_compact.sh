@@ -16,8 +16,8 @@
 #     }
 #   }
 #
-# Requires: memo CLI on PATH (set up with `memo calibrate` — the project's
-# .luamemorc names its database), jq installed.
+# Requires: memo (found as _project.sh says: $MEMO_BIN, the one next to these hooks, or on PATH;
+# set up with `memo calibrate` — the project's .luamemorc names its database) and jq.
 # Never exits non-zero — a failed save must never block a context compact.
 
 set -uo pipefail

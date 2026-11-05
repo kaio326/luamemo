@@ -261,7 +261,25 @@ local function cmd_set(name, text, user)
     io.write("  A running MCP server picks this up when it restarts (reconnect it in your client).\n")
 end
 
+-- A name an older luamemo read (settings.RETIRED, e.g. 0.4's MEMO_DB_URL): every command
+-- warns about it while a .luamemorc still sets it.
+local function unset_retired(full, user)
+    local files = settings.files()
+    local which = user and "user" or "project"
+    local path = files.paths[which]
+    if files[which][full] == nil then
+        io.write(("%s is not set in %s\n"):format(full, home_path(path)))
+        return
+    end
+    local ok, err = require("luamemo.cli._common").rc_set(path, full, nil)
+    if not ok then die(err) end
+    io.write(("%s removed from %s — it is no longer read: %s\n"):format(full, home_path(path), settings.RETIRED[full]))
+end
+
 local function cmd_unset(name, user)
+    local up = name:upper()
+    local full = up:match("^MEMO_") and up or ("MEMO_" .. up)
+    if settings.RETIRED[full] and not settings.get(full) then return unset_retired(full, user) end
     local e = entry_of(name)
     local files = settings.files()
     local which = user and "user" or "project"

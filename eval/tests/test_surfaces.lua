@@ -119,8 +119,10 @@ local function seed(scope, rows)
             dedup_strategy = "append" }))
     end
 end
+-- (a memory folded into a summary is archived — hidden, reviewed after the grace period — and not counted)
 local function count(scope)
-    return tonumber(require("luamemo.db").value("SELECT count(*) FROM lm_memories WHERE scope = ?", scope))
+    return tonumber(require("luamemo.db").value("SELECT count(*) FROM lm_memories WHERE scope = ? "
+        .. "AND json_type(metadata, '$.lm_fold') IS NULL", scope))
 end
 
 section("C. bulk delete by filter", function()
@@ -171,6 +173,49 @@ local one = s.call("memory_delete", { id = keep_id })
 check("memory_delete by id still deletes one", one.ok == true and count("del:mcp") == 0)
 local noscope = s.call("memory_delete", { kind = "note" })
 check("by filter, a scope is required", (noscope.error or ""):find("scope", 1, true) ~= nil)
+
+-- What was distilled from a memory could not be removed (here: the database refuses the delete of the observation): the
+-- update and the delete still happen, and the answer says so — a `warning`, not a silent success
+do
+    local dbw = require("luamemo.db")
+    seed("del:warn", { {}, {} })
+    local ids = {}
+    for _, r in ipairs(dbw.query("SELECT id FROM lm_memories WHERE scope = 'del:warn' ORDER BY id") or {}) do ids[#ids + 1] = tonumber(r.id) end
+    local now = require("luamemo.util").now_us()
+    for _, id in ipairs(ids) do
+        assert(dbw.run("INSERT INTO lm_observations (scope, body, evidence_ids, last_reinforced, created_at) VALUES (?, ?, ?, ?, ?)",
+            "del:warn", "an observation made from memory " .. id, dbw.json({ id }), now, now))
+    end
+    local upd, del = H.with_trigger("lm_test_block_obs_delete", "BEFORE DELETE ON lm_observations BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+        function()
+            return s.call("memory_update", { id = ids[1], body = "new words about the warning case" }),
+                s.call("memory_delete", { id = ids[2] })
+        end, true)
+    check("MCP memory_update whose observations cannot be retired: ok, the edit made, a warning in the answer",
+        upd.ok == true and tostring((upd.memory or {}).warning):find("could not be removed", 1, true) ~= nil
+        and dbw.value("SELECT body FROM lm_memories WHERE id = ?", ids[1]):find("new words about the warning case", 1, true) ~= nil, json.encode(upd))
+    check("MCP memory_delete whose observations cannot be retired: ok, the memory deleted, a warning in the answer",
+        del.ok == true and tostring(del.warning):find("could not be removed", 1, true) ~= nil
+        and tonumber(dbw.value("SELECT count(*) FROM lm_memories WHERE id = ?", ids[2])) == 0, json.encode(del))
+    local clean = s.call("memory_delete", { id = ids[1] })
+    check("(control) a delete that retires its observations: ok and no warning", clean.ok == true and clean.warning == nil, json.encode(clean))
+    -- a standing rule no memory holds is stored by memory_sense (Phase 23.1)
+    local sensed = s.call("memory_sense", { scope = "sense:mcp", turns = { { role = "user", text = "Never delete a user's data without asking first." } } })
+    check("MCP memory_sense: a standing rule nothing holds is stored as a decision (captured = 1)",
+        type(sensed.result) == "table" and sensed.result.captured == 1
+        and tonumber(dbw.value("SELECT count(*) FROM lm_memories WHERE scope = 'sense:mcp' AND kind = 'decision'")) == 1, json.encode(sensed))
+    -- … and the CLI says it too
+    seed("del:warn-cli", { {} })
+    local cid = tonumber(dbw.value("SELECT id FROM lm_memories WHERE scope = 'del:warn-cli'"))
+    assert(dbw.run("INSERT INTO lm_observations (scope, body, evidence_ids, last_reinforced, created_at) VALUES (?, ?, ?, ?, ?)",
+        "del:warn-cli", "an observation made from memory " .. cid, dbw.json({ cid }), now, now))
+    local _, _, cli_out = H.with_trigger("lm_test_block_obs_delete_cli", "BEFORE DELETE ON lm_observations BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+        function() return memo_json("", "delete " .. cid) end, true)
+    local cli = json.decode(tostring(cli_out):match("%b{}") or "") or {}   -- (the answer is the JSON object; a stderr line comes before it)
+    check("memo delete ID whose observations cannot be retired: ok, the memory deleted, a warning in the answer",
+        cli.ok == true and tostring(cli.warning):find("could not be removed", 1, true) ~= nil
+        and tonumber(dbw.value("SELECT count(*) FROM lm_memories WHERE id = ?", cid)) == 0, tostring(cli_out))
+end
 s.close()
 
 seed("del:mcp2", { {}, {} })
@@ -314,15 +359,20 @@ check("MCP memory_summarize: dry run, then for real", ((md.result or {}).summari
     and ((mr.result or {}).summarised or 0) >= 1 and count("f:mcp") == 1, json.encode(mr))
 -- Periodic: every MEMO_SUMMARIZER_INTERVAL_SECONDS, on writes (lazy, like the digest).
 local lm = require("luamemo")
+-- (the interval is a day by default now: the two old notes are seeded before the interval is set, as they were)
+lm.setup({ summarizer_interval_seconds = 0 })
 seed("f:auto", { {}, {} })
-lm.setup({ summarizer_interval_seconds = 3600, summarizer_retention_days = 0, summarizer_weight_threshold = 2 })
+-- (maintenance_background = false: the batch runs inside the write, so the test can see it; by default it is a separate process)
+lm.setup({ summarizer_interval_seconds = 3600, summarizer_retention_days = 0, summarizer_weight_threshold = 2,
+           maintenance_background = false })
 seed("f:auto", { { title = "trigger" } })
 local sums = function() return tonumber(require("luamemo.db").value(
     "SELECT count(*) FROM lm_memories WHERE scope = 'f:auto' AND kind = 'summary'")) end
 check("a write summarizes its scope when the interval is due", sums() == 1)
 seed("f:auto", { { title = "again" } })
 check("… at most once per interval", sums() == 1)
-lm.setup({ summarizer_interval_seconds = 0, summarizer_retention_days = 30, summarizer_weight_threshold = 0.5 })
+lm.setup({ summarizer_interval_seconds = 0, summarizer_retention_days = 30, summarizer_weight_threshold = 0.5,
+           maintenance_background = true })
 end)
 
 -- ---------------------------------------------------------------------------

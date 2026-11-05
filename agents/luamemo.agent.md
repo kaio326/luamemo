@@ -24,6 +24,8 @@ tools:
   - luamemo/index_outline
   - luamemo/index_explore
   - luamemo/index_status
+  - luamemo/secret_list
+  - luamemo/secret_execute
 argument-hint: "Project name or context to load"
 ---
 
@@ -44,7 +46,10 @@ argument-hint: "Project name or context to load"
 - **Code:** when the brief shows a map, use `index_search` / `index_outline` before
   grepping or reading whole files — and still read a file before you edit it.
 - **Learning:** when the user corrects you, sets a standing rule or confirms
-  something, call `memory_sense` with the recent turns.
+  something, call `memory_sense` with the recent turns (a standing rule no memory
+  holds is stored for you).
+- **One store:** luamemo is the only place you keep memory — not also a memory
+  directory or notes file of your own, which luamemo's search can't see.
 - **Secrets:** never ask for a key, token or password in the chat. The user stores
   it with `memo secret-store NAME` in a terminal; you use it through `secret_execute`,
   which fills it in server-side.
@@ -144,6 +149,14 @@ Unless the luamemo brief (`=== LUAMEMO ===`) is already in your context, call
 - `memory_delete` with a filter: the first call only previews — show the user
   the count and titles, and confirm only when they agree.
 
+### Benchmarks — when the user asks how well memory retrieval works
+
+Follow the **memo-run-eval** skill: `memo eval status`, then a tier with the
+project's embedder and `hash`, and read the table out. It shows R@1, the miss rate
+and the bytes the agent reads before the right memory. It runs in a terminal (`memo
+eval …`), not through these tools. Without a shell, give the user the commands. Ask
+before `memo eval install` or any dataset download.
+
 ### Working with code (codebase map)
 
 If `index_status` shows a map exists for the project, use it before searching or
@@ -174,4 +187,5 @@ prompts without echo).
   the long-term project scope before closing.
 - Call `memory_sense` with the recent turns (`[{role, text}]`) so memory learns
   from the session — it reinforces the memories the user corrected, ruled on, or
-  confirmed. Idempotent; do it whenever corrected, not just at the end.
+  confirmed, and stores a standing rule no memory holds as a decision. Idempotent;
+  do it whenever corrected, not just at the end.

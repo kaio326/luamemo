@@ -4,19 +4,27 @@
 --
 -- Clusters unprocessed memories for a scope by cosine similarity, then
 -- either reinforces an existing observation (cheap UPDATE) or synthesises a
--- new one via the configured summarizer adapter (one LLM call per new
--- cluster). Also provides a search leg that surfaces observations alongside
--- regular memories in store.search().
+-- new one via the configured summarizer adapter (an LLM call only for a new
+-- cluster of two or more, and never when opts.no_llm: a search, or scheduled
+-- work with a remote summarizer). Also provides a search leg that surfaces
+-- observations alongside regular memories in store.search().
 --
 -- Public API:
 --   consolidate.configure(config)         -- called by M.setup()
 --   consolidate.notify(scope)             -- fast, no DB; sets pending flag
---   consolidate.process(scope)            -- runs clustering + reinforcement
+--   consolidate.pending(scope)            -- has a write been notified, or a run left rows (more remain, or a fetch failed)?
+--   consolidate.process(scope [, opts])   -- runs clustering + reinforcement (opts: limit, tier_min, no_llm) →
+--                                            { reinforced, synthesised, errors, skipped?, failed? }: check `failed` (nothing
+--                                            was read or done) before treating the rows as consolidated
 --   consolidate.search(scope, qvec, lim)  -- observation search leg
+--   consolidate.would_reinforce(scope, vecs) -- per vector: is an observation close enough that process would
+--                                              reinforce it? (the digest asks before it escalates a mistake)
+--   consolidate.UNPROCESSED_SQL           -- the SQL condition for "a memory process takes" (the digest's fetch shares it)
 
 local db      = require("luamemo.db")
 local embed   = require("luamemo.embed")
 local util    = require("luamemo.util")
+local settings = require("luamemo.settings")   -- (same_memory: one definition of "the same memory")
 local vectors = require("luamemo.vectors")
 
 local M = {}
@@ -31,24 +39,11 @@ local _adapter_cache   = {}        -- [name] -> summarizer module
 
 -- Compute freshness_trend from the epoch of last_reinforced and proof_count.
 local function _freshness_trend(last_epoch, proof_count)
-    local days = (os.time() - last_epoch) / 86400
+    local days = (os.time() - last_epoch) / util.DAY_S
     if days < 7  and proof_count >= 3 then return "strengthening" end
     if days < 30                       then return "stable"        end
     if days < 90                       then return "weakening"     end
     return "stale"
-end
-
--- Detect negation language in a memory body (pure Lua string scan).
-local NEGATION_MARKS = {
-    "no longer", "not ", " not$", "stopped", "won't", "changed",
-    "instead", "reversed", "removed", "dropped", "deprecated",
-}
-local function _has_negation(body)
-    local lower = body:lower()
-    for _, pat in ipairs(NEGATION_MARKS) do
-        if lower:find(pat, 1, true) then return true end
-    end
-    return false
 end
 
 -- Proof-count multiplicative boost for observation search scores.
@@ -69,16 +64,10 @@ end
 local function _ts_to_epoch(us)
     us = tonumber(us)
     if not us then return 0 end
-    return math.floor(us / 86400000000) * 86400
+    return math.floor(us / util.DAY_US) * util.DAY_S
 end
 
-local function _ids(list)
-    local out = {}
-    for _, id in ipairs(list or {}) do
-        if tonumber(id) then out[#out + 1] = math.floor(tonumber(id)) end
-    end
-    return out
-end
+local _ids = util.ints
 
 -- ---------------------------------------------------------------------------
 -- Summarizer dispatch (reuses summarizers adapter cache pattern)
@@ -87,56 +76,65 @@ local function _load_adapter(name)
     return util.load_submodule(_adapter_cache, "luamemo.summarizers", name, "summarize")
 end
 
+-- The text of a memory (or of a summarizer's answer): its body, else its title — a note written with a title only has a
+-- vector (its title is embedded), so it is taken, and an empty text would leave it unconsolidated for good. → the text, or
+-- nil when it has none.
+local function _text_of(t)
+    if t.body ~= nil and t.body ~= "" then return t.body end
+    if t.title ~= nil and t.title ~= "" then return t.title end
+end
+
 -- Synthesise a belief body from a cluster of memories.
 -- Uses the configured summarizer when available and not "noop".
--- Falls back to the body of the highest-importance memory in the cluster.
-local function _synthesize(cluster)
-    -- Fall back when no LLM is configured.
-    local adapter_name = cfg and cfg.summarizer_adapter
-    if not adapter_name or adapter_name == "noop" or adapter_name == "" then
-        -- Use the body of the highest-importance memory.
+-- Falls back to the text of the highest-importance memory in the cluster. → the text ("" when there is none: the caller
+-- reports it) and, when the fallback was taken because the summarizer failed, why.
+local function _synthesize(cluster, no_llm)
+    -- The fallback: the text of the highest-importance member.
+    local function best_text(err)
         local best = cluster[1]
         for _, m in ipairs(cluster) do
             if (m.importance or 0) > (best.importance or 0) then best = m end
         end
-        return best.body, nil
+        return _text_of(best) or "", err
     end
+
+    -- Fall back when no LLM is configured — or when the caller is a search (no_llm): a search waits on this call,
+    -- and a language model takes tens of seconds; the observation is the best member's text, and the model's
+    -- phrasing is for the background run (memo maintain) to give.
+    -- A cluster of one has nothing to summarize: its own words are the observation (a model's rewording of a single
+    -- memory took 15 s and said the same thing — and most clusters are single).
+    if no_llm or #cluster < 2 then return best_text() end
+    local adapter_name = require("luamemo.summarizers._common").adapter_name(cfg)   -- (`auto` resolved: it looks at the disk)
+    if adapter_name == "noop" then return best_text() end
 
     local adapter, aerr = _load_adapter(adapter_name)
-    if not adapter then
-        -- Adapter unavailable; fall back gracefully.
-        local best = cluster[1]
-        for _, m in ipairs(cluster) do
-            if (m.importance or 0) > (best.importance or 0) then best = m end
-        end
-        return best.body, aerr
-    end
+    if not adapter then return best_text(aerr) end   -- unavailable: fall back gracefully
 
     local result, serr = adapter.summarize(cluster, cfg)
-    if not result then
-        -- Synthesis failed; fall back to highest-importance body.
-        local best = cluster[1]
-        for _, m in ipairs(cluster) do
-            if (m.importance or 0) > (best.importance or 0) then best = m end
-        end
-        return best.body, serr
-    end
+    if not result then return best_text(serr) end   -- failed: fall back to the best member's text
 
-    local body = result.body or result.title or ""
-    return body, nil
+    -- (an answer with no text — "body": "" and no title — is no observation: reported by `process`, and the cluster waits)
+    return _text_of(result) or "", nil
 end
 
 -- ---------------------------------------------------------------------------
 -- DB helpers
 -- ---------------------------------------------------------------------------
 
--- Fetch all unprocessed memories for a scope (consolidated_at IS NULL)
--- including their embedding vectors.
+-- The one definition of "a memory consolidate.process takes": not consolidated yet, and with a vector (a note stored
+-- without one — the embedder was down, the text too long — is left until it is re-embedded). The digest's own fetch of
+-- the rows to archive uses it too: a row archived without an observation made from it would be deleted at its review.
+M.UNPROCESSED_SQL = "consolidated_at IS NULL AND embedding IS NOT NULL"
+
+-- Fetch the scope's unprocessed memories (M.UNPROCESSED_SQL) of tier `tier_min` or above — the oldest `limit` of them —
+-- with their embedding vectors unpacked → rows, or nil + why (a read that failed is not "nothing to process").
 local function _fetch_unprocessed(scope, limit, tier_min)
-    local sql = "SELECT id, body, title, importance, embedding FROM lm_memories "
-        .. "WHERE scope = ? AND consolidated_at IS NULL AND embedding IS NOT NULL"
+    local sql = "SELECT id, body, title, importance, updated_at, embedding FROM lm_memories "
+        .. "WHERE scope = ? AND " .. M.UNPROCESSED_SQL
         .. (tier_min and (" AND tier >= " .. math.floor(tier_min)) or "") .. " ORDER BY id"
-    local rows = (limit and db.query(sql .. " LIMIT ?", scope, limit) or db.query(sql, scope)) or {}
+    local rows, err
+    if limit then rows, err = db.query(sql .. " LIMIT ?", scope, limit) else rows, err = db.query(sql, scope) end
+    if not rows then return nil, tostring(err) end
     for _, r in ipairs(rows) do r.embedding = vectors.unpack(r.embedding) end
     return rows
 end
@@ -151,15 +149,15 @@ local function _row_norm(r, col, p, bytes)
 end
 
 -- The scope's observations (without their vectors, most recently reinforced first) and
--- each cluster's closest one: a single pass, every stored vector scored where it lies
--- against each cluster's pivot (vectors.cosine_ptr). They were all unpacked into Lua
+-- each pivot's closest one (n pivots: float tables, or false for none): a single pass, every stored vector scored
+-- where it lies against each pivot (vectors.cosine_ptr). They were all unpacked into Lua
 -- tables and scored in Lua on every run — the first search after any write: 37 ms at
--- 1,575 observations. → observations, closest[ci] = { obs = row, sim = cosine }
-local function _observations_near(scope, clusters)
+-- 1,575 observations. → observations, closest[i] = { obs = row, sim = cosine }
+local function _observations_near(scope, pivots, n)
     local qs = {}
-    for ci, cl in ipairs(clusters) do
-        local v = cl[1].embedding
-        qs[ci] = type(v) == "table" and #v > 0 and vectors.query(v) or false
+    for i = 1, n do
+        local v = pivots[i]
+        qs[i] = type(v) == "table" and #v > 0 and vectors.query(v) or false
     end
     local observations, closest = {}, {}
     db.scan("SELECT id, proof_count, freshness_trend, last_reinforced, embedding, emb_norm FROM lm_observations "
@@ -178,14 +176,64 @@ local function _observations_near(scope, clusters)
     return observations, closest
 end
 
--- Mark a batch of memory ids as consolidated (set consolidated_at = now).
-local function _mark_consolidated(ids)
-    ids = _ids(ids)
-    if #ids == 0 then return end
-    local params = { util.now_us() }
-    for _, id in ipairs(ids) do params[#params + 1] = id end
-    assert(db.run("UPDATE lm_memories SET consolidated_at = ? WHERE id IN (" .. db.placeholders(#ids) .. ")",
-        unpack(params, 1, #params)))
+-- The one definition of "an observation close enough to reinforce": the closest one's raw cosine (an entry of
+-- _observations_near's `closest`, or nil) against MEMO_CONSOLIDATE_REINFORCE_THRESHOLD (`need`, from _reinforce_need).
+local function _reinforce_need() return settings.same_memory(cfg or {}, "consolidate_reinforce_threshold") end
+local function _close_enough(entry, need) return entry ~= nil and entry.sim >= need end
+
+-- A cluster's memories as `process` read them (id and updated_at): the condition "still as they were read" and its two
+-- parameters, ONE each whatever the cluster's size (a cluster has no limit; a bound variable per memory stops at LuaJIT's
+-- unpack, near 8,000). The stamps are text: json.encode rounds an integer of microseconds.
+local STILL_AS_READ = "id IN (SELECT value FROM json_each(?)) AND printf('%d:%d', id, updated_at) IN (SELECT value FROM json_each(?))"
+local function _as_read(cluster)
+    local ids, stamps = {}, {}
+    for _, m in ipairs(cluster) do
+        local id = math.floor(tonumber(m.id))
+        ids[#ids + 1] = id
+        stamps[#stamps + 1] = ("%d:%d"):format(id, tonumber(m.updated_at) or 0)
+    end
+    return db.json(ids), db.json(stamps)
+end
+
+-- Are all of the cluster's memories still unconsolidated, of the scope and as they were read? One rewritten since
+-- (store.update moved its updated_at; its new text is in no observation), moved to another scope or otherwise touched
+-- makes the cluster wait: no observation made from a read that is out of date, and the next run reads them again.
+-- A read that fails is an error, never "changed" (a failing database must not look like a quiet one).
+local function _unchanged(scope, cluster)
+    local ids_json, stamps_json = _as_read(cluster)
+    local count, err = db.value("SELECT count(*) FROM lm_memories WHERE scope = ? AND consolidated_at IS NULL AND " .. STILL_AS_READ,
+        scope, ids_json, stamps_json)
+    if count == nil then error("could not check the cluster: " .. tostring(err), 0) end
+    return tonumber(count) == #cluster
+end
+
+-- Is the cluster already known to be out of date? (a pure shortcut before a model or embedder call: `_commit` checks again,
+-- inside its transaction, and is the authority; a read that fails is "not known")
+local function _known_stale(scope, cluster)
+    local ok, still = pcall(_unchanged, scope, cluster)
+    return ok and not still
+end
+
+-- Mark a cluster's memories as consolidated (consolidated_at = now) — those still as `process` read them.
+local function _mark_consolidated(cluster)
+    local ids_json, stamps_json = _as_read(cluster)
+    assert(db.run("UPDATE lm_memories SET consolidated_at = ? WHERE " .. STILL_AS_READ, util.now_us(), ids_json, stamps_json))
+end
+
+-- A cluster's write, ONE transaction: its memories are still as they were read (else nothing is written and the cluster
+-- waits), `write()` makes or reinforces the observation (it raises its error, worded), and the memories are marked. Any
+-- error undoes all of it: never an observation without its memories marked, nor memories marked without their observation.
+-- → "made", write()'s result | "changed" | nil, why
+local function _commit(scope, cluster, write)
+    local ok, flag, out = db.transaction(function()
+        if not _unchanged(scope, cluster) then return "changed" end
+        local result = write()
+        local okm, merr = pcall(_mark_consolidated, cluster)
+        if not okm then error("mark consolidated: " .. tostring(merr), 0) end
+        return "made", result
+    end)
+    if not ok then return nil, tostring(flag) end
+    return flag, out
 end
 
 local function _append(list, more)
@@ -195,22 +243,39 @@ local function _append(list, more)
     return out
 end
 
--- Reinforce an existing observation: increment proof_count, update
--- evidence_ids, and recalculate freshness_trend.
-local function _reinforce(obs_id, new_ids, new_quotes, last_epoch)
+-- Reinforce an existing observation: increment proof_count, update evidence_ids, stamp last_reinforced = now and write
+-- the freshness_trend that follows from that (it is being reinforced now, with its new proof count) → the observation as it
+-- now is, { proof_count, last_reinforced, freshness_trend }: the numbers written, for the caller's in-memory copy. Only
+-- the memories the observation's evidence does not hold yet are added and counted (a cluster read again after an unfinished
+-- run is not counted twice); a cluster all of whose memories it holds still stamps last_reinforced.
+local function _reinforce(obs_id, new_ids, new_quotes)
+    local now_is
+    local id = math.floor(tonumber(obs_id) or 0)
     local ok, err = db.transaction(function(h)
-        local cur = h.first("SELECT evidence_ids, evidence_quotes FROM lm_observations WHERE id = ?",
-            math.floor(tonumber(obs_id) or 0))
+        local cur = h.first("SELECT proof_count, evidence_ids, evidence_quotes FROM lm_observations WHERE id = ?", id)
         if not cur then error("observation " .. tostring(obs_id) .. " not found", 0) end
-        local n, uerr = h.run("UPDATE lm_observations SET proof_count = proof_count + ?, evidence_ids = ?, "
+        -- only the memories its evidence does not hold yet count (a cluster read again after a run that did not finish
+        -- would otherwise be counted twice: its proof, its evidence and its quotes)
+        local held = {}
+        for _, v in ipairs(type(cur.evidence_ids) == "table" and cur.evidence_ids or {}) do held[tonumber(v)] = true end
+        local fresh_ids, fresh_quotes = {}, {}
+        for i, mid in ipairs(new_ids) do
+            if not held[tonumber(mid)] then
+                fresh_ids[#fresh_ids + 1] = mid
+                fresh_quotes[#fresh_quotes + 1] = new_quotes and new_quotes[i]
+            end
+        end
+        local proof = tonumber(cur.proof_count) + #fresh_ids   -- (NOT NULL, read inside this transaction)
+        now_is = { proof_count = proof, last_reinforced = util.now_us(), freshness_trend = _freshness_trend(os.time(), proof) }
+        local n, uerr = h.run("UPDATE lm_observations SET proof_count = ?, evidence_ids = ?, "
             .. "evidence_quotes = ?, freshness_trend = ?, last_reinforced = ? WHERE id = ?",
-            #new_ids, db.json(_append(cur.evidence_ids, _ids(new_ids))),
-            db.json(_append(cur.evidence_quotes, new_quotes)),
-            _freshness_trend(last_epoch, 0),  -- approx; real count unknown here
-            util.now_us(), math.floor(tonumber(obs_id) or 0))
+            proof, db.json(_append(cur.evidence_ids, _ids(fresh_ids))),
+            db.json(_append(cur.evidence_quotes, fresh_quotes)), now_is.freshness_trend,
+            now_is.last_reinforced, id)
         if not n then error(uerr, 0) end
     end)
-    if not ok then error("reinforce obs db error: " .. tostring(err)) end
+    if not ok then error(tostring(err), 0) end   -- (the caller names the observation)
+    return now_is
 end
 
 -- Update freshness_trend for an observation based on its current proof_count
@@ -232,19 +297,85 @@ local function _insert_obs(scope, body, evidence_ids, evidence_quotes, obs_vec, 
         .. "VALUES (?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)",
         scope, body, math.max(1, #evidence_ids), db.json(_ids(evidence_ids)), db.json(evidence_quotes or {}),
         math.min(10.0, math.max(0.0, imp or 0.5)), db.blob(blob), norm, now, now)
-    if not n then error("insert obs db error: " .. tostring(qerr)) end
+    if not n then error(tostring(qerr), 0) end   -- (the caller says it is the insert)
 end
 
--- ---------------------------------------------------------------------------
--- Clustering
--- ---------------------------------------------------------------------------
+-- The result of a call that read or did nothing: `failed` says why, and the one error in `errors` says it with the
+-- module's name (a caller must not go on as if the rows were consolidated).
+local function _did_nothing(why)
+    return { reinforced = 0, synthesised = 0, errors = { "consolidate: " .. why }, failed = why }
+end
 
--- Greedy single-linkage clustering.
--- Assigns each memory to the first existing cluster whose centroid (first
--- member) has cosine similarity >= threshold.  New memories start their own
--- cluster if none qualifies.
--- Returns a list of lists, each inner list being memory rows.
--- _cluster and _cosine are provided by util.cluster / util.cosine.
+-- (Clustering is util.cluster: greedy, each memory joins the first cluster whose first member it is as close to as the
+-- threshold, else starts one.)
+
+-- A cluster's ids, quote snippets (200 chars of each) and average importance — what an observation is made of.
+local function _describe(cluster)
+    local ids, quotes, avg_imp = {}, {}, 0
+    for _, m in ipairs(cluster) do
+        ids[#ids + 1] = m.id
+        quotes[#quotes + 1] = util.clip(m.body or "", 200)
+        avg_imp = avg_imp + (tonumber(m.importance) or 0.5)
+    end
+    return ids, quotes, avg_imp / #cluster
+end
+
+-- The reinforcement path of a cluster: the closest observation is close enough, so no summarizer is needed. Ends in
+-- `_commit`: a cluster whose memories changed since they were read waits for the next run without a word; one whose write
+-- failed waits with its error in `result`. `obs` is the observation as `_observations_near` read it: updated in memory to
+-- what was written (for the clusters after this one and the trend refresh).
+local function _reinforce_cluster(scope, cluster, obs, result)
+    local ids, quotes = _describe(cluster)
+    local state, res = _commit(scope, cluster, function()
+        local ok, reinforced = pcall(_reinforce, obs.id, ids, quotes)   -- (the observation as it now is, or the error)
+        if not ok then error("reinforce obs " .. tostring(obs.id) .. ": " .. tostring(reinforced), 0) end
+        return reinforced
+    end)
+    if state == "made" then
+        result.reinforced = result.reinforced + 1
+        obs.proof_count, obs.last_reinforced, obs.freshness_trend = res.proof_count, res.last_reinforced, res.freshness_trend
+    elseif state == nil then
+        result.errors[#result.errors + 1] = res
+    end
+end
+
+-- The synthesis path of a cluster: one summarizer call (or the best member's text), a new observation. `pivot`: the
+-- cluster's vector, the fallback when the observation's own text cannot be embedded. Ends in `_commit` like the other path;
+-- a summarizer that gave no text makes no observation and the cluster waits — said, not silent.
+local function _synthesize_cluster(scope, cluster, pivot, no_llm, result)
+    local ids, quotes, avg_imp = _describe(cluster)
+    local body, serr = _synthesize(cluster, no_llm)
+    if serr and cfg.consolidate_log_errors then
+        result.errors[#result.errors + 1] = "synthesize: " .. tostring(serr)
+    end
+    if not body or body == "" then
+        result.errors[#result.errors + 1] = "synthesize: empty body"
+        return
+    end
+    -- The default summarizer keeps a member's text: its stored vector serves (an embedder call per new memory went to that
+    -- text again). Else embed it.
+    local obs_vec
+    for _, m in ipairs(cluster) do
+        if _text_of(m) == body and type(m.embedding) == "table" then obs_vec = m.embedding; break end
+    end
+    if not obs_vec then
+        local everr
+        obs_vec, everr = embed.embed(body)
+        if not obs_vec then
+            result.errors[#result.errors + 1] = "embed obs body: " .. tostring(everr)
+            obs_vec = pivot
+        end
+    end
+    local state, why = _commit(scope, cluster, function()
+        local ok, ierr = pcall(_insert_obs, scope, body, ids, quotes, obs_vec, avg_imp)
+        if not ok then error("insert obs: " .. tostring(ierr), 0) end
+    end)
+    if state == "made" then
+        result.synthesised = result.synthesised + 1
+    elseif state == nil then
+        result.errors[#result.errors + 1] = why
+    end
+end
 
 -- ---------------------------------------------------------------------------
 -- Public API
@@ -261,123 +392,79 @@ function M.notify(scope)
     if scope then _pending[scope] = true end
 end
 
---- Check whether a scope has pending unprocessed writes.
+--- Check whether a scope has pending unprocessed writes — a write notified and not processed yet, or rows a run left
+--- (a limited run with more remaining, a fetch that failed).
 function M.pending(scope)
     return _pending[scope] == true
 end
 
 --- Run the consolidation pipeline for a scope.
---- Fetches memories with consolidated_at IS NULL, clusters them by cosine
+--- Fetches the memories of M.UNPROCESSED_SQL (not consolidated yet, and with a vector: a note stored without one is
+--- left unconsolidated until it is re-embedded), clusters them by cosine
 --- similarity, then either reinforces an existing observation or synthesises
---- a new one.  Marks all processed memories as consolidated.
+--- a new one.  Each cluster ends in ONE transaction: its memories are still as they were read (not rewritten, moved or
+--- otherwise touched meanwhile — else the cluster waits for the next run, silently), the observation is made or reinforced,
+--- and the memories are marked consolidated. Any error undoes all of it: the cluster waits, with the error in `errors`
+--- ("insert obs: …", "reinforce obs N: …", "mark consolidated: …"; "synthesize: empty body" when the summarizer gave no
+--- text; "could not check the cluster: …" when the read that tells it is unchanged failed). A notice about HOW an
+--- observation was made ("embed obs body: …" — the cluster's own vector is used —, "synthesize: …" with
+--- MEMO_CONSOLIDATE_LOG_ERRORS — the best member's text is used) is in `errors` too: it reports what happened to the
+--- embedder or the summarizer, and its memories are marked only if the cluster then went through — one that changed
+--- meanwhile waits, and the notice still stands.
 ---
 --- opts.limit: at most that many memories (the oldest), the scope left pending while more
 --- remain — what a search runs inline: the whole backlog there (clustering is O(n ×
 --- clusters) in Lua) stalled the search after a bulk write (9 s after 5,000 rows).
 --- opts.tier_min: only memories of that tier or above (a search: 1 — tier 0 is the digest's).
+--- opts.no_llm: never ask the summarizer — a new observation is its best member's text (what a search runs, and
+--- the digest when the summarizer is a remote model).
 ---
 --- Returns a summary table:
----   { reinforced = N, synthesised = N, errors = {...} }
+---   { reinforced = N, synthesised = N, errors = {...}, skipped = why, failed = why }
+--- (skipped: the scope is not maintained — a replica, the code index — and nothing was done. failed: nothing was read
+--- or done, not configured or the memories could not be fetched — a caller that goes on as if they were consolidated
+--- must not: the digest would archive rows no observation holds. A failed fetch leaves the scope pending for the next
+--- call; "not configured" changes no flag — M.configure resets them all.)
 function M.process(scope, opts)
-    if not cfg then return { reinforced = 0, synthesised = 0, errors = {"consolidate: not configured"} } end
+    if not cfg then return _did_nothing("not configured") end
 
     -- Clear the pending flag first so concurrent writes queue a follow-up run.
     _pending[scope] = nil
 
-    -- Federation: a dev's org replica mirrors the central, which consolidates it.
-    if require("luamemo.federation.policy").replica(scope) then
-        return { reinforced = 0, synthesised = 0, errors = {}, skipped = "replica" }
-    end
+    -- A dev's org replica mirrors the central, which consolidates it; the code index is not memory (observations of
+    -- its symbols and dependency edges would be noise).
+    local skip = require("luamemo.federation.policy").maintenance_skip(scope)
+    if skip then return { reinforced = 0, synthesised = 0, errors = {}, skipped = skip } end
 
     local result = { reinforced = 0, synthesised = 0, errors = {} }
 
     local limit = opts and tonumber(opts.limit)
-    local memories = _fetch_unprocessed(scope, limit, opts and tonumber(opts.tier_min))
+    local memories, ferr = _fetch_unprocessed(scope, limit, opts and tonumber(opts.tier_min))
+    if not memories then
+        _pending[scope] = true   -- (not read: the next call tries again)
+        return _did_nothing("fetch error: " .. ferr)
+    end
     if #memories == 0 then return result end
     if limit and #memories >= limit then _pending[scope] = true end   -- more remain: the next call goes on
 
     -- Cluster unprocessed memories.
-    local threshold = (cfg.consolidate_threshold) or 0.80
+    local threshold = settings.same_memory(cfg, "consolidate_threshold")
     local clusters  = util.cluster(memories, threshold)
-    local observations, closest = _observations_near(scope, clusters)
+    local pivots = {}
+    for ci, cluster in ipairs(clusters) do pivots[ci] = cluster[1].embedding end
+    local observations, closest = _observations_near(scope, pivots, #clusters)
+    local need = _reinforce_need()
 
     for ci, cluster in ipairs(clusters) do
-        -- Collect ids and quote snippets.
-        local ids    = {}
-        local quotes = {}
-        local avg_imp = 0
-        for _, m in ipairs(cluster) do
-            ids[#ids + 1]    = m.id
-            quotes[#quotes + 1] = util.clip(m.body or "", 200)
-            avg_imp = avg_imp + (tonumber(m.importance) or 0.5)
-        end
-        avg_imp = avg_imp / #cluster
-
-        -- Find the pivot embedding (first member's vec).
-        local pivot_vec = cluster[1].embedding
-
-        -- Is the closest existing observation close enough to reinforce?
-        local best_obs = closest[ci] and closest[ci].obs
-        local best_sim = closest[ci] and closest[ci].sim or 0
-        local reinforce_threshold = (cfg.consolidate_reinforce_threshold) or 0.75
-
-        if best_obs and best_sim >= reinforce_threshold then
-            -- Reinforcement path: no LLM needed.
-            local last_epoch = _ts_to_epoch(best_obs.last_reinforced)
-            local ok, rerr = pcall(_reinforce, best_obs.id, ids, quotes, last_epoch)
-            if not ok then
-                result.errors[#result.errors + 1] = "reinforce obs "
-                    .. tostring(best_obs.id) .. ": " .. tostring(rerr)
-            else
-                result.reinforced = result.reinforced + 1
-                -- Update freshness_trend in-memory for later iterations.
-                best_obs.proof_count = (tonumber(best_obs.proof_count) or 1) + #ids
-            end
+        -- Is the closest existing observation (to the cluster's pivot, its first member's vector: pivots[ci]) close
+        -- enough to reinforce? If not, a new one is made — unless the cluster changed while the others before it were
+        -- summarized: it waits for the next run, and no model call is made for it.
+        if _close_enough(closest[ci], need) then
+            _reinforce_cluster(scope, cluster, closest[ci].obs, result)
+        elseif _known_stale(scope, cluster) then
+            -- (waits)
         else
-            -- Synthesis path: one LLM call (or fallback concatenation).
-            local has_neg = false
-            for _, m in ipairs(cluster) do
-                if _has_negation(m.body or "") then has_neg = true; break end
-            end
-
-            local body, serr = _synthesize(cluster)
-            if serr and cfg.consolidate_log_errors then
-                result.errors[#result.errors + 1] = "synthesize: " .. tostring(serr)
-            end
-            if body and body ~= "" then
-                -- The default summarizer keeps a member's body: its stored vector serves (an
-                -- embedder call per new memory went to that text again). Else embed it.
-                local obs_vec
-                for _, m in ipairs(cluster) do
-                    if m.body == body and type(m.embedding) == "table" then obs_vec = m.embedding; break end
-                end
-                if not obs_vec then
-                    local everr
-                    obs_vec, everr = embed.embed(body)
-                    if not obs_vec then
-                        result.errors[#result.errors + 1] = "embed obs body: " .. tostring(everr)
-                        obs_vec = pivot_vec  -- fall back to cluster pivot
-                    end
-                end
-                local ok, ierr = pcall(_insert_obs, scope, body, ids, quotes, obs_vec, avg_imp)
-                if not ok then
-                    result.errors[#result.errors + 1] = "insert obs: " .. tostring(ierr)
-                else
-                    result.synthesised = result.synthesised + 1
-                    -- Mark the new observation as a candidate for future reinforcement.
-                    -- (It will be scanned by _observations_near on the next run.)
-                end
-                -- Suppress unused variable warning for has_neg; it will be used
-                -- in Plan 11 for contradiction handling.
-                local _ = has_neg
-            end
-        end
-
-        -- Mark memories as consolidated regardless of synthesis outcome so
-        -- they are not re-processed on the next run.
-        local ok2, merr = pcall(_mark_consolidated, ids)
-        if not ok2 then
-            result.errors[#result.errors + 1] = "mark consolidated: " .. tostring(merr)
+            _synthesize_cluster(scope, cluster, pivots[ci], opts and opts.no_llm, result)
         end
     end
 
@@ -387,6 +474,16 @@ function M.process(scope, opts)
     end
 
     return result
+end
+
+--- For each vector of `vecs` (float tables, or false for none: no holes), is there an observation of the scope close
+--- enough that `process` would reinforce it? The decision `process` takes — the raw cosine of the closest observation
+--- against MEMO_CONSOLIDATE_REINFORCE_THRESHOLD — for all of them in one pass over the observations → a list of booleans.
+function M.would_reinforce(scope, vecs)
+    local _, closest = _observations_near(scope, vecs, #vecs)
+    local need, out = _reinforce_need(), {}
+    for i = 1, #vecs do out[i] = _close_enough(closest[i], need) end
+    return out
 end
 
 --- Observation search leg for store.search().

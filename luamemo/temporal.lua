@@ -322,32 +322,43 @@ end
 -- rrf_merge(ranked_lists, k)
 -- Reciprocal Rank Fusion over a table of ranked lists.
 -- Each list is an array of rows that respond to row.id.
--- Returns a merged list sorted by descending RRF score.
+-- Returns a merged list sorted by descending RRF score; equal scores keep the order
+-- the rows first appear in (the first list's order wins). RRF ties are common — a row
+-- 1st in one list and 2nd in the other scores exactly what the reverse scores — and
+-- the order must not come from pairs() over the ids: LuaJIT randomises string hashing
+-- per process, so the same search ranked a tie differently from run to run.
 -- k defaults to 60 (standard RRF constant).
 -- ---------------------------------------------------------------------------
 function M.rrf_merge(ranked_lists, k)
     k = k or 60
     local scores = {}   -- [id] = accumulated RRF score
     local rows_by_id = {}  -- [id] = row table (first occurrence wins)
+    local order = {}    -- ids in the order they first appear
     for _, list in ipairs(ranked_lists) do
         for rank, row in ipairs(list) do
             local id = tostring(row.id)
+            if not scores[id] then order[#order + 1] = id end
             scores[id]   = (scores[id] or 0) + 1.0 / (k + rank)
             if not rows_by_id[id] then rows_by_id[id] = row end
         end
     end
     -- Build sorted result.
     local result = {}
-    for id, score in pairs(scores) do
+    for pos, id in ipairs(order) do
         local row = rows_by_id[id]
         -- Attach rrf_score; preserve original score for debugging.
         local merged = {}
         for key, val in pairs(row) do merged[key] = val end
-        merged.rrf_score = score
-        merged.score     = score  -- overwrite score with RRF value
+        merged.rrf_score = scores[id]
+        merged.score     = scores[id]  -- overwrite score with RRF value
+        merged._rrf_pos  = pos
         result[#result + 1] = merged
     end
-    table.sort(result, function(a, b) return (a.rrf_score or 0) > (b.rrf_score or 0) end)
+    table.sort(result, function(a, b)
+        if a.rrf_score ~= b.rrf_score then return a.rrf_score > b.rrf_score end
+        return a._rrf_pos < b._rrf_pos
+    end)
+    for _, r in ipairs(result) do r._rrf_pos = nil end
     return result
 end
 

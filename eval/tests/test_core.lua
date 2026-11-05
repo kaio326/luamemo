@@ -36,7 +36,7 @@ local function count(sql, ...) return tonumber((db.value(sql, ...))) end
 
 -- Backdate rows' updated_at (setting it explicitly: the touch trigger only moves an
 -- updated_at the UPDATE leaves alone).
-local DAY_US = 86400 * 1000000
+local DAY_US = require("luamemo.util").DAY_US
 local function backdate(where, param, days)
     assert(db.run("UPDATE lm_memories SET updated_at = ? WHERE " .. where, util.now_us() - days * DAY_US, param))
 end
@@ -647,8 +647,12 @@ do
     check("summarizer real: no errors",      real ~= nil and #real.errors == 0,
         real and table.concat(real.errors, "; ") or "")
 
-    local rows = db.query("SELECT id, kind, title, metadata FROM lm_memories WHERE scope = 'h83-sum' ORDER BY id")
-    check("summarizer: 1 row remains", rows ~= nil and #rows == 1, "got " .. tostring(rows and #rows))
+    -- the four originals are archived (hidden, kept through the grace period, then reviewed — luamemo.fold), not deleted
+    local rows = db.query("SELECT id, kind, title, metadata FROM lm_memories WHERE scope = 'h83-sum' "
+        .. "AND json_type(metadata, '$.lm_fold') IS NULL ORDER BY id")
+    check("summarizer: 1 visible row remains", rows ~= nil and #rows == 1, "got " .. tostring(rows and #rows))
+    check("summarizer: the 4 originals are archived, not deleted",
+        count("SELECT count(*) FROM lm_memories WHERE scope = 'h83-sum' AND tier = 0 AND json_type(metadata, '$.lm_fold') IS NOT NULL") == 4)
     check("summarizer: kind=summary",  rows ~= nil and rows[1] ~= nil and rows[1].kind == "summary")
 
     local meta_t = rows and rows[1] and rows[1].metadata

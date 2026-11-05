@@ -39,8 +39,11 @@ memo ping --embedder
 memo embed "deploy the app" --compare-to "deploying the application"
 ```
 
-`memo calibrate` normally picks a semantic embedder when one works on the
-machine; `--allow-hash` lets it settle for `hash`.
+`memo calibrate` picks a semantic embedder when one works on the machine. When
+none does yet but the machine could run the in-process GGUF embedder, it records
+`hash` as an interim (at 768 dimensions, so the later switch needs no schema
+change, only `memo reembed --all`) and prints the GGUF setup. On a machine that
+can't run the GGUF embedder it stops unless you pass `--allow-hash`.
 
 ## Switching to a real embedder later
 

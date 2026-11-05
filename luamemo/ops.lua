@@ -208,11 +208,14 @@ end
 function M.sense(p, scope)
     if not str(scope) then return nil, "sense: scope required" end
     if type(p.turns) ~= "table" then return nil, "sense: turns array required" end
+    local cfg = require("luamemo").config
     return { ok = true, result = require("luamemo.sensing").process(scope, p.turns, {
         generative     = to_bool(p.generative) == true,
         min_confidence = tonumber(p.min_confidence),
         min_similarity = tonumber(p.min_similarity),
         delta_scale    = tonumber(p.delta_scale),
+        capture            = cfg.sense_capture ~= false,   -- (MEMO_SENSE_CAPTURE: on unless turned off)
+        capture_similarity = tonumber(cfg.sense_capture_similarity),
     }) }
 end
 
@@ -245,6 +248,42 @@ end
 function M.tune_weights(p, scope)
     return require("luamemo.tune_weights").recommend({ scope = scope, samples = p.samples,
         metric = p.metric, in_force = require("luamemo").config.hybrid_weights })
+end
+
+-- ── What an agent receives of a memory ───────────────────────────────────────
+
+--- A list row's body is at most this many bytes (`truncated`: memory_get has it whole) —
+--- one long memory (an imported document) cost its full length in every search it matched.
+M.BODY_CAP = 2000
+
+--- What an agent reads of a memory (search, recent, get): its text and where it lives — not
+--- the scoring internals (vec_score, fts_score, weight, decay_rate, …), empty tags / metadata
+--- left out, the time to the second. About half the tokens of the whole row. cap: the body's
+--- byte limit (lists pass M.BODY_CAP; memory_get none). The MCP server answers with this, and
+--- the benchmarks measure it (eval/metrics.lua: the bytes before the right memory appears).
+function M.compact_row(r, cap)
+    local out = { id = r.id, observation_id = r.observation_id, title = r.title, body = r.body, kind = r.kind,
+                  scope = r.scope, tier = r.tier }
+    if cap and type(r.body) == "string" and #r.body > cap then
+        out.body, out.truncated = util.cut_utf8(r.body, cap) .. "…", true
+    end
+    if type(r.tags) == "table" and next(r.tags) ~= nil then out.tags = r.tags end
+    -- luamemo's own bookkeeping (lm_*: replica ids, sync clocks, proposal links) and an org
+    -- memory's proposers (people's e-mail identities) stay out: half of an org search's
+    -- answer, sent to the model on every call (verbose keeps them).
+    if type(r.metadata) == "table" then
+        local m
+        for k, v in pairs(r.metadata) do
+            if type(k) ~= "string" or (k:sub(1, 3) ~= "lm_" and k ~= "proposers") then
+                m = m or {}
+                m[k] = v
+            end
+        end
+        out.metadata = m
+    end
+    if r.created_at ~= nil then out.created_at = tostring(r.created_at):sub(1, 19) end
+    if tonumber(r.score) then out.score = tonumber(("%.3f"):format(tonumber(r.score))) end
+    return out
 end
 
 return M

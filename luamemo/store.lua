@@ -10,6 +10,7 @@
 local db          = require("luamemo.db")
 local embed       = require("luamemo.embed")
 local util        = require("luamemo.util")
+local settings    = require("luamemo.settings")   -- (same_memory: one definition of "the same memory")
 local temporal    = require("luamemo.temporal")
 local consolidate = require("luamemo.consolidate")
 local digest      = require("luamemo.digest")
@@ -19,6 +20,9 @@ local fts         = require("luamemo.fts")
 -- Federation write policy: org: scopes are read-only replicas (role=dev) or
 -- protected with a directive-only core tier (role=org). No-op when role=solo.
 local policy      = require("luamemo.federation.policy")
+local fold        = require("luamemo.fold")        -- (not_folded_sql: the one predicate for an archived original)
+local feedback    = require("luamemo.feedback")
+local maintenance = require("luamemo.maintenance")
 
 local M = {}
 
@@ -131,7 +135,9 @@ local function _clean(a)
         end
         if not ok then return nil, "tags must be a list of words" end
     end
-    if out.metadata ~= nil and type(out.metadata) ~= "table" then return nil, "metadata must be an object" end
+    if out.metadata ~= nil and (type(out.metadata) ~= "table" or out.metadata[1] ~= nil) then   -- (a list is no object)
+        return nil, "metadata must be an object"
+    end
     return out
 end
 
@@ -145,7 +151,7 @@ M.RETURN_COLS = RETURN_COLS
 local _importance_to_tier = util.importance_to_tier
 
 local DEFAULT_EMBED_TIMEOUT_MS = 30000  -- fallback when embed_timeout_ms not set by M.setup()
-local US_PER_DAY = 86400000000
+local US_PER_DAY = util.DAY_US
 
 -- Trim table `t` to at most `n` entries.  Returns a new table when trimming
 -- is needed, or `t` itself when len(t) <= n (no copy).
@@ -271,8 +277,10 @@ local function _find_near_duplicate(scope, vec, threshold, raw)
     if not scope or not vec or not threshold then return nil end
     local q = vectors.query(vec)
     local best_id, best_sim = nil, -1
+    -- (raw conversation is compared with raw conversation — not with a folded original waiting for its review)
     local n, err = db.scan("SELECT id, embedding, emb_norm FROM " .. tbl()
-        .. " WHERE scope = ? AND embedding IS NOT NULL AND " .. (raw and "tier = 0" or "tier >= 1"), { scope }, function(r)
+        .. " WHERE scope = ? AND embedding IS NOT NULL AND "
+        .. (raw and ("tier = 0 AND " .. fold.not_folded_sql()) or "tier >= 1"), { scope }, function(r)
         local p, bytes = r:blob_ptr(1)
         local s = vectors.cosine_ptr(p, bytes, r:double(2), q)
         if s > best_sim then best_sim, best_id = s, r:int(0) end
@@ -383,7 +391,7 @@ function M.write(args)
     -- the core tier). Protected org scopes cap at 2 unless this is directive ingest.
     local tier = args.tier
     if tier ~= nil then
-        tier = math.max(0, math.min(3, math.floor(tonumber(tier) or 1)))
+        tier = util.clamp_tier(tier)
     else
         tier = policy.default_tier(scope, cap, _importance_to_tier(importance))
     end
@@ -406,11 +414,16 @@ function M.write(args)
     -- memory's importance (more findable next time) and feeds the ranker.
     -- A capability write (federation directive ingest) is a system write keyed
     -- by its source: never merged into another row, never a retrieval miss.
+    -- Only a write that someone chose to make can be a miss. Not: raw conversation
+    -- (tier 0 — each hook snapshot repeats the one before), and the writes luamemo
+    -- makes itself (args.no_miss — set by calibrate's rewrite of its own rows, a
+    -- promoted summary, org knowledge, the benchmark ledger; no tool can pass it).
+    -- Each of those would raise a memory's importance, over and over, for nothing.
     local strategy     = args.dedup_strategy or cfg.dedup_strategy or "update"
     local dedup_active = cfg.dedup_enabled and strategy ~= "append" and not cap
-    local miss_active  = cfg.feedback_enabled and not cap
-    local dedup_thr    = cfg.dedup_threshold or 0.95
-    local miss_thr     = cfg.miss_threshold or 0.90
+    local miss_active  = cfg.feedback_enabled and not cap and not args.no_miss and tier ~= 0
+    local dedup_thr    = settings.same_memory(cfg)
+    local miss_thr     = settings.same_memory(cfg, "miss_threshold")
 
     local existing
     if vec and (dedup_active or miss_active) then
@@ -423,8 +436,8 @@ function M.write(args)
         if near and near.id then
             if miss_active and sim >= miss_thr then       -- retrieval miss (fail-soft)
                 pcall(function()
-                    require("luamemo.digest").record_event(
-                        near.id, scope, "miss", 0.5, "miss:duplicate-write")
+                    digest.record_event(
+                        near.id, scope, "miss", 0.5, feedback.miss_note(feedback.miss_kind(scope, near.id)))
                 end)
             end
             if dedup_active and sim >= dedup_thr then existing = near end
@@ -481,21 +494,17 @@ function M.write(args)
     end
     -- Notify consolidation engine of new unprocessed memory.
     consolidate.notify(scope)
-    digest.notify_write(scope)
     -- Opportunistic maintenance: piggyback a debounced digest on the write so tier
     -- promotion / consolidation / decay happen without depending on any external
-    -- trigger (agent or scheduler) remembering to. Opt-in (auto_digest_enabled);
-    -- atomically debounced inside maybe_run (at most once per interval per scope);
-    -- fail-soft; the _running guard makes re-entry via consolidate impossible.
-    -- Never inside a caller's transaction: a digest may call the summarizer, and
-    -- that would hold the database's write lock for the whole call.
-    if cfg.auto_digest_enabled and not db.in_transaction() then
-        pcall(function() digest.maybe_run(scope) end)
-    end
-    -- The same for summaries, every MEMO_SUMMARIZER_INTERVAL_SECONDS (0: on demand only).
-    if (tonumber(cfg.summarizer_interval_seconds) or 0) > 0 and not db.in_transaction() then
-        pcall(function() require("luamemo.summarizer").maybe_run(scope) end)
-    end
+    -- trigger (agent or scheduler) remembering to. On by default (auto_digest_enabled);
+    -- atomically debounced in the claim (at most once per interval per scope);
+    -- fail-soft; maintenance.after_write refuses re-entry and never raises.
+    -- Never inside a caller's transaction: the claim is itself a write to the
+    -- database, which would join (and roll back with) the caller's transaction
+    -- while the background process it starts had already begun.
+    -- The same for summaries, every MEMO_SUMMARIZER_INTERVAL_SECONDS (0: on demand only). Both claims are made
+    -- together and, if either is won, ONE background process does the work (luamemo.maintenance.after_write).
+    if not db.in_transaction() then maintenance.after_write(scope, cfg) end
     _out(row)
     row.warning = warning
     return row, nil, "inserted"
@@ -656,7 +665,7 @@ function M.write_many(rows_in, opts)
     --   2. Group embedded rows by scope (usually 1 scope, sometimes a few).
     --   3. Issue ONE candidate fetch per distinct scope from the DB.
     --   4. Run cosine comparisons in Lua memory — no extra DB round-trips.
-    local threshold = cfg.dedup_threshold or 0.95
+    local threshold = settings.same_memory(cfg)
     local dedup_active = cfg.dedup_enabled and strategy ~= "append"
 
     -- 1. Intra-batch dedup pass (only when dedup is active).
@@ -711,10 +720,11 @@ function M.write_many(rows_in, opts)
                 scopes_needed[item.args.scope or cfg.default_scope] = true
             end
         end
-        local cap = tonumber(cfg.dedup_candidate_limit) or 1000
+        local cap = settings.number(cfg, "dedup_candidate_limit")
         for sc in pairs(scopes_needed) do
             local rows = db.query("SELECT " .. RETURN_COLS .. ", embedding, emb_norm FROM " .. tbl()
-                .. " WHERE scope = ? AND embedding IS NOT NULL ORDER BY updated_at DESC LIMIT ?", sc, cap)
+                .. " WHERE scope = ? AND embedding IS NOT NULL AND " .. fold.not_folded_sql()
+                .. " ORDER BY updated_at DESC LIMIT ?", sc, cap)   -- (an archived original is not a place to write into)
             local cands = {}
             -- The stored float32 vector and its norm, scored in place (vectors.cosine_ptr) as
             -- a single write's dedup does — not unpacked into a Lua table per candidate.
@@ -731,7 +741,7 @@ function M.write_many(rows_in, opts)
     local function tier_for(args_i, importance)
         local p_tier = args_i.tier
         if p_tier ~= nil then
-            p_tier = math.max(0, math.min(3, math.floor(tonumber(p_tier) or 1)))
+            p_tier = util.clamp_tier(p_tier)
         else
             p_tier = policy.default_tier(args_i.scope or cfg.default_scope, args_i._cap,
                 _importance_to_tier(importance))
@@ -860,7 +870,6 @@ function M.write_many(rows_in, opts)
         if r.row and r.row.scope and not seen_scopes[r.row.scope] then
             seen_scopes[r.row.scope] = true
             consolidate.notify(r.row.scope)
-            digest.notify_write(r.row.scope)
         end
     end
 
@@ -877,15 +886,65 @@ function M.get(id)
     return row and _out(row) or nil
 end
 
--- What was derived from these memories goes with them (a delete, new text) — both went on
--- reaching agents after the memory was deleted or rewritten:
+-- A warning for the answer of a change that was made all the same: written to stderr too, and handed back as it is.
+local function _warn(text)
+    io.stderr:write("[luamemo] ", text, "\n")
+    return text
+end
+
+-- The observations whose evidence holds any of the memories (`q`, `in_ids`, `ids_json`: _forget_derived's) go; the rest
+-- of their evidence keeps its memories — and the ones the digest archived, or consolidated and not archived yet, are
+-- given back (fold.release): held only by an observation going away, their review would delete them as memories nothing
+-- holds; a member of a higher tier is only unconsolidated, so its observation is made again. Only the memories of the
+-- observation's own scope. One transaction: never an observation deleted with its originals left holding on to it, never
+-- an original given back for an observation that stays. The ids pass as one JSON parameter per statement, whatever the
+-- evidence's size (it only grows, and a bound variable per id would stop at LuaJIT's unpack, near 8,000).
+-- → how many memories were given back — on success; nil, the text of a warning — when it failed (nothing changed: the
+-- observation stays — it may still serve the text of a memory that is gone — and its originals keep their holder; the
+-- text is also written to stderr).
+local function _forget_observations(q, in_ids, ids_json)
+    if not db.value(q("SELECT 1 FROM lm_observations WHERE %s1 = 1 LIMIT 1")) then
+        return 0   -- (none here: a code map's per-file replace pays index probes only)
+    end
+    local given_back = 0
+    local ok, err = db.transaction(function()
+        local held, qerr = db.query(q("SELECT o.id, o.scope, o.evidence_ids FROM lm_observations o WHERE %sEXISTS "
+            .. "(SELECT 1 FROM json_each(o.evidence_ids) e WHERE CAST(e.value AS INTEGER) IN " .. in_ids .. ")", ids_json))
+        if not held then error("the observations could not be read: " .. tostring(qerr), 0) end
+        if #held == 0 then return end
+        -- (an observation's originals are its own scope's: an id in its evidence may since have been taken, by a memory of
+        -- another scope, once the review deleted the original that had it)
+        local obs_ids, kin_by_scope = {}, {}
+        for _, o in ipairs(held) do
+            obs_ids[#obs_ids + 1] = o.id
+            local kin = kin_by_scope[o.scope] or {}
+            kin_by_scope[o.scope] = kin
+            for _, k in ipairs(type(o.evidence_ids) == "table" and o.evidence_ids or {}) do kin[#kin + 1] = k end
+        end
+        for observation_scope, kin in pairs(kin_by_scope) do
+            local released, rerr = fold.release(kin, observation_scope)
+            if released == nil then error("their originals could not be given back: " .. tostring(rerr), 0) end
+            given_back = given_back + released
+        end
+        local obs_in, obs_json = db.in_list(obs_ids)
+        local n, derr = db.run("DELETE FROM lm_observations WHERE id IN " .. obs_in, obs_json)
+        if n == nil then error("they could not be deleted: " .. tostring(derr), 0) end
+    end)
+    if not ok then return nil, _warn("the observations made from it could not be removed (" .. tostring(err) .. ")") end
+    return given_back
+end
+
+-- What was derived from these memories goes with them (a delete, new text, a move to another scope) — both went on
+-- reaching agents after the memory was deleted, rewritten or moved:
 --   · the "Preference: …" companions written from their text (luamemo.patterns:
---     metadata.is_synthetic + source_id; lm_memories_synthetic_idx finds them);
+--     metadata.is_synthetic + source_id; lm_memories_synthetic_idx finds them) — except for a move without new text, which
+--     carries them along (opts.keep_companions: the caller moves them);
 --   · the observations distilled from them (luamemo.consolidate): an observation's text
---     may be a memory's own (the default summarizer keeps a member's body). The rest of
---     its evidence keeps its memories.
+--     may be a memory's own (the default summarizer keeps a member's text). The rest of
+--     its evidence keeps its memories (_forget_observations); the scope, if given, is told when some were given back.
 -- scope: where to look (nil: every scope).
-local function _forget_derived(ids, scope)
+-- → nil | a warning: what could not be removed (it is on stderr too).
+local function _forget_derived(ids, scope, opts)
     if #ids == 0 then return end
     local function q(sql, ...)   -- sql with an optional "scope = ? AND " at %s → sql, params…
         if scope then return sql:format("scope = ? AND "), scope, ... end
@@ -898,19 +957,26 @@ local function _forget_derived(ids, scope)
         .. "AND json_extract(metadata, '$.source_id') IN " .. in_ids, ids_json)) or {}
     if #syn > 0 then
         for _, r in ipairs(syn) do all[#all + 1] = r.id end
-        local syn_in, syn_json = db.in_list({ unpack(all, #ids + 1) })
-        db.run("DELETE FROM " .. tbl() .. " WHERE id IN " .. syn_in, syn_json)
-        in_ids, ids_json = db.in_list(all)
+        if not (opts and opts.keep_companions) then
+            local syn_in, syn_json = db.in_list({ unpack(all, #ids + 1) })
+            db.run("DELETE FROM " .. tbl() .. " WHERE id IN " .. syn_in, syn_json)
+            in_ids, ids_json = db.in_list(all)
+        end
     end
-    if not db.value(q("SELECT 1 FROM lm_observations WHERE %s1 = 1 LIMIT 1")) then
-        return   -- (none here: a code map's per-file replace pays index probes only)
-    end
-    db.run(q("DELETE FROM lm_observations WHERE id IN (SELECT o.id FROM lm_observations o, json_each(o.evidence_ids) e "
-        .. "WHERE %sCAST(e.value AS INTEGER) IN " .. in_ids .. ")", ids_json))
+    local given_back, warning = _forget_observations(q, in_ids, ids_json)
+    if scope and given_back and given_back > 0 then consolidate.notify(scope) end
+    return warning
 end
 
 -- ---------------------------------------------------------------------------
 -- update (re-embeds if title or body changed)
+--
+-- New text, or a move to another scope, makes what was distilled from the memory out of date: the observations of its
+-- old scope that hold it go (their other archived notes are given back), its "Preference" companions go with new text
+-- and move along with a move, an archived original is its own memory again (its fold record goes, at the tier it had),
+-- and the memory is consolidated afresh where it now is. → the row, with `warning` when the memory's embedding is
+-- degraded, when something derived from it could not be removed, or when its companions could not be moved with it (the
+-- last two also written to stderr: the memory itself is updated) | nil, why
 -- ---------------------------------------------------------------------------
 function M.update(id, patch)
     id = tonumber(id)
@@ -928,6 +994,11 @@ function M.update(id, patch)
     -- memory is consolidated again.
     local rewritten = not patch._reembed and ((new_title and new_title ~= existing.title)
         or (new_body and new_body ~= existing.body))
+    -- A move to another scope does the same: what was distilled from it there (an observation of that scope, which may
+    -- carry its text) goes, and the destination consolidates it — kept consolidated, no digest would ever take it again,
+    -- and the review of the new scope, finding no observation of its own holding it, would delete it.
+    local moved = patch.scope ~= nil and patch.scope ~= existing.scope
+    local renewed = rewritten or moved   -- (its distilled form is out of date)
 
     -- Federation: the row itself must be mutable by this caller, and a move
     -- (patch.scope) must be allowed into the destination — never carrying tier 3
@@ -935,7 +1006,7 @@ function M.update(id, patch)
     local ok_m, merr = policy.check_mutation(existing.scope, existing.tier, patch._cap)
     if not ok_m then return nil, "update: " .. merr end
     local moved_tier
-    if patch.scope and patch.scope ~= existing.scope then
+    if moved then
         local ok_i, ierr = policy.check_insert(patch.scope, patch._cap)
         if not ok_i then return nil, "update: " .. ierr end
         local capped = policy.cap_tier(patch.scope, tonumber(existing.tier) or 1, patch._cap)
@@ -951,12 +1022,21 @@ function M.update(id, patch)
         params[np] = val
     end
     if patch.scope then set("scope", patch.scope) end
-    if moved_tier then set("tier", math.floor(moved_tier)) end
     if patch.kind  then set("kind",  patch.kind)  end
     if new_title then set("title", new_title) end
     if new_body  then set("body",  new_body)  end
     if patch.tags     then set("tags", db.json(scrub_all(patch.tags))) end
-    if patch.metadata then set("metadata", db.json(scrub_all(patch.metadata))) end
+    -- An archived original (tier 0 with a fold record) that is edited or moved is its own memory again, and a metadata patch
+    -- keeps its record: fold.edit_sets says how, as SQL — decided on the row as this statement finds it, in this same
+    -- statement (not after it, where a failure would leave it hidden, reviewed on its old clock).
+    local fsets, fparams = fold.edit_sets({
+        renewed = renewed,
+        max_tier = policy.cap_tier(patch.scope or existing.scope, 3, patch._cap),   -- (what the destination allows)
+        else_tier = moved_tier and math.floor(moved_tier),                          -- (a core memory moved to a protected scope)
+        metadata = patch.metadata and db.json(scrub_all(patch.metadata)),
+    })
+    for _, clause in ipairs(fsets) do sets[#sets + 1] = clause end
+    for _, v in ipairs(fparams) do np = np + 1; params[np] = v end
     if patch.importance ~= nil then
         local imp, ierr = clamp_check("importance", patch.importance, 0.0, 10.0)
         if ierr then return nil, ierr end
@@ -984,7 +1064,7 @@ function M.update(id, patch)
         set("emb_norm", norm)
         set("was_truncated", vtrunc and 1 or 0)
     end
-    if rewritten then set("consolidated_at", nil) end
+    if renewed then set("consolidated_at", nil) end
 
     if #sets == 0 then return existing end
     set("updated_at", util.now_us())
@@ -994,12 +1074,24 @@ function M.update(id, patch)
     local row, err = db.first("UPDATE " .. tbl() .. " SET " .. table.concat(sets, ", ")
         .. " WHERE id = ? RETURNING " .. RETURN_COLS, unpack(params, 1, np))
     if not row then return nil, "update: db error: " .. tostring(err) end
-    if rewritten then
-        _forget_derived({ id }, existing.scope)
+    local warnings = { warning }
+    if renewed then
+        -- A move without new text carries the note's "Preference" companions to the new scope, unconsolidated;
+        -- new text, or a delete, takes them (they were written from the old text).
+        local carry = moved and not rewritten
+        warnings[#warnings + 1] = _forget_derived({ id }, existing.scope, { keep_companions = carry })
+        if carry then
+            local cn, cerr = db.run("UPDATE " .. tbl() .. " SET scope = ?, consolidated_at = NULL WHERE scope = ? "
+                .. "AND json_extract(metadata, '$.is_synthetic') = 1 AND json_extract(metadata, '$.source_id') = ?",
+                row.scope, existing.scope, id)
+            if cn == nil then
+                warnings[#warnings + 1] = _warn("its companions could not be moved (" .. tostring(cerr) .. ")")
+            end
+        end
         consolidate.notify(row.scope)
     end
     _out(row)
-    row.warning = warning
+    row.warning = #warnings > 0 and table.concat(warnings, "; ") or nil
     return row
 end
 
@@ -1066,7 +1158,10 @@ end
 local function push_all(dst, src) for _, v in ipairs(src or {}) do dst[#dst + 1] = v end end
 
 -- ---------------------------------------------------------------------------
--- delete
+-- delete one memory; what was derived from it goes with it (its "Preference" companions, the observations that hold it —
+-- their other archived notes are given back). → { affected_rows, warning } — `warning` when the observations could not
+-- be removed (a busy database; also written to stderr): they may go on serving the memory's text — a second delete finds
+-- no memory and does not retry | nil, why
 -- ---------------------------------------------------------------------------
 function M.delete(id, opts)
     id = tonumber(id)
@@ -1078,8 +1173,9 @@ function M.delete(id, opts)
     end
     local n, err = db.run("DELETE FROM " .. tbl() .. " WHERE id = ?", id)
     if not n then return nil, "delete: " .. tostring(err) end
-    if row and n > 0 then _forget_derived({ id }, row.scope) end
-    return { affected_rows = n }
+    local warning
+    if row and n > 0 then warning = _forget_derived({ id }, row.scope) end
+    return { affected_rows = n, warning = warning }
 end
 
 -- ---------------------------------------------------------------------------
@@ -1128,6 +1224,8 @@ function M.match_where(args, n)
     return { count = tonumber(count) or 0, titles = titles }
 end
 
+-- Delete the memories a filter matches, 500 at a time; what was derived from them goes with them (like `delete`). → how many
+-- | nil, why. A failure to remove the observations made from them is on stderr only — the count has no room for a warning.
 function M.delete_where(args)
     args = args or {}
     local where, params = _bulk_where(args, "delete_where")
@@ -1221,7 +1319,7 @@ function M.replica_upsert(scope, item, vec, cap, opts)
     local meta = {}
     for k, v in pairs(type(item.metadata) == "table" and item.metadata or {}) do meta[k] = v end
     meta.lm_org_id, meta.lm_org_updated_us = key, ("%d"):format(us)
-    local tier = math.max(0, math.min(3, math.floor(tonumber(item.tier) or 1)))
+    local tier = util.clamp_tier(item.tier)
     local imp  = math.max(0.0, math.min(10.0, tonumber(item.importance) or 1.0))
     local dr   = math.max(0.0, math.min(1.0, tonumber(item.decay_rate) or 0.0))
     local c_us = math.floor(tonumber(item.created_us) or us)
@@ -1263,7 +1361,18 @@ function M.replica_delete(scope, local_ids, cap)
 end
 
 -- SQL weight of a row at time ? (µs): importance × exp(−decay_rate × age in days).
-local WEIGHT_SQL = "(importance * exp(-decay_rate * ((? - updated_at) / 86400000000.0)))"
+local WEIGHT_SQL = ("(importance * exp(-decay_rate * ((? - updated_at) / %d.0)))"):format(US_PER_DAY)
+
+--- The rows luamemo's own maintenance may select — to summarize, to group as duplicates, to expire — as a WHERE
+--- fragment. Never: what the federation role must keep (replicas, org directives), a folded original waiting for
+--- its review (luamemo.fold), or the code index (`codeindex:` scopes are rebuilt from source by memo index; they
+--- are not memory). ONE predicate for the passes that select rows in store.lua (summarize, group, expire); the ones
+--- that take a whole scope (digest, consolidate's observations, the fold review, training) ask
+--- policy.maintenance_skip(scope) the same question.
+function M.maintenance_where(cap)
+    -- (the cheap scope test first: a row of the code map never has its metadata parsed by the fold test)
+    return policy.NOT_CODEINDEX_SQL .. " AND " .. fold.not_folded_sql() .. policy.and_exclusion(cap)
+end
 
 -- ---------------------------------------------------------------------------
 -- select_for_summarization
@@ -1289,9 +1398,8 @@ function M.select_for_summarization(opts)
     local conds = { "kind != 'summary'", "updated_at < ?", WEIGHT_SQL .. " < ?" }
     local params = { now - retention_days * US_PER_DAY, now, weight_threshold }
     if opts.scope then conds[#conds + 1] = "scope = ?"; params[#params + 1] = opts.scope end
-    -- Federation: never fold replicas (dev) or directives (org) into summaries.
-    local excl = policy.maintenance_exclusion_sql()
-    if excl then conds[#conds + 1] = excl end
+    -- Never fold replicas (dev) or directives (org), what is already folded, or the code index.
+    conds[#conds + 1] = M.maintenance_where()
     params[#params + 1] = batch_size * max_batches
 
     local rows = db.query("SELECT " .. RETURN_COLS .. " FROM " .. tbl() .. " WHERE " .. table.concat(conds, " AND ")
@@ -1320,8 +1428,13 @@ end
 
 -- ---------------------------------------------------------------------------
 -- replace_with_summary
--- Atomically: insert the summary memory, delete the originals. Returns the
--- new summary row (with id) so callers can log / surface it.
+-- Atomically: insert the summary memory, archive the originals (luamemo.fold: hidden, then reviewed after the
+-- grace period — deleted only if the summary holds what they did). Returns the new summary row (with id) so
+-- callers can log / surface it, or nil, err.
+--   summary_args: scope (the summary is one scope's and hides its originals, so they must all be in it; left out, the
+--                 originals' own scope — they must share one), title, body, tags, metadata (copied: the caller's table
+--                 is not changed; summarized_ids, the ids actually used, is added), importance, decay_rate, _cap (the
+--                 federation capability the archive is allowed under)
 -- ---------------------------------------------------------------------------
 function M.replace_with_summary(ids, summary_args)
     if type(ids) ~= "table" or #ids == 0 then
@@ -1330,20 +1443,26 @@ function M.replace_with_summary(ids, summary_args)
     if type(summary_args) ~= "table" then
         return nil, "replace_with_summary: summary_args required"
     end
-    local clean = {}
-    for _, v in ipairs(ids) do
-        local n = tonumber(v)
-        if n then clean[#clean + 1] = math.floor(n) end
-    end
+    local clean = util.ints(ids)
     if #clean == 0 then return nil, "replace_with_summary: no valid ids" end
+    -- (the summary is one scope's and hides its originals: they have to be that scope's; a check that cannot be made
+    -- is a refusal, not a pass)
+    local scopes, serr = db.query("SELECT DISTINCT scope FROM " .. tbl() .. " WHERE id IN (" .. db.placeholders(#clean) .. ")",
+        unpack(clean, 1, #clean))
+    if not scopes then return nil, "replace_with_summary: the originals' scope could not be checked: " .. tostring(serr) end
+    if #scopes > 1 or (summary_args.scope and scopes[1] and scopes[1].scope ~= summary_args.scope) then
+        return nil, "replace_with_summary: originals of another scope"
+    end
+    local scope = summary_args.scope or (scopes[1] and scopes[1].scope)
 
     -- Stamp summarized_ids onto metadata so the new row tells you what it
-    -- replaced. Caller-supplied metadata is preserved.
-    local meta = summary_args.metadata or {}
-    meta.summarized_ids = ids
+    -- replaced. Caller-supplied metadata is preserved (on a copy: the caller's table is not changed).
+    local meta = {}
+    for k, v in pairs(summary_args.metadata or {}) do meta[k] = v end
+    meta.summarized_ids = clean
 
     local insert_args = {
-        scope      = summary_args.scope,
+        scope      = scope,
         kind       = "summary",
         title      = summary_args.title,
         body       = summary_args.body,
@@ -1360,11 +1479,11 @@ function M.replace_with_summary(ids, summary_args)
         local r, werr = M.write(insert_args)
         if not r then error("insert failed: " .. tostring(werr), 0) end
         row = r
-        -- Folded rows the role must not touch (replicas / org directives) stay put.
-        local excl = policy.maintenance_exclusion_sql(summary_args._cap)
-        local dn, derr = h.run("DELETE FROM " .. tbl() .. " WHERE id IN (" .. db.placeholders(#clean) .. ")"
-            .. (excl and (" AND " .. excl) or ""), unpack(clean, 1, #clean))
-        if not dn then error("delete failed: " .. tostring(derr), 0) end
+        -- The originals are archived, not deleted: hidden, kept through a grace period, then reviewed against
+        -- the summary (luamemo.fold). Rows the role must not touch (replicas / org directives) stay put.
+        -- (if that fails the summary is rolled back with it: a summary beside all its visible sources is a duplicate)
+        local archived, aerr = fold.archive(clean, "summary", r.id, summary_args._cap)
+        if archived == nil then error("archive failed: " .. tostring(aerr), 0) end
     end)
     if not ok then return nil, "replace_with_summary: " .. tostring(err) end
     return row
@@ -1377,7 +1496,7 @@ function M.recent(args)
     args = args or {}
     local limit  = math.min(tonumber(args.limit) or 20, 200)
     local offset = math.max(tonumber(args.offset) or 0, 0)
-    local conds, params = {}, {}
+    local conds, params = { fold.not_folded_sql() }, {}   -- (a folded original is archived, not recent)
     if args.scope then conds[#conds + 1] = "scope = ?"; params[#params + 1] = args.scope end
     if args.kind then conds[#conds + 1] = "kind = ?"; params[#params + 1] = args.kind end
     if tonumber(args.tier_min) then conds[#conds + 1] = "tier >= ?"; params[#params + 1] = tonumber(args.tier_min) end
@@ -1405,9 +1524,8 @@ function M.find_decayed(opts)
     local conds = { "decay_rate > 0", "importance > 0", WEIGHT_SQL .. " < ?" }
     local params = { util.now_us(), threshold }
     if opts.scope then conds[#conds + 1] = "scope = ?"; params[#params + 1] = opts.scope end
-    -- Federation: decay never touches replicas (dev) or directives (org).
-    local excl = policy.maintenance_exclusion_sql()
-    if excl then conds[#conds + 1] = excl end
+    -- Decay never touches replicas (dev), directives (org), a folded original or the code index.
+    conds[#conds + 1] = M.maintenance_where()
     params[#params + 1] = max_rows
 
     local rows, qerr = db.query("SELECT id FROM " .. tbl() .. " WHERE " .. table.concat(conds, " AND ")
@@ -1428,7 +1546,9 @@ end
 -- find_clusters
 -- Fetches up to `max_rows` memories for the given scope (importance > 0) and
 -- groups them by cosine similarity using union-find (O(N²) pairwise, capped
--- at max_rows = 500 by default). Returns only multi-member clusters.
+-- at max_rows = 500 by default). Returns only multi-member clusters. With no
+-- scope every scope is read — the highest-importance max_rows in total, not per
+-- scope — but a cluster never mixes scopes: a summary is one scope's.
 -- Embeddings are stripped from the returned members.
 --
 -- Returns (clusters, err) where each cluster is:
@@ -1436,10 +1556,10 @@ end
 -- ---------------------------------------------------------------------------
 function M.find_clusters(opts)
     opts = opts or {}
-    local threshold = tonumber(opts.similarity_threshold) or 0.85
+    local threshold = tonumber(opts.similarity_threshold) or settings.same_memory(cfg, "consolidate_threshold")
     local max_rows  = math.min(tonumber(opts.max_rows) or 500, 5000)
 
-    local conds, params = { "importance > 0" }, {}
+    local conds, params = { "importance > 0", M.maintenance_where() }, {}
     if opts.scope then conds[#conds + 1] = "scope = ?"; params[#params + 1] = opts.scope end
     params[#params + 1] = max_rows
     local rows, qerr = db.query("SELECT " .. RETURN_COLS .. ", embedding FROM " .. tbl() .. " WHERE "
@@ -1461,7 +1581,9 @@ function M.find_clusters(opts)
     end
     for i = 1, #rows do
         for j = i + 1, #rows do
-            if _cosine(rows[i].embedding, rows[j].embedding) >= threshold then
+            -- (a cluster is one scope's: its summary is written into one scope, and a note of another — a private
+            -- one, say — must not be merged into it or hidden by it)
+            if rows[i].scope == rows[j].scope and _cosine(rows[i].embedding, rows[j].embedding) >= threshold then
                 local ri, rj = find(i), find(j)
                 if ri ~= rj then parent[ri] = rj end
             end
@@ -1628,6 +1750,12 @@ local function _filters(f, p, with_time)
         conds[#conds + 1] = p .. "tier >= ?"
         params[#params + 1] = math.max(0, math.min(3, math.floor(tonumber(f.tier_min))))
     end
+    -- A folded original (hidden, waiting for its review) is tier 0: a search that asks for tier 0 must not get it.
+    -- (From tier 1 up the tier filter already excludes it; and the predicate reads a row's metadata only at tier 0,
+    -- so the usual search pays almost nothing for it.)
+    if not f.tier_min or tonumber(f.tier_min) < 1 then
+        conds[#conds + 1] = fold.not_folded_sql(p)
+    end
     if f.tier_max then
         conds[#conds + 1] = p .. "tier <= ?"
         params[#params + 1] = math.max(0, math.min(3, math.floor(tonumber(f.tier_max))))
@@ -1637,10 +1765,22 @@ local function _filters(f, p, with_time)
     return conds, params
 end
 
+-- How importance weighs in a result's score (MEMO_IMPORTANCE_CURVE, sqrt unless set). linear is the importance
+-- itself: with importances from 0.2 to 6 it decides the order and similarity only breaks ties; sqrt and log2(1+x)
+-- compress that so a clearly better match can beat a more important memory (measured: eval/README.md). All three
+-- are 1 at importance 1 and 0 at 0.
+local IMPORTANCE_CURVES = {
+    linear = function(x) return x end,
+    sqrt   = function(x) return math.sqrt(x) end,
+    log    = function(x) return math.log(1 + x) / math.log(2) end,
+}
+M.IMPORTANCE_CURVES = IMPORTANCE_CURVES
+
 local function _weight(r, ignore_decay, now_us)
     if ignore_decay then return 1.0 end
     local age_days = math.max(0, (now_us - (tonumber(r.updated_at) or now_us)) / US_PER_DAY)
-    return (tonumber(r.importance) or 1.0) * math.exp(-(tonumber(r.decay_rate) or 0) * age_days)
+    local curve = IMPORTANCE_CURVES[settings.value(cfg, "importance_curve")] or IMPORTANCE_CURVES[settings.get("MEMO_IMPORTANCE_CURVE").default]
+    return curve(math.max(0, tonumber(r.importance) or 1.0)) * math.exp(-(tonumber(r.decay_rate) or 0) * age_days)
 end
 
 -- The FTS leg's query, `where` = the filters (" AND m.…"); parameters: the MATCH string,
@@ -1858,7 +1998,7 @@ function M.search(args)
         metadata_filter = metadata_filter,
     }
 
-    local qvec, err = embed.embed(q)
+    local qvec, err = embed.embed(q, "query")
     if not qvec then return nil, err end
 
     -- Decide rerank up front so we can over-fetch the candidate pool.
@@ -1992,11 +2132,10 @@ function M.search(args)
             local r = final_rows[i]
             if r and r.id then ids[#ids + 1] = r.id end
         end
-        if #ids > 0 then
-            pcall(function()
-                require("luamemo.feedback").log_retrieval(scope, args.query, ids)
-            end)
-        end
+        pcall(function()
+            if #ids > 0 then feedback.log_retrieval(scope, args.query, ids)
+            else feedback.log_no_result(scope, args.query) end   -- (a log of gaps, never a memory)
+        end)
     end
 
     -- Observation supplement: run any pending consolidation, then slot-append
@@ -2011,7 +2150,8 @@ function M.search(args)
             -- (a bounded slice: a bulk write's backlog drains over the next searches; tier ≥ 1
             -- — tier 0 is raw conversation, the digest's: distilled here, a search's tier
             -- filter didn't hold for it)
-            pcall(consolidate.process, scope or "", { limit = 100, tier_min = 1 })
+            -- (no_llm: this runs inside a search, which must never wait on a language model)
+            pcall(consolidate.process, scope or "", { limit = 100, tier_min = 1, no_llm = true })
         end
         local obs_rows = consolidate.search(scope or "", qvec, rrf_fetch)
         if #obs_rows > 0 then

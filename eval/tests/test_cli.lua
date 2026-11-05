@@ -293,9 +293,20 @@ local function cal(args)
         :format(proj, CENV, REPO .. "/cli/memo", args or ""))
 end
 local function rc_db() return H.rc_get(H.slurp(proj .. "/.luamemorc"), "MEMO_DB") end
-local _, pc = cal("--probe-only")
+local pout, pc = cal("--probe-only")
 check("--probe-only writes nothing (no .luamemorc, no database)", pc == 0 and H.slurp(proj .. "/.luamemorc") == nil
     and select(2, sh(("test -e %q"):format(data))) ~= 0)
+-- The wrapper hands --probe-only to the probe, so its text says what really happens.
+check("--probe-only says calibrate would record the settings, and what to run next",
+    pout:find("Settings (memo calibrate records them in .luamemorc)", 1, true) ~= nil
+    and pout:find("without --probe-only", 1, true) ~= nil, pout:sub(-500))
+-- --write is the wrapper's own plumbing, not an option: it used to overwrite the user's path silently.
+local wout, wc = cal("--write " .. proj .. "/wrote.txt")
+check("--write is not a calibrate option (refused, nothing written)", wc ~= 0
+    and wout:find("unknown arg: --write", 1, true) ~= nil and H.slurp(proj .. "/wrote.txt") == nil, wout:sub(-300))
+local dout, dc = sh(("%s %q doctor --json 2>&1"):format(CENV, REPO .. "/cli/memo"))
+check("doctor takes no flags: --json is refused with a usage error", dc == 2
+    and dout:find("unknown flag: --json", 1, true) ~= nil, dout:sub(-300))
 local out, code = cal()
 local name = rc_db()
 check("a new project gets its own database, named after its directory", code == 0 and name ~= nil
@@ -492,13 +503,18 @@ local HSCOPE = SCOPE .. "-hook"
 local db = require("luamemo.db")
 local function saved() return tonumber(db.value("SELECT count(*) FROM lm_memories WHERE scope = ?", HSCOPE)) end
 -- The project's .luamemorc names the database — the hook's environment doesn't.
-local function hook(path)
+-- (`dir`: the hook scripts to run. Beside a checkout's cli/memo they find that memo themselves — the plugin's case —
+-- so "no memo installed" is a copy of the scripts with no cli/ next to it.)
+local function hook(path, dir)
     return sh(("cd %q && env -u MEMO_DB MEMO_PROJECT= PATH=%q MEMO_LUA=%q LUA_PATH=%q MEMO_SCOPE=%q "
         .. "CLAUDE_TRANSCRIPT_PATH=%q CLAUDE_SESSION_ID=hooktest bash %q"):format(proj, path, LUA_ABS, REPO_PATH,
-        HSCOPE, tr, REPO .. "/hooks/claude/pre_compact.sh"))
+        HSCOPE, tr, (dir or (REPO .. "/hooks/claude")) .. "/pre_compact.sh"))
 end
-local _, c1 = hook(H.sys_path())
+local alone = base .. "-hooks-alone"
+os.execute(("mkdir -p %q && cp %q/*.sh %q/"):format(alone, REPO .. "/hooks/claude", alone))
+local _, c1 = hook(H.sys_path(), alone)
 check("no memo installed → the hook does nothing (exit 0)", c1 == 0 and saved() == 0, saved())
+os.execute(("rm -rf %q"):format(alone))
 local _, c2 = hook(bin .. ":" .. H.sys_path())
 local body = db.value("SELECT body FROM lm_memories WHERE scope = ?", HSCOPE) or ""
 check("with memo installed the hook saves the last messages into the project's database", c2 == 0 and saved() == 1
@@ -584,7 +600,7 @@ local sf = assert(io.open(spy .. "/memo", "w"))
 sf:write('#!/bin/sh\nprintf "%s\\n" "$@" > "$0.args"; cat > "$0.stdin"\n'); sf:close()
 os.execute(("chmod +x %q"):format(spy .. "/memo"))
 local input = json.encode({ session_id = "cc-spy", transcript_path = cc })
-sh(("printf '%%s' %s | env PATH=%q bash %q"):format(q(input), spy .. ":" .. H.sys_path(),
+sh(("printf '%%s' %s | env PATH=%q MEMO_BIN=%q bash %q"):format(q(input), spy .. ":" .. H.sys_path(), spy .. "/memo",
     REPO .. "/hooks/claude/pre_compact.sh"))
 local args, stdin = H.slurp(spy .. "/memo.args") or "", H.slurp(spy .. "/memo.stdin") or ""
 check("… the conversation goes to memo on stdin (--body -), not on its command line",

@@ -1,5 +1,570 @@
 # Changelog
 
+## [0.5.2] — unreleased
+
+- Fixed: the Python parser crashed ("unfinished capture") on a `'''`-quoted docstring, which stopped any
+  index run over a tree that contained one; the corpus build also skips (and logs) a source whose ingest fails.
+
+### `memo usage` — how memory is really used
+
+- **`memo usage [--scope S] [--days N] [--gap SECONDS] [--json]`** reads the usage log
+  (`MEMO_FEEDBACK_ENABLED`, off by default) and reports signals that need no known right answer:
+  searches a day, follow-ups within `--gap` seconds of the search before (asked again as it was, or in other
+  words), what was said afterwards (praise, corrections, misses), and the rank at which a memory confirmed
+  useful stood in the latest search that offered it. It only reads.
+- **A search that finds nothing is now logged** (with `MEMO_FEEDBACK_ENABLED`; `feedback.log_no_result`):
+  the clearest sign of a gap in memory. It is a log, never a memory: no `lm_memories` row, nothing a search,
+  the brief or an export returns; it has no candidates, so the learners' training set and the org push (both
+  go through the candidates) never see it, and sensing does not take it for an active log; kept `MEMO_FEEDBACK_RETENTION_DAYS` (below).
+- **Fixed: `miss` events were recorded for writes nobody chose to make.** With the usage log on, a write that
+  nearly repeats an existing memory is a "miss" (retrieval failed to bring it, so it was written again). It
+  was also recorded for `memo calibrate` writing its scan rows again (one miss per row on every rerun: 12
+  after four runs of a four-row project), for the session hooks' raw conversation (each tier-0 snapshot repeats
+  the one before: 3 for 4 snapshots), a promoted summary, org knowledge and the benchmark ledger. Those
+  writes no longer count (tier 0, and an internal `no_miss` flag that no tool can pass); an agent's or a
+  person's own repeated write still does. The misses fed `memo usage`, the learners and what a dev pushes to
+  an org, where each is applied as a bump to the memory's importance.
+- **Fixed: a correction about a memory that was never retrieved stayed a "mistake" with the usage log on.**
+  Sensing's own lookup of the memory a correction refers to was logged as a retrieval of it, so the memory was
+  always a "candidate" and the mistake → miss reclassification could not happen (it worked only in tests, with
+  the log off). That lookup is no longer logged.
+
+### One source of truth for what features share
+
+- **"The same memory" has one definition: `MEMO_DEDUP_THRESHOLD`.** A duplicate write, a miss
+  (`MEMO_MISS_THRESHOLD`), `memo consolidate`'s merge and the digest's grouping (`MEMO_CONSOLIDATE_THRESHOLD`) and an
+  observation's reinforce (`MEMO_CONSOLIDATE_REINFORCE_THRESHOLD`) now take it unless their own setting is set
+  (`settings.same_memory`), so changing the one changes them all. They were four numbers (0.95, 0.90, 0.85 hard-coded, 0.80,
+  0.75) that disagreed; measured with EmbeddingGemma 2 on a project's own memories (eval/clustering_probe.lua), 0.75 matched 99.5 %
+  of unrelated memories, 0.90 flagged 13.4 % of genuinely new writes as a missed search, and only from 0.95 are a distinct
+  memory (0.7 % wrongly matched) and its near-duplicate or snapshot (100 % found) told apart. The effective values are now 0.95.
+- **One language model: `MEMO_GEN_MODEL`** (`luamemo.llm`). The summarizer gets an in-process adapter, `gguf`, that answers with
+  that model (no server to run), and the new value `auto` uses it when one is configured and loads, else `noop`. Consolidate's
+  merge and the digest's synthesis go through the same adapter; `ollama` / `openai` (with their URL and model) win only when named.
+  Measured on twelve batches of real notes (eval/summarizer_bench.lua): in-process gemma-4 78 s a batch on a CPU, 3.9 % of its
+  tokens invented, 16.5 % of the concrete tokens kept; Ollama gemma4:e4b on a GPU 17 s, 9.4 % invented, 24 % kept — it was chosen as
+  the default for needing no server or GPU memory and inventing less. `memo doctor` shows the model and what follows from it.
+  The summarizer's default was `noop` until the folding it does was archived and reviewed rather than deleted; it
+  is `auto` now (below).
+
+### The usage log, kept and read well
+
+- **A search is kept `MEMO_FEEDBACK_RETENTION_DAYS` (90; 0: forever).** The usage log used to grow without limit.
+  Now any search goes at that age, except the newest 20 (per scope) that offered each memory with a recorded
+  reinforcement (praise, direct command, mistake, reversal or miss — the learner's training triples, which read 5;
+  `harvest` returns the same ones after pruning) and a row adopted from an organization. `memo maintain` prunes
+  once a day per database; the claim of that day reads before it writes, so a day with nothing due takes no write lock.
+  A search never prunes (it would make the agent wait): a write's background maintenance and the session brief start
+  `memo maintain`. `memo doctor` warns when the retention is shorter than the longer of the two grace periods
+  (`MEMO_FOLD_GRACE_DAYS`, `MEMO_DIGEST_GRACE_DAYS`: what offered a memory before that no longer shows it useful).
+- **`memo doctor` says what the log is**: off (the default) — it keeps the text of every search, for how long, and
+  what it enables; on — how many searches, how old the oldest is, whether an organization receives the queries
+  (`MEMO_ORG_SHARE`), and whether the learned reranker trains from it. The setting's documentation says the same.
+- **`memo usage` says whose miss a miss was**: a near-duplicate write is now recorded as a ranking miss (a
+  search ran in that scope in the last ten minutes and did not offer the memory), offered anyway (it did, and
+  the memory was written again), or no search first. It shows how long the log keeps a search, and says when
+  there are fewer than 30 searches that the rates are anecdotes (one event moves them by whole points).
+- **Folding is all or nothing, and a bad record cannot stop a review (second review round).** If the originals cannot be
+  archived, `replace_with_summary` rolls the summary back (it used to commit a summary beside all its visible sources);
+  `metadata.lm_fold` is a record any writer can set, so a review now takes a summary only from the same scope, treats a
+  non-numeric `into_id` as a summary that is gone, and goes on past a row that raises (it is reported and logged). A write into
+  a code-index scope no longer claims a digest slot and starts a `memo maintain` that can only skip it.
+- **The lock of `memo maintain` is an `flock(2)`** on `<db>.maintenance.lock`: one run at a time per database, held by
+  the running process and released by the kernel when it ends, however it ends — so there is no stale lock to wait
+  out, to take over or to race for. A lock file that cannot be made or opened is reported as that (by hand an error,
+  in the log with `--quiet`), not taken for another run at work. The maintenance log of an older version is made
+  private, and the model-markup defang also covers `<|"|>`-style tokens and drops a NUL.
+- **A folded memory is deleted only with a record of it, and a summary that is gone gives it back (third review round).**
+  The review writes its audit line to `<db>.maintenance.log` *before* the delete and does not delete when the line cannot
+  be written (the log is also refused when it, or its rotated copy, is a symlink); an archive or review error is no longer
+  swallowed — `memo maintain` prints "N things went wrong" and the digest does not count a cluster whose originals could not
+  be archived. When what a memory was folded into is gone, raw conversation the digest folded into an observation is
+  still deleted unless it was ever useful, but a memory folded into a *summary* is given back (restored to the tier it
+  had; a tier-0 memory is *kept*, hidden as before the fold), not deleted: the summary was the only copy of what it said.
+  `memo maintain` and its log count `kept` beside `restored`.
+- **A review decides nothing it could not look up, and nothing from under another run (fourth review round).** A failed
+  query used to read as an answer: an observation lookup that failed ("database is locked") made raw conversation the
+  observation does hold look unheld and deleted it; a failed count of praise read as "never praised". Both are now
+  errors that leave the row as it was, and every change a review makes (the delete, the restore, a correction) re-checks that
+  the memory is still waiting for its review — `memory_digest` reviews without the maintenance lock, so two reviews can
+  overlap — and is reported, not counted, when it did not happen. The process a run starts no longer inherits the
+  caller's sockets (a `memo serve` central restarted within a run's lifetime found its port still bound); the brief's scan
+  for due reviews takes the rows the review itself would take, rows from before folds were recorded included; and the
+  usage log's prune says when its delete failed. `memo maintain` and its log also report a reranker training that
+  failed and a usage-log prune that failed, and a lock file that cannot be made is logged and fails the run.
+- **A review trusts neither an id nor a snapshot (fifth review round).** A summary's id is reused once its newest row
+  is deleted, so an unrelated memory written afterwards could be taken for "the summary" an original was folded into —
+  and the original deleted although its only copy was gone; now the summary has to be a *summary* of the same scope
+  that already existed when the original was folded into it. A second archive of an already-folded memory no longer
+  writes over its record (the tier it had, where it went, its grace). Every write of a review also checks that the
+  memory is still *as it was decided about* (not corrected or folded again by another run since). A log that cannot be
+  written ends the pass with one error instead of 200 identical ones, and the digest's own review stops at the run's
+  time box (`--max-seconds`: no part is started after it). A `memo serve` central marks its sockets close-on-exec (the
+  run it starts used to keep any connection above descriptor 9 open). `memory_consolidate` / `memo consolidate` with no
+  scope groups each scope on its own — it used to merge near-identical notes of different scopes into one summary in the
+  first one's scope, and hide the other's original; `replace_with_summary` refuses originals of another scope, and
+  stamps only the ids it used. `memo maintain` with a missing or unusable `--scope` / `--max-seconds` value is a usage
+  error (it used to run with the default), and its line says `review —` when no review ran.
+- **A review does not take a hidden summary for a holder, and a preview is the real thing (sixth review round).** A
+  summary that had itself been folded into a newer one (hidden, waiting to be reviewed and deleted) still counted as
+  "the summary", so its originals were deleted too early; it now counts as gone and they are given back. A row from
+  before folds were recorded, once corrected, lost the fact that it is raw conversation and was later restored as a
+  visible memory instead of being kept hidden. A record whose date cannot be read no longer passes the reused-id check.
+  `fold.run`'s dry run says `restored` where the real run would (a correction that cannot be made is a restore).
+  `replace_with_summary` fails closed — an unreadable scope check refuses — and, with no scope given, writes the summary
+  into its originals' scope. The digest no longer scans every observation and runs the whole consolidation once per
+  cluster: it searches only for a cluster with mistakes behind it and consolidates once per run, and a consolidation
+  that fails leaves the rows for the next run. `memo maintain --all` has one time box for the whole run (it used to
+  give every scope a fresh one), and `--max-seconds nan` / `inf` are usage errors.
+- **Mistakes escalate a memory again (seventh review round).** The digest raises the importance and tier of a cluster with
+  mistakes behind it unless an observation already matches it — but "matches" meant "the scope has any observation at
+  all" (the search has no cut-off), so once a scope held one observation, escalation stopped for good. It now asks
+  whether an observation is as close as `MEMO_CONSOLIDATE_REINFORCE_THRESHOLD` (what the consolidation itself reinforces
+  at), and asks every cluster before the consolidation makes an observation out of its rows, so the order of the clusters
+  no longer decides, and does it for all of them in one pass over the observations (`consolidate.would_reinforce`). A member
+  the digest escalated is no longer folded away in the same run (it used to be hidden at tier 0 and deleted after the grace
+  period unless praised): the archive takes only rows still at tier 0. `memo consolidate` documents that it works over every
+  scope when none is given. The maintenance queries test the code-index scope before they parse a row's metadata. A
+  reversal, a miss or an escalation no longer overwrites a change made meanwhile: the importance/tier write is made only
+  if the row still has the tier and importance it was read with. The digest's promotions (tier 1 → 2 by an observation's
+  proof, tier 2 → 3 by mistakes) are one statement each, so an observation that absorbed thousands of memories can no
+  longer make the digest raise and stop the review after it; and a note stored without a vector (the embedder was down,
+  the text too long) is not folded by the digest any more — it used to be hidden, never made into an observation, and
+  deleted after the grace period — it stays as it is until `memo reembed`.
+- **Escalation follows the mistakes, and a reinforced observation is fresh (eleventh review round).** The digest took
+  the tier of an escalated cluster from the member's importance, which is on a 0–10 scale, as if it were a 0–1 relevance:
+  a tier-0 row of importance 3 became a core (tier 3) memory on its first mistake. The tier now comes from the number of
+  mistakes alone (1 → importance up, tier 0; 2 → tier 1; …) and never lowers the member's own importance. An observation
+  the consolidation reinforced kept its old `last_reinforced` in memory, so the trend refresh at the end of the run wrote
+  "stale" over the trend it had just set and the digest's promotion skipped the memories it holds; it is now fresh when the
+  run ends. A promotion statement that fails is reported in the digest's errors (it was swallowed), and the other one still
+  runs.
+- **A NaN delta is no number (twelfth review round).** `memory_sense` with `delta_scale: "nan"` (a string `tonumber` accepts)
+  sent a NaN through the clamp: a miss on a memory of importance 1 or more went straight to the ceiling (7) and the event was
+  not even stored. A NaN delta or id now counts as none (delta 0.5, no id), and an event that cannot be stored no longer changes
+  the memory it was about. `MEMO_DIGEST_ESCALATE_ALPHA` is documented for what it sets: how many mistakes raise a memory's tier.
+- **The digest reports a query it could not read (thirteenth review round).** When the count of mistakes behind a cluster (or
+  the notes themselves) could not be read — a busy database — the digest took it for "no mistakes" and archived the cluster
+  unescalated, hiding the note its mistakes had marked. It now reports it in its errors ("mistake counts error: …",
+  "fetch tier-0 error: …"), clusters, consolidates and archives nothing that run, and still promotes and reviews; the next
+  run does the work. The same held one step on: when `consolidate.process` could not read the rows it was to take (or was
+  not configured) it returned a clean, empty result and the digest archived every cluster although no observation had been
+  made — the review would later delete those notes. `process` now says so (`failed`, and "consolidate: fetch error: …" in
+  its errors, and stays pending), the digest archives nothing and reports "consolidate error: …", and a failed limited fetch is no longer
+  retried without its limit. `memory_digest`'s `threshold` is documented as the digest's own grouping, not the observations'.
+  The digest's archive also holds only the rows as it read them (sixteenth review round): a note edited — or moved
+  to another scope — while the consolidation ran (it can ask a model for a minute) used to be archived all the same, its new
+  text in no observation, and the review deleted it a month later as a note nothing holds. The archive now takes a row only
+  if it is still at tier 0, in the scope and consolidated; the edited note waits for the next run.
+- **A note is not archived before an observation holds it (seventeenth review round).** The review deletes an archived
+  note that no observation holds, and three ways led there without a word: an observation that could not be written
+  (database busy) still got its notes marked consolidated, archived and, a month on, deleted — the digest reported a clean
+  run; a note rewritten while `consolidate.process` worked was marked all the same (its new text in no observation); and
+  deleting or rewriting one note of an observation deleted the whole observation, leaving the cluster's archived notes
+  with no holder. Now `process` marks a cluster only once an observation holds it, and only the notes unchanged since it
+  read them; what it could not do comes back in the digest's errors ("consolidate: insert obs: …") and the notes wait for
+  the next run; an observation that goes with its memory gives its archived notes back (`fold.release`), to be digested
+  again. An escalation that loses a race with an event re-reads the row and applies.
+- **A moved note keeps its life, and a title is an observation's text (eighteenth review round).** A note moved to
+  another scope (`memory_update` with `scope`) stayed consolidated, so no digest took it again and the review of its new
+  scope deleted it as a note nothing holds; the observation of its old scope went on serving its text there. A move now
+  does what new text does: that observation goes (its other archived notes given back) and the note is consolidated in its
+  new scope. A note written with a title only was given no observation (an empty text) and was taken again by every run;
+  its title is now the observation's text, and a summarizer that gives no text is reported ("synthesize: empty body").
+  Giving notes back and deleting their observation are one transaction, bound as one parameter whatever the evidence's
+  size.
+- **Nothing is made from a read that is out of date, and a failed clean-up is said (nineteenth review round).** A cluster
+  of notes now ends in one transaction — the notes are still as `process` read them, the observation is made or reinforced,
+  the notes are marked — so a note rewritten, or moved to another scope, while a summarizer worked no longer ends up in an
+  observation of the old scope carrying its old text, and a mark that fails takes its observation with it (no proof or
+  evidence counted twice at the next run, which also counts only the notes an observation does not hold yet). When an
+  observation could not be removed with the memory it came from (a busy database), `memory_delete` and `memory_update`
+  answer with a `warning` and stderr gets a line; before, the failure went to a log that did not exist and the
+  observation went on serving the text. Moving a note without new text carries its "Preference" companions along; moving or
+  editing an archived original shows it again; the members of a deleted observation that are in a higher tier are
+  consolidated again. A summarizer's answer of a title and an empty body is the title (it was asked again at every run).
+- **An archived original is its own again in one place, and a stale cluster costs no model call (twentieth review
+  round; every item reproduced as a user would before it was fixed).** What an edit or a move does to an archived
+  original's fold record is now `fold.edit_sets`, the only place that says it: the tier it comes back at is read from the
+  record clamped to 0–3 (a record holding 99 gave a tier-99 memory), and the record goes in the same statement as the edit,
+  so the note is reviewed on a new clock, not its old one (an edited note taken by the digest again was decided at once).
+  A metadata patch on an archived original (no new text) no longer drops its record — the review took the note for raw
+  conversation nothing holds — and the statement carries the record itself: through a Lua number its microsecond stamps
+  were rounded and stored as reals. `fold.release(ids, scope)` takes the scope its callers are working in, so the
+  release of an observation can no longer give back a note of its evidence that has since moved to another scope. A cluster that changed while the
+  others were summarized is found out before its model call, not after (one call saved per stale cluster); a cluster whose
+  check cannot be read is an error ("could not check the cluster: …"), not a quiet "changed". `memo delete ID` and the MCP
+  `memory_delete` (by id) / `memory_update` answers carry the `warning` too, as does a move whose companions could not be carried.
+- **An edit is decided on the row as the statement finds it, and a core memory comes back a core memory (twenty-first
+  review round; each item reproduced before it was fixed).** The edit of an archived original (tier 0 with a fold record)
+  was decided from a copy of the row read before the new text was embedded: a fold that landed meanwhile (another process,
+  a slow embedder) left the edited memory at tier 0 with its record and not consolidated — hidden from search and never
+  reviewed. The decision is now inside the UPDATE (`CASE` on the row as it is then), which also keeps the stamps of the
+  record exact. A core memory (tier 3) that the summarizer folded is shown again at tier 3 (the first clamp, 0–2, lowered
+  it); a fold record that is no object is a record all the same (the edit ends it, at an ordinary tier). A list given as
+  `metadata` is refused by `memory_update` and `memory_write` from Lua too (it made a patch lose the record of an archived
+  original). The docs said a `warning` on a delete means "delete again": a second delete finds no memory and retries
+  nothing, so the advice is gone; a delete by filter answers with the count only (said now), and `memo org review remove`
+  prints the warning. `consolidate.process` is split into `_reinforce_cluster` and `_synthesize_cluster`.
+- **A standing rule you state is stored, not just attributed (Phase 23.1).** `memory_sense` / `memo sense` used to record a
+  rule ("always …", "never …") only as feedback on the nearest memory that already existed; with none, the rule was dropped —
+  so a rule given in conversation could vanish. Now a sentence that opens with a rule's words (always, never, from now on,
+  going forward, make sure, remember to, you must …), in a short turn with no question and no pasted code, that no memory
+  already holds (nearest memory closer than `MEMO_SENSE_CAPTURE_SIMILARITY`, 0.6) is stored as a `decision` memory — the
+  rule, and what the assistant had just said — once (its marker is in the metadata). On by default (`MEMO_SENSE_CAPTURE`);
+  `memory_brief` lists the rules stored in the last seven days, and `memory_delete` removes a wrong one. Corrections stay
+  feedback only. The answer gains `captured` / `captured_ids`.
+- **Two Claude Code hooks make luamemo the agent's memory without the agent's cooperation (Phase 23.2).**
+  `hooks/claude/user_prompt.sh` (UserPromptSubmit) sends each prompt and the assistant's last message to `memo sense` in the
+  background — prints nothing, never delays the prompt — so corrections, praise and standing rules reach memory even when the
+  agent forgets `memory_sense`. `hooks/claude/block_file_memory.sh` (PreToolUse on Write|Edit|NotebookEdit) denies a write
+  under `~/.claude/projects/*/memory/` in a project that has a `.luamemorc` (Claude Code's file memory is invisible to
+  luamemo) and names the luamemo tools instead; projects without luamemo are untouched, and the user's own `~/.luamemorc`
+  does not count as a project's. Both are in the plugin's `hooks/hooks.json`.
+- **`memo agent`, and `memo calibrate` sets luamemo up as Claude Code's memory without any hand configuration (Phase 23.3).**
+  `memo agent install` copies the hook scripts to `<data dir>/hooks/claude/` (`~/.local/share/luamemo/` unless `XDG_DATA_HOME` is set; a path a LuaRocks upgrade does not move) and
+  merges SessionStart (the brief), UserPromptSubmit (what you say → `memo sense`) and PreToolUse (no file memory in a luamemo
+  project) into `~/.claude/settings.json` with `jq` — other hooks and settings stay, in their order; ours are recognised by a
+  `luamemo-agent` marker, so a second run changes nothing and an upgrade replaces them (the earlier hand-made guard too); the
+  original is kept once as `settings.json.luamemo-bak`. It writes a marked block into `~/.claude/CLAUDE.md`, and moves the
+  project's Claude Code memory notes into luamemo (`memo agent import-notes`: kind by the note's type, once each, originals
+  to `memory-archive-DATE`, `MEMORY.md` a pointer; nothing moves if a note cannot be read). When the luamemo plugin is
+  enabled it ships the hooks, so only the block and the notes are done; a project whose own settings already inject the
+  brief gets no second SessionStart. `--with-transcripts` adds PreCompact and PostToolUse. `memo agent status` and
+  `memo doctor` report what is wired, stale or missing; `memo agent uninstall` undoes it; `memo calibrate` runs it as its
+  last phase (`--no-agent` skips), and does nothing without `~/.claude`. The hooks now share `hooks/claude/_project.sh`
+  (a project "uses luamemo" when a `.luamemorc` is found from its directory up, not counting `~/.luamemorc`); a project
+  without one costs nothing — no `memo` is started for it.
+- **Phase 23 reviewed: every claim run before it was listed; what reproduced is fixed.**
+  *Your files:* `import-notes` imports a note again when its text changed (updating that memory), never overwrites a
+  file in the archive, archives your own `MEMORY.md` with the notes, writes the pointer only when everything moved, and
+  names notes it cannot read; a flat `type:` line in a note is read; a begin marker without an end in `CLAUDE.md` no
+  longer makes the next install swallow your text, and uninstall removes only the block and the blank line install added;
+  `settings.json` is written through a symlink and keeps its mode (the backup too), and only luamemo's own hooks are
+  recognised (another tool's `user_prompt.sh` stays); transcript hooks stay wired on later installs
+  (`--no-transcripts` removes them) and `status` checks every script copy. *Learning:* a remark that merely opens with a
+  rule word ("Never mind", "Always happy to help"), or a line of a pasted text, is no longer stored as your rule; the
+  openers "you have to", "do not ever", "don't ever" and "make sure …" can now be captured; a prompt's credentials are
+  scrubbed before they are kept in the signal's note. *Cost:* the hooks no longer probe the embedder for every prompt
+  and session start (30 s against 0.4 s with an unreachable embedder), a turn with several signals is searched once, the
+  PreToolUse guard answers without starting `jq` for a path with no "memory" in it. *Hooks:* the transcript hooks use the
+  pinned `MEMO_BIN`; the guard honours `$CLAUDE_CONFIG_DIR`; a project `.luamemorc` that links to `~/.luamemorc` is not a
+  project (memo's rule); the plugin's SessionStart is the same script as the installer's. The `CLAUDE.md` block is
+  ~450 characters (it is read in every session of every project).
+- **Every client is told luamemo is the only memory store (Phase 23.4).** The core rules the MCP server sends, `SKILL.md` and
+  the agent file (kept word for word equal by `test_parity`) gain "**One store:** luamemo is the only place you keep memory
+  — not also a memory directory or notes file of your own", and the Learning rule says a standing rule no memory holds is
+  stored for the agent. This reaches clients that have no hooks at all.
+- **Delta review round (fixes of the Phase 23 review and the documentation audit re-reviewed; 17 proven defects, all fixed).**
+  `memo agent install` decided "were the transcript hooks mine?" with a different test than the one that strips them: hooks
+  wired by hand as the README describes were deleted by a plain install, and a user's own `pre_compact.sh` switched the opt-in
+  conversation capture on. Both now use one definition (a hook is luamemo's by its marker or its own script path, read from the
+  parsed settings, in install and in the status check). `uninstall` leaves a `settings.json` without luamemo hooks byte for byte
+  as it was (no reformatting, no backup, says "no luamemo hooks") and keeps a symlinked `CLAUDE.md` a link (its target is
+  emptied); `import-notes --dry-run` names the unreadable notes; `memo doctor` finds a stale hook copy on a LuaRocks install
+  (it is given the shipped `hooks/` as `memo agent` is). Rule capture no longer stores "Always, thanks." or "Never works for me"
+  as standing rules. The session-cost figures are re-measured (rules 1,944 B, tool definitions 16,019 B / core 11,072 B, total
+  18,301 / 13,354 B; README, mcp/README, eval/README and `baselines.json`); the rockspec description no longer says corrections
+  and praise are kept as decisions; hook script headers and a few comments say what the code now does. New guards, each
+  mutation-checked: the plugin's `SessionStart` command line, calibrate's Claude Code phase (`--no-agent`, `--dry-run`), the
+  agent file's tool list read from its own rules block, and the cases above. The second delta round (the review of these fixes)
+  found one defect in them: the rule-capture fix read "the word after the opener" as letters only, so rules like "Always 2 spaces
+  for indentation" or "Never 500 on the health route" were dropped; a digit after the opener starts the rule. The third and
+  fourth delta rounds found that only ASCII punctuation was skipped after an opener, so "Never… mind", "Always — thanks" or
+  "Always ✅ thanks" were stored as rules; whatever is not an ASCII letter or digit after an opener (any mark, arrow, quote,
+  emoji, no-break space, or a letter beyond ASCII) is skipped now, with no table of ranges to keep complete. A known limit:
+  after a letter beyond ASCII the next ASCII word decides, so "Always é ok usar tabs" (mixed languages, "ok" being a remark
+  word) is not stored.
+- **Documentation audit: every claim in the guides, the help texts and the rockspec checked against the code, and what was
+  wrong is fixed.** The decay example used `importance × e^(−rate × days)`; the weight is `curve(importance) × …` with the
+  default `sqrt` curve (formula and numbers corrected). The TEI examples set `MAX_BATCH_TOKENS=4096`, which makes TEI hang
+  without an error on a long memory — now 7168 with `AUTO_TRUNCATE`, and `tei.md` points at the shipped compose file
+  instead of two stale copies of it. The VS Code agent was told to use `secret_execute` but its tool list left out the secret
+  tools (a test now compares the tools its rules name with its list). `memo doctor --json` was accepted and ignored (now a usage
+  error); `memo calibrate --write PATH` was overwritten by calibrate's own temp file (now refused) and `--probe-only` printed
+  that it recorded settings (the probe is told, so its text is right); the `--multilingual` / `--long` help described scan
+  behaviour they never had; `memo agent --help` said calibrate "offers" what it does without asking; the probe text said
+  "C toolchain" where a prebuilt GGUF runtime needs none. README: calibrate's fifth step (Claude Code), the 0.4 team-memory
+  upgrade step, hook scripts need `_project.sh`, the GGUF runtime download named among the outbound connections, `memo serve`
+  accepting `0.0.0.0` / `::`, exit status 2, tier-0 defaults, latency figures labelled by vector size. `mcp/README.md`,
+  `SESSION_CONTINUITY.md` and `EMBEDDERS.md`: scope defaults, row truncation, promotion folds tier 1 and up only, the promote
+  result is `{ ok, result }`, calibrate keeps embedder keys already set. The rockspec description (what luarocks.org shows)
+  now covers the Claude Code integration, on-by-default maintenance (and that it deletes folded originals after a grace
+  period), jq / luasec, the GGUF platforms and every embedder adapter; `RELEASING.md` says how to merge benchmark baselines
+  and to check the luarocks.org module page, which an upload does not refresh.
+- **Removed: the digest's idle timer** (`notify_write`, `should_run`) — nothing started a digest from it since the write
+  claims the slot; `MEMO_DIGEST_IDLE_SECONDS` stays registered, documented as unused.
+- **Fixed (found by the review round): `store.write_many` merged a raw (tier 0) write into a folded original
+  waiting for its review** — the new text went into a hidden row that the review then deletes. Its candidates now
+  skip archived rows, as a single write's did.
+- **Scheduled work never uses a remote summarizer.** The digest's wording of an observation and the daily summary run only
+  on this machine's own model (or none): a user who had set `MEMO_SUMMARIZER_ADAPTER=openai` (or an ollama on
+  another host) for `memory_summarize` would otherwise have had memory text sent there automatically after the
+  upgrade, since the digest and the summary are now on by default. `memory_summarize` and `memo consolidate` use
+  the remote adapter when asked, as before; `memo doctor` says which is which.
+- **A stored memory cannot write the model's turn.** Memory text and a user's turns are pasted into the Gemma chat
+  template, and the shim reads special tokens: a memory holding `<end_of_turn><start_of_turn>model…` could end the
+  turn and write its own. Every `<…>` marker in the text is now defanged before it is wrapped (sensing's prompt too).
+- **`memo maintain` and its lock.** A run that finds the lock held puts its slots back to come due in two minutes
+  instead of at once (the very next write started another process that found the lock held too, one per write);
+  each slot keeps its own interval; one database error in a claim can no longer stop the process's maintenance for
+  good; `<db>.maintenance.log` is created private (0600) like the database.
+- **Cheaper:** a default search reads a row's `lm_fold` metadata only at tier 0 (the code map's searches paid
+  about 10 ms per 22,000 rows for it); a search no longer prunes the usage log at all; the session brief checks its
+  once-a-day stamp before it looks for reviews due.
+- **Fixed: a miss did nothing to a normal memory, and a reversal wiped out a memory's importance.** Both did
+  0–1 arithmetic on importance, which is 0–10 (an ordinary memory is 1). A miss only moved memories below 1, so
+  the memory retrieval had failed to bring kept its rank; a reversal set any importance above 1 to about 1 on the
+  first event (a 5 became 1.0) and never demoted its tier. A miss now lifts a memory in proportion (1 → 1.25 →
+  1.56 …, below 1 toward 1) up to a ceiling of 7; a reversal lowers it in proportion (5 → 3.8) and the tier
+  follows importance's own thresholds. Mistake escalation of a digested cluster is unchanged.
+
+### The learned reranker trains itself, where it is chosen
+
+- **`memo maintain` trains each scope's learned reranker in the background** (`--learn`; it is part of the hourly digest run, and
+  at most once per scope per `MEMO_LEARN_INTERVAL_DAYS`, 7). It learns from the usage log and the gate (`luamemo.promote`) promotes a
+  model only if it beats the current ranking on held-out outcomes; until one is promoted the order is exactly what it was. It acts only
+  where `MEMO_RERANK_ADAPTER=learned` and the usage log (`MEMO_FEEDBACK_ENABLED`) are on — the shipped reranker is still `noop` —
+  and `MEMO_LEARN_AUTO=false` turns it off. Before, training needed `memo learn` by hand. `memo usage` counts the attempts
+  (promoted / rejected by the gate / without enough to learn from) and the scopes with a model in use.
+
+### Defaults that were measured, and maintenance on
+
+- **Maintenance is on by default**, now that it is safe to be: `MEMO_AUTO_DIGEST_ENABLED` is `true` (it was off unless
+  `memo calibrate` happened to write it — neither of the owner's projects had it), `MEMO_SUMMARIZER_ADAPTER` is `auto` (the shared
+  language model when one is configured and loads, else it joins texts as before) and `MEMO_SUMMARIZER_INTERVAL_SECONDS` is a day
+  (one batch per scope per day). All of it runs in the background process; a folded memory is archived and reviewed, never
+  deleted outright; the code index is never touched; a search never waits on the model.
+- **`MEMO_IMPORTANCE_CURVE` defaults to `sqrt`** (it was effectively `linear`): on the corpus it beat linear on every comparison
+  with no regression — overall R@1 63.9 → 65.6, a note's content 22.4 → 46.4, searching eight scopes 44.1 → 62.4 (eval/README.md).
+  Stored importances are unchanged; only how much they weigh against a match. `linear` restores the old ranking.
+- The thresholds for "the same memory" (dedup, miss, consolidate's merge, the digest's grouping, reinforce) are one value, 0.95.
+- `MEMO_NO_MAINTENANCE=1` (set by `memo eval` and the test runner; set it yourself when you run a benchmark runner directly) keeps
+  a scratch database from starting a `memo maintain`.
+
+### Maintenance runs beside the agent, never in its way
+
+- **`memo maintain`** (`luamemo.maintenance`) does the maintenance — the digest, one bounded batch of summarizing and the
+  review of folded memories whose grace period is over — as a separate process. A write that makes it due only *claims* the
+  slot (the atomic row the digest and the summarizer already kept, so at most one run per interval per scope) and starts the
+  process, detached and silent: its output goes nowhere (an MCP server's stdout is the protocol), the write returns at once,
+  and what it did goes to `<database file>.maintenance.log`. A start that fails gives the claim back; nothing is raised.
+  One run at a time per database (`<database file>.maintenance.lock`, an flock: a second run leaves at once; the kernel drops the
+  lock when the holder ends) — per file, because the data directory holds every project's database and one project's run must not hold another's up. By hand it prints a line
+  per scope; `--quiet` prints nothing, whatever happens. `MEMO_MAINTENANCE_BACKGROUND=false` runs it inside the write as before.
+- **The session brief asks for the reviews that are due**, at most once a day, in any scope — a scope nobody writes to any more
+  would otherwise never get its folded memories reviewed. With the usage log on and nothing to review, it starts the run
+  that prunes the log instead (so the log is pruned by a session that only reads, too).
+- **A search never waits on a language model.** The consolidation a search runs inline when memories are pending used the
+  summarizer to word each observation; with a model behind it that is a call of tens of seconds inside the agent's search.
+  It now takes the best member's body, as with no model; the model's wording is for the background run. Observations are not
+  made for `codeindex:` scopes at all.
+- `memo doctor` shows whether maintenance is in the background and when it last ran.
+- **One process per write, and a slot is never spent for nothing.** A write claims whichever slots are due — the digest, the daily
+  summary — and starts one process for all of them (`maintenance.after_write`); two processes would race for the lock, and the loser
+  used to exit with its slot spent, so a day's summarizing could be lost. A run that cannot take the lock now puts the slots it
+  was started for back, to come due again in two minutes. The lock and the log are per database file (`<file>.maintenance.lock` / `.maintenance.log`): they were
+  per directory, and a data directory holds every project's database.
+
+### Folding a memory no longer deletes it: archive → grace → review → delete or correct
+
+- **A memory folded into a summary (`memory_summarize`, consolidate's merge) or an observation (the digest) is archived,
+  not deleted** (`luamemo.fold`). It stays in the database, hidden — tier 0, with `lm_fold` in its metadata; no search, `recent`,
+  brief or maintenance pass sees it — for `MEMO_FOLD_GRACE_DAYS` (30; the digest's own week is now the same setting, its
+  `MEMO_DIGEST_GRACE_DAYS` an override). Why: a summary keeps a quarter or less of the concrete tokens of what it replaces
+  (eval/summarizer_bench.lua), and deleting a memory also deleted the record of whether it was useful (its reinforcements and
+  the searches that offered it cascaded away).
+- **At the end of the grace period it is reviewed** — analyze and compare — against what replaced it: *delete* it if it was not
+  shown useful (praise, a direct command, or `MEMO_FOLD_USEFUL_OFFERS` searches offering it — the usage log) or the summary
+  keeps `MEMO_FOLD_MIN_COVERAGE` (0.6) of its concrete tokens; *correct* the summary if the memory was useful and the summary lost
+  its facts, or the summary was marked wrong since (a mistake or reversal on it): the missing facts are added from the memory's own
+  sentences — no model, nothing invented — the summary is re-embedded and the memory goes back to grace; *restore* it if the
+  summary is gone (raw conversation the digest folded into an observation that no longer holds it is the one exception: deleted
+  unless it was ever useful), or after `MEMO_FOLD_MAX_REVIEWS` (2) corrections — never delete what the summary still cannot
+  replace. A tier-0 memory is *kept*: back as it was, hidden like any tier-0 memory, out of every pass. Every
+  decision is logged to the database's `.maintenance.log`, a deletion before it happens.
+- Fixed with it: the digest's end-of-run purge deleted consolidated tier-0 rows after a week without asking whether they had helped,
+  and the digest, consolidate and the summarizer could select code-index rows (importance 0.2 / 0.3 are "light and old"):
+  `store.maintenance_where` is now the one predicate every maintenance pass uses — not a replica or org directive, not an archived
+  original, not a `codeindex:` scope — and the digest and the review skip the code index.
+
+### Safer maintenance, and a way to measure how importance weighs
+
+- **`MEMO_CONSOLIDATE_MAX_GROUP`** (default 8; 0 lifts it): `memo consolidate` never merges a group of
+  near-duplicates larger than this. Its groups are chains (A~B and B~C group all three), and with
+  EmbeddingGemma 2 the default threshold chained 251 of the 450 memories of a real scope into one group; a
+  summarizer asked to merge that would have folded unrelated memories into one and deleted the originals.
+  Such a group is reported (`too_large`) and left alone. (The similarity thresholds became 0.95 in "One source of
+  truth for what features share", below.)
+- **`MEMO_IMPORTANCE_CURVE`** (new: `linear`, `sqrt`, `log`; `sqrt` is the default, see "Defaults that were
+  measured"): how much a memory's importance weighs against how well it matches in ranking. The score is the
+  match times the importance, and importances run from 0.2 to 6 (30x), so with `linear` importance decides the
+  order and a better match only breaks ties; `sqrt` (5.5x) and `log` (log2(1+x), 11x) compress that.
+- **`eval/clustering_probe.lua`**: what a similarity threshold means for consolidate (single link) and for the
+  digest (pivot) on the same rows — false merges and duplicates found, per threshold (eval/README.md).
+
+### What retrieval costs the agent: miss rate and bytes to the hit
+
+- **Every benchmark now reports two more numbers beside R@k and MRR** (eval/metrics.lua,
+  shared by the LongMemEval, LoCoMo, ConvoMem, MemBench and personalization runners):
+  - **miss rate** — the share of questions whose right memory is not in the 10 results an
+    agent gets (1 − R@10; a rank past 10 counts as a miss): the agent then searches again,
+    greps or reads whole files;
+  - **bytes to hit** — what the agent reads before the right memory comes: the compact rows
+    1..rank exactly as the MCP server returns them (bodies capped at 2000), mean / median /
+    p90 over the questions answered within 10, with a token estimate (bytes / 4) and the
+    bytes returned on a miss.
+  The row the server returns and the row the benchmarks measure are one function
+  (`luamemo.ops.compact_row`). The result JSON keeps its keys; the new ones sit beside them.
+- The personalization and MemBench runners take `--embedder gguf` (the in-process GGUF
+  embedder), as the others do.
+
+### `memo eval` — the benchmarks on your machine (optional kit)
+
+- **`memo eval status | install | fetch | run | history`** runs the retrieval benchmarks
+  here. Tiers: `quick` (personalization, session, codemap — in the kit, seconds, no download), `standard`
+  (+ LoCoMo, ConvoMem, LongMemEval oracle) and `full` (+ MemBench, LongMemEval _s, perf).
+  Embedders: `mine` (the project's), `hash`, `gguf`, `ollama`, `tei`, local ones only.
+  Results are also compared with the published baselines: a drop of 1 point of R@1, or
+  10 % more bytes to hit, is flagged.
+- **Your last three results, side by side:** a run keeps the newest three results of each
+  benchmark × embedder in the project's memory, one memory each in the scope
+  `eval:<project>`, out of the project's own searches. It prints them side by side (R@1 /
+  R@5 / R@10, MRR, miss rate, bytes to hit) with the change from each result to the one
+  before. `memo eval history` shows them without running; an agent can search them. A
+  partial run (`--n`) is not kept.
+- **The runners never touch your memory:** each one gets a new scratch database and none of
+  your `MEMO_*` settings (a learned reranker, a projection or a context size would change
+  the numbers); only the GGUF runtime's and the libraries' paths are kept.
+- **The kit is optional and checked:** the runners, the personalization set, the fixtures
+  and the baselines are not in the rock — `memo eval install` downloads this release's
+  `luamemo-evalkit-<version>.tar.gz` from GitHub and refuses it unless it matches the
+  SHA-256 the rock ships (`luamemo/evalkit.lua`); `--from CHECKOUT` copies it from a
+  checkout of the same version. Datasets come from their own sources with `memo eval fetch
+  NAME` — each file checked against the copy the baselines were measured on, the big ones
+  only with `--yes`; nothing is downloaded or run implicitly.
+- **The `memo-run-eval` skill** (Claude Code plugin) is the benchmark workflow for the agent.
+  It checks the kit, asks before installing or downloading, and runs the tier you need. Then
+  it shows the table of your last three results and reads it out: what R@1, the miss rate
+  and the bytes mean for you, and what changed.
+- `memo config unset` removes a setting luamemo no longer reads, e.g. 0.4's `MEMO_DB_URL`,
+  which warns on every command; the warning names the command.
+
+### More of what the agent pays for, measured
+
+- **`session`:** what an agent receives from luamemo before its first search: the usage
+  rules, the tool definitions (all 27, or `MEMO_MCP_TOOLS=core`'s 16) and the session brief,
+  in bytes. It runs `memo mcp` as a client does.
+- **`codemap`:** "where is X done?". 40 questions over luamemo's own modules, answered with
+  `index_search` against grep. R@k, the miss rate and the bytes read until the right file:
+  the result lines `index_search` prints, against whole files read in grep's order.
+- **`perf`:** this machine's speed and footprint. Search latency at 1k / 20k / 100k memories,
+  query embedding (hash, the GGUF model), writes per second, the MCP server's start and
+  first search, its memory (idle, after a search, with the GGUF model loaded) and the
+  database's size per 1k memories. Only its own history compares it.
+- **`--rerank noop|learned|cross_encoder|ollama:<model>`:** a reranker on the retrieval
+  benchmarks, with its own cost per search: time, the model's tokens (Ollama counts them)
+  and failed calls. Failures used to be silent, the search keeping its order.
+- **`--prompts auto`** (below) and **`--embedder gguf:<model>`** (another GGUF embedding model,
+  e.g. `gguf:embeddinggemma-2-Q8_0`). A gguf run on a GPU (`MEMO_GGUF_NGL`) is labelled
+  `@gpu`, because its vectors differ slightly from the CPU's.
+
+### Embedding
+
+- **Task prompts (`MEMO_EMBED_PROMPTS`):** asymmetric embedders are trained with one
+  instruction before a query and another before a stored text, and luamemo sent neither.
+  `none` (the default), `auto` (the model's own: EmbeddingGemma's `task: search result |
+  query:` / `title: none | text:`, nomic-embed-text's `search_query:` / `search_document:`), or
+  a JSON pair. They are part of the embedding space: switching needs `memo reembed --all`.
+- **llama.cpp b11829** (from b9976). EmbeddingGemma-300M's vectors are bit-identical. The
+  new tag adds **EmbeddingGemma 2**, and the shim now takes an embedding's width after the
+  model's projection: EmbeddingGemma 2 is 512 wide inside and 768 out, and the hidden width
+  took its first 512 values. The context defaults to the model's trained length (at most 8K;
+  EmbeddingGemma 2 reads 8K, EmbeddingGemma-300M stays at 2K).
+- **EmbeddingGemma 2 is the new default GGUF model**, with its task prompts
+  (`MEMO_EMBED_PROMPTS=auto`) and a text cap sized to its 8K context (24,000 characters;
+  the setup guide and `memo calibrate` write all three). On LoCoMo it goes from R@1 59.0 % to
+  61.2 % and its miss rate from 6.9 % to 6.6 %; ConvoMem R@1 92.0 % to 93.6 %; the code map
+  loses some (miss 7.5 % to 12.5 %). It takes about 2.5× the CPU time to embed a long text,
+  and it needs this release's llama.cpp (a model newer than the runtime now fails with a
+  message saying so: `memo gguf install`). **Without its prompts it is worse than the
+  300M model.** An existing EmbeddingGemma-300M setup is untouched: its model is still
+  found, with no prompts and the same cap, and nothing needs re-embedding.
+- EMBEDDERS.md: what a GPU (CUDA build) gains and costs, and the WSL toolkit trap.
+
+### Sensing and reranking
+
+- **Gemma 4 for generative sensing:** the prompt now uses the turn markup of the model's own
+  chat template, `<|turn>` for Gemma 4. Every prompt used to be Gemma 3's `<start_of_turn>`.
+- **The Ollama reranker no longer lets a thinking model think** (`think: false`). gemma4
+  wrote 1,000+ characters of reasoning per search, taking about 10× the time, for the
+  same JSON.
+
+### A benchmark corpus of 100,000 real entries
+
+- **`memo eval build-corpus`** builds a luamemo database for benchmarks, kept apart from every
+  project: a file named `bench*.db` labelled as one, which the builder refuses to confuse with a
+  real database and no luamemo tool is configured to open. It is made by running luamemo's own
+  code over real source trees on the machine, not from random text: `memo index ingest` for the
+  code of each project (symbol, file and dependency rows, `requires` facts; the Python standard
+  library is one huge scope, since luamemo searches one scope at a time and "100k" is only a
+  test of scale if a scope is that big), `memo calibrate`'s scan for READMEs, instruction files,
+  decision comments and git history, and the owner's own notes for the agent-written decisions,
+  plans and facts. Embedded with the configuration you use (EmbeddingGemma 2, task prompts) into
+  the real `embedding` column. Resumable per project; takes hours; the generator ships in the
+  eval kit, the database never does.
+- **Labelled questions** (`--stage queries`): the gold comes from the real structure of each row (a
+  symbol's own docstring with its name taken out, the names a file defines, who requires a module,
+  a README section's opening sentence, a commit, a note's heading and its sentences), with how much
+  the question shares with its answer measured and bucketed. A model rewrites a sample in other
+  words (`--stage paraphrase`, cached so it is never asked twice; a rewrite is kept only if it shares
+  few words with its answer and none of its identifiers).
+- **A simulated history** (`--stage simulate`): the questions replayed in time order through the real
+  search with feedback on, and the outcomes written through the real feedback code, by a click model whose
+  parameters are explicit and recorded in the database (position bias, praise, corrections, misses,
+  label noise). Holdout projects get none. A scope with 200 or more history questions has each asked
+  again in later cycles (`--heavy-cycles 6`, `--heavy-min 200`), as a busy project is, so the learning
+  curve has points past one pass over the questions.
+- **Benchmarks on it:** `scale` (R@k, miss rate, bytes to hit and search time at 100k rows, by category,
+  difficulty and source) and `learned` (the learned reranker's learning curve through the real promotion
+  gate: the change in R@1 on held-out questions after 100, 1,000 and 10,000 outcomes), plus `task_cost`
+  (bytes an agent reads before the file that answers: the code map against grep), `multiscope` (the same
+  questions over 1, 2, 4 and 8 scopes, and a project's `repo:` + `codeindex:` pair) and `maintenance`
+  (consolidation's cost by working-set size, its redundant rows and what collapsing them does to recall,
+  on a copy; digest and summarize as dry runs) — the `corpus` tier. The grep baseline is shared with the
+  code-map benchmark (`eval/grep_baseline.lua`). A file question ("which file defines A and B") counts the
+  symbols the file defines as right answers along with the file's own row; `--stage dedupe` removes the
+  exact repeats a rescan once wrote into the `repo:` scopes (the rescan now refreshes them in place —
+  `write_many` appends unless the call passes `dedup_strategy`, whatever its rows ask for). The `learned`
+  curve clears the reranker's in-memory weights between its points (it had scored all three with the first
+  point's weights).
+  Without the database they are skipped, said once, and everything else runs as before.
+- `index.ingest` takes `select_files` (a sample of a huge tree); `memo calibrate`'s scan is a function
+  (`luamemo.cli.calibrate.scan`) that returns the rows it would write, touching nothing.
+
+### Fixes
+
+- **`memo calibrate` never scanned the git history of a repository with fewer than 200 commits.** It asked
+  git for `HEAD~200..HEAD`, which is an error in a young repository, and the error was dropped: luamemo's
+  own repository (58 commits) got none. It now reads the newest 200 commits.
+- **The same search gives the same order every time.** When the temporal leg fuses its
+  rankings, two memories can score exactly the same: one 1st and 2nd, the other 2nd and
+  1st. That tie was ordered by Lua's hash order, which changes from process to process,
+  so a memory's place in the results could swap between runs. Now the first ranking's
+  order decides. The benchmarks found it: ConvoMem's R@1 moved by about 0.1–0.2 points
+  between identical runs.
+- **A GGUF shim built before 0.5.0 is recognised.** That shim fails on any text longer than
+  the model's context; 0.5.0's truncates it. An upgrade keeps a shim built next to the
+  modules, since it was never part of the rock. Writes of long texts then failed with a bare
+  "embed failed", and `memo gguf status` said "loads". Now the status says the shim is too
+  old, and the error names the fix: rebuild it with `build.sh`, or `memo gguf install`.
+
+### Release
+
+- The release builds the eval kit (`eval/release/eval_kit.sh`), writes its checksum into the
+  release commit (`eval/release/write_evalkit.lua`) and attaches it. Tested against a local
+  asset; 0.5.2's release is the first real run.
+
 ## [0.5.1] — 2026-10-18
 
 ### macOS

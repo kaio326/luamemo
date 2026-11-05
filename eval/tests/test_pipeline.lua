@@ -267,8 +267,7 @@ memory.setup({
     summarizer_adapter = "noop",
     consolidate_threshold            = 0.70,
     consolidate_reinforce_threshold  = 0.50,
-    digest_idle_seconds     = 9999,
-    digest_grace_days       = 0,
+    digest_grace_days       = 30,   -- (a consolidated raw row waits this long, hidden, for its review — luamemo.fold)
     digest_escalate_alpha   = 0.4,
     digest_promote_tier2_at = 3,
     digest_promote_tier3_at = 5,
@@ -286,23 +285,15 @@ do
     check("digest: lm_reinforcements table exists",
         db.value("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lm_reinforcements'") ~= nil)
 
-    -- configure + notify_write
+    -- configure
     local ok2, err2 = pcall(function()
         digest.configure({
-            digest_idle_seconds     = 9999,
-            digest_grace_days       = 0,
             digest_escalate_alpha   = 0.4,
             digest_promote_tier2_at = 3,
             digest_promote_tier3_at = 5,
         })
-        digest.notify_write(SCOPE_D)
     end)
-    check("digest: configure and notify_write succeed", ok2, tostring(err2))
-
-    -- should_run
-    check("digest: should_run false immediately after write", not digest.should_run(SCOPE_D))
-    check("digest: should_run false for unknown scope",
-        not digest.should_run("smoke:digest:never_written"))
+    check("digest: configure succeeds", ok2, tostring(err2))
 
     -- record_event
     local seed_row, seed_err = store.write({
@@ -422,25 +413,26 @@ do
             .. " expected=" .. #dry_ids)
     end
 
-    -- purge stale (grace_days=0)
+    -- the grace period is over: the folded rows are reviewed (none was useful) and deleted
     if #tier0_ids > 0 then
-        local params = { util.now_us() - 1000000 }
+        local params = { util.now_us() - 1000000, util.now_us() - 1000000 }
         for _, id in ipairs(tier0_ids) do params[#params + 1] = id end
-        db.run("UPDATE " .. MEM_TBL .. " SET consolidated_at = ? WHERE " .. ids_in(tier0_ids), unpack(params))
+        db.run("UPDATE " .. MEM_TBL .. " SET consolidated_at = ?, metadata = json_set(metadata, '$.lm_fold.review_at', ?) WHERE "
+            .. ids_in(tier0_ids), unpack(params))
         local ok11, res11 = pcall(digest.run, SCOPE_D)
-        check("digest: run for purge succeeds", ok11, tostring(res11))
+        check("digest: run for the review succeeds", ok11, tostring(res11))
         if ok11 then
-            check("digest: deleted > 0 with grace_days=0", res11.deleted > 0,
+            check("digest: deleted > 0 once the grace period is over", res11.deleted > 0,
                 "deleted=" .. tostring(res11.deleted))
         end
     end
 
-    -- store.write calls notify_write
+    -- a write after the digest is wired up still succeeds
     local ok12, err12 = pcall(store.write, {
-        scope = SCOPE_D, title = "notify test", body = "notify_write integration",
+        scope = SCOPE_D, title = "notify test", body = "write after the digest is configured",
         importance = 0.5,
     })
-    check("digest: store.write after wiring succeeds (notify_write hooked)", ok12, tostring(err12))
+    check("digest: store.write after wiring succeeds", ok12, tostring(err12))
 
     db.run("DELETE FROM " .. MEM_TBL .. " WHERE scope = ?", SCOPE_D)
     db.run("DELETE FROM " .. REI_TBL .. " WHERE scope = ?", SCOPE_D)

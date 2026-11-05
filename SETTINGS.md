@@ -97,12 +97,13 @@ for the few settings marked below where a mistake must stop luamemo instead.
 | `MEMO_GGUF_MODEL` | text | — | The .gguf model file of the in-process GGUF embedder (MEMO_EMBEDDER=gguf_ffi). Changing it: `memo reembed --all`. Set only in your shell, `memo calibrate` offers to save it in `.luamemorc` (an MCP client starts the server without your shell's settings). Older name, still read: `MEMO_GEMMA_MODEL`. |
 | `MEMO_EMBED_DIM` | whole number ≥ 1 | `384` | Vector size the embedder returns. Changing it: `memo reembed --all`. An invalid value stops luamemo (it is never ignored). Set only in your shell, `memo calibrate` offers to save it in `.luamemorc` (an MCP client starts the server without your shell's settings). |
 | `MEMO_EMBEDDER_HEADERS` | JSON object | `{}` | Extra HTTP headers for the embedder, a JSON object; a credential as {secret:NAME} (memo secret-store). |
+| `MEMO_EMBED_PROMPTS` | text | `none` | Task prompts for the embedder: none, auto (the model's own — EmbeddingGemma's task: / title: prefixes, nomic-embed-text's search_query: / search_document:) or {"query":"…{text}…","document":"…{text}…"}. Changing it: `memo reembed --all`. Set only in your shell, `memo calibrate` offers to save it in `.luamemorc` (an MCP client starts the server without your shell's settings). |
 | `MEMO_EMBEDDER_INPUT_TYPE` | text | — | Input type sent to cohere (default search_document) or voyage (default: none). Changing it: `memo reembed --all`. |
 | `MEMO_EMBEDDER_NUM_CTX` | whole number ≥ 1 | — | Context size asked of an ollama embedder (default: the model's). |
 | `MEMO_EMBED_TIMEOUT_MS` | whole number ≥ 1 | `30000` | Timeout of one embedding request (ms). |
 | `MEMO_EMBED_MAX_CHARS` | whole number ≥ 1 | — | Longer text is cut to this many characters before embedding (the row is flagged); unset: no limit. |
 | `MEMO_PROJECTED_BASE` | text | — | Base embedder of the projected embedder (hash, gguf_ffi, …). Changing it: `memo reembed --all`. |
-| `MEMO_GGUF_NCTX` | whole number ≥ 1 | `2048` | Context size of the in-process GGUF embedder. Older name, still read: `MEMO_GEMMA_NCTX`. |
+| `MEMO_GGUF_NCTX` | whole number ≥ 1 | — | Context size of the in-process GGUF embedder (unset: the context the model was trained with, at most 8192 — EmbeddingGemma 2 reads 8K, EmbeddingGemma-300M 2K). Older name, still read: `MEMO_GEMMA_NCTX`. |
 | `MEMO_GGUF_NGL` | whole number ≥ -1 | `0` | GPU layers for the GGUF embedder: 0 CPU, N layers, -1 all. Older name, still read: `MEMO_GEMMA_NGL`. |
 | `MEMO_GGUF_SHIM` | text | — | Path of the built GGUF shim (default: the one next to luamemo). Older name, still read: `MEMO_GEMMA_SHIM`. |
 | `MEMO_CA_FILE` | text | — | A PEM certificate (or CA) trusted for https:// calls besides the system's — a self-hosted service's. Set only in your shell, `memo calibrate` offers to save it in `.luamemorc` (an MCP client starts the server without your shell's settings). |
@@ -128,6 +129,7 @@ for the few settings marked below where a mistake must stop luamemo instead.
 | Setting | Accepts | Default | Meaning |
 |---|---|---|---|
 | `MEMO_HYBRID_WEIGHTS` | JSON object | `{"fts":0.3,"vector":0.7}` | Blend of the vector and text scores: {"vector": …, "fts": …}. |
+| `MEMO_IMPORTANCE_CURVE` | `linear` · `sqrt` · `log` | `sqrt` | How much a memory's importance weighs against its similarity in ranking: sqrt (the square root: 0.2 to 6 is a 5.5x spread — a clearly better match can beat a more important memory), linear (the importance itself: a 30x spread, importance decides the order), log2(1+importance) (11x). All are 1 at importance 1. |
 | `MEMO_OBS_MAX_SLOTS` | whole number ≥ 0 | `3` | Observations listed after the memories of a search (0: none). |
 | `MEMO_PERSON_NAME_BOOST` | number ≥ 0 | `0.15` | Score boost for a memory naming a capitalised name from the query. |
 | `MEMO_PERSON_NAME_BOOST_ENABLED` | true / false | `true` | Apply the name boost. |
@@ -140,7 +142,7 @@ for the few settings marked below where a mistake must stop luamemo instead.
 | Setting | Accepts | Default | Meaning |
 |---|---|---|---|
 | `MEMO_RERANK_ENABLED` | true / false | `false` | Rerank every search (a call can still turn it off). |
-| `MEMO_RERANK_ADAPTER` | `noop` · `ollama` · `openai` · `cross_encoder` · `learned` | `noop` | Reranker: noop (word overlap), ollama, openai, cross_encoder (TEI / Cohere / Jina), learned (from use). |
+| `MEMO_RERANK_ADAPTER` | `noop` · `ollama` · `openai` · `cross_encoder` · `learned` | `noop` | Reranker: noop (word overlap), ollama, openai, cross_encoder (TEI / Cohere / Jina), learned (from use: with MEMO_FEEDBACK_ENABLED, memo maintain trains it in the background and promotes a model only if it beats the current ranking on held-out data; until then the order is untouched). |
 | `MEMO_RERANK_URL` | text | — | Reranker endpoint. |
 | `MEMO_RERANK_MODEL` | text | — | Reranker model. |
 | `MEMO_RERANK_HEADERS` | JSON object | `{}` | Extra HTTP headers for the reranker, a JSON object; a credential as {secret:NAME}. |
@@ -152,12 +154,12 @@ for the few settings marked below where a mistake must stop luamemo instead.
 
 | Setting | Accepts | Default | Meaning |
 |---|---|---|---|
-| `MEMO_SUMMARIZER_ADAPTER` | `noop` · `ollama` · `openai` | `noop` | Summarizer: noop (no model — joins the memories), ollama, openai. |
+| `MEMO_SUMMARIZER_ADAPTER` | `auto` · `noop` · `gguf` · `ollama` · `openai` | `auto` | Summarizer: auto (the language model, MEMO_GEN_MODEL, when one is configured and loads; else noop), noop (no model — joins the memories), gguf (that model, in-process), ollama, openai (each with its URL and model). ollama and openai are used when you ask (memory_summarize, memo consolidate), never by the scheduled background maintenance: that runs only on this machine's own model. |
 | `MEMO_SUMMARIZER_URL` | text | — | Summarizer endpoint. |
 | `MEMO_SUMMARIZER_MODEL` | text | — | Summarizer model. |
 | `MEMO_SUMMARIZER_HEADERS` | JSON object | `{}` | Extra HTTP headers for the summarizer, a JSON object; a credential as {secret:NAME}. |
 | `MEMO_SUMMARIZER_TIMEOUT_MS` | whole number ≥ 1 | `60000` | Timeout of one summarizer request (ms). |
-| `MEMO_SUMMARIZER_INTERVAL_SECONDS` | whole number ≥ 0 | `0` | Summarize automatically (alongside the writes' maintenance) at most this often; 0: only on demand. |
+| `MEMO_SUMMARIZER_INTERVAL_SECONDS` | whole number ≥ 0 | `86400` | Summarize automatically — one batch, in the background, started by a write — at most this often per scope (a day); 0: only on demand. What is folded is archived and reviewed, not deleted. Only with the in-process model (or none): a remote summarizer is never used in the background. |
 | `MEMO_SUMMARIZER_WEIGHT_THRESHOLD` | number ≥ 0 | `0.5` | Memories weighing less than this (importance × decay) are summarized … |
 | `MEMO_SUMMARIZER_RETENTION_DAYS` | whole number ≥ 0 | `30` | … once older than this many days. |
 | `MEMO_SUMMARIZER_BATCH_SIZE` | whole number ≥ 1 | `20` | Memories per summary. |
@@ -167,25 +169,36 @@ for the few settings marked below where a mistake must stop luamemo instead.
 
 | Setting | Accepts | Default | Meaning |
 |---|---|---|---|
-| `MEMO_AUTO_DIGEST_ENABLED` | true / false | `false` | Writes keep memory maintained: tiers, consolidation, decay. Older name, still read: `MEMO_AUTO_DIGEST`. |
+| `MEMO_AUTO_DIGEST_ENABLED` | true / false | `true` | Writes keep memory maintained — tiers, consolidation, decay, the review of folded memories — by starting the digest in the background when it is due (MEMO_AUTO_DIGEST_INTERVAL). Older name, still read: `MEMO_AUTO_DIGEST`. |
 | `MEMO_AUTO_DIGEST_INTERVAL` | whole number ≥ 0 | `3600` | At most one automatic maintenance per scope per this many seconds. |
-| `MEMO_DIGEST_PROMOTE_TIER2_AT` | whole number ≥ 1 | `3` | Times a memory is proven useful before it moves to tier 2. |
-| `MEMO_DIGEST_PROMOTE_TIER3_AT` | whole number ≥ 1 | `5` | Times a mistake recurs before its memory moves to tier 3 (core). |
-| `MEMO_DIGEST_GRACE_DAYS` | whole number ≥ 0 | `7` | Days an ephemeral (tier 0) memory is kept once consolidated. |
-| `MEMO_DIGEST_ESCALATE_ALPHA` | number, 0–1 | `0.4` | How fast a recurring mistake's importance grows. |
-| `MEMO_DIGEST_IDLE_SECONDS` | whole number ≥ 0 | `1800` | A scope without writes for this long is due for a digest. |
-| `MEMO_CONSOLIDATE_THRESHOLD` | number, 0–1 | `0.8` | Similarity at which memories are grouped into an observation. |
-| `MEMO_CONSOLIDATE_REINFORCE_THRESHOLD` | number, 0–1 | `0.75` | Similarity at which a group reinforces an existing observation. |
-| `MEMO_CONSOLIDATE_LOG_ERRORS` | true / false | `false` | Report the observations that failed to build in the consolidation result. |
+| `MEMO_DIGEST_PROMOTE_TIER2_AT` | whole number ≥ 1 | `3` | How many memories (proof) an observation needs, and not be stale, before the tier-1 memories it holds move to tier 2. |
+| `MEMO_DIGEST_PROMOTE_TIER3_AT` | whole number ≥ 1 | `5` | Times a mistake recurs (a mistake, or a direct command) before its tier-2 memory moves to tier 3 (core); never on an organization's shared scope. |
+| `MEMO_MAINTENANCE_BACKGROUND` | true / false | `true` | The digest, scheduled summaries and the review of folded memories run in a separate background process (memo maintain), silent, started by the write that makes them due (and, for a review that is due or the usage log's prune, by the session brief, once a day). false: inside that write (a language model can stall it for a minute); the brief then starts nothing. |
+| `MEMO_FOLD_GRACE_DAYS` | whole number ≥ 0 | `30` | Days a memory folded into a summary or an observation is kept, hidden, before it is reviewed. Review: delete it if it was not shown useful or its facts are in the summary; correct the summary (and wait again) if not; restore it if what it was folded into is gone (raw conversation folded by the digest excepted: deleted unless it was ever useful). A deletion is recorded in the maintenance log first, and not made if that cannot be written. |
+| `MEMO_FOLD_MAX_REVIEWS` | whole number ≥ 0 | `2` | Corrections of the summary one folded memory may cause; past this it is restored instead of deleted. |
+| `MEMO_FOLD_MIN_COVERAGE` | number, 0–1 | `0.6` | Share of a folded memory's concrete tokens (numbers, identifiers, file names) its summary must keep, if the memory was ever useful, for it to be deleted. |
+| `MEMO_FOLD_USEFUL_OFFERS` | whole number ≥ 1 | `3` | Searches that offered a folded memory (the usage log) after which it counts as shown useful, besides any praise or direct command. |
+| `MEMO_DIGEST_GRACE_DAYS` | whole number ≥ 0 | `30` | Days an ephemeral (tier 0) memory is kept once consolidated, before its review (unset: MEMO_FOLD_GRACE_DAYS). |
+| `MEMO_DIGEST_ESCALATE_ALPHA` | number, 0–1 | `0.4` | How fast recurring mistakes escalate a memory in the digest. The more mistakes (a mistake, or a direct command) behind a group of not-yet-digested tier-0 notes that no observation matches (see MEMO_CONSOLIDATE_REINFORCE_THRESHOLD), the higher the digest lifts its best note: at 0.4 tier 1 after 2 mistakes, tier 2 after 4, tier 3 after 15 (an organization's shared scope stops at tier 2), and its importance up to a matching value between 0 and 1 if that is higher. The higher this number, the fewer mistakes each step takes. Moving an existing tier-2 memory to tier 3 is MEMO_DIGEST_PROMOTE_TIER3_AT. |
+| `MEMO_DIGEST_IDLE_SECONDS` | whole number ≥ 0 | `1800` | Not used any more (0.5.2): the digest runs from a write, at most once per MEMO_AUTO_DIGEST_INTERVAL, and from memo maintain — never because a scope has gone quiet. Kept so a config that sets it still loads. |
+| `MEMO_CONSOLIDATE_THRESHOLD` | number, 0–1 | `0.95` | Similarity at which memories are grouped into an observation, and at which memo consolidate treats two as duplicates (unset: the dedup threshold). The digest groups its tier-0 notes at it too: which group is escalated for its mistakes, which notes are archived together (memo digest --threshold overrides that grouping only). |
+| `MEMO_CONSOLIDATE_MAX_GROUP` | whole number ≥ 0 | `8` | memo consolidate never merges a group of near-duplicates larger than this (a long chain of similar memories is not one memory); it is only reported. 0: no limit. |
+| `MEMO_CONSOLIDATE_REINFORCE_THRESHOLD` | number, 0–1 | `0.95` | Similarity at which a group reinforces an existing observation — and so, in the digest, is not escalated for its mistakes but reinforced into it (unset: the dedup threshold; measured, 0.75 matched 99.5 % of unrelated memories). |
+| `MEMO_CONSOLIDATE_LOG_ERRORS` | true / false | `false` | Report, in the consolidation's result (and the digest's errors), a summarizer that failed for a cluster: its observation then falls back to the best member's text. |
 | `MEMO_CORPUS_HEALTH_CHECK` | true / false | `false` | Print memo doctor's corpus warnings (truncation) at startup. |
 
 ### Learning from use
 
 | Setting | Accepts | Default | Meaning |
 |---|---|---|---|
-| `MEMO_FEEDBACK_ENABLED` | true / false | `false` | Log searches and detect missed memories (what the learned reranker trains on). |
-| `MEMO_MISS_THRESHOLD` | number, 0–1 | `0.9` | Similarity at which a new write reveals a memory a search missed. |
-| `MEMO_GEN_MODEL` | text | — | GGUF instruct model for memo sense --generative. |
+| `MEMO_LEARN_AUTO` | true / false | `true` | memo maintain trains each scope's learned reranker when it is due (MEMO_LEARN_INTERVAL_DAYS) and enough of the usage log has accumulated; the gate promotes a model only if it beats the current ranking on held-out data. Only where MEMO_RERANK_ADAPTER is learned and MEMO_FEEDBACK_ENABLED is on. |
+| `MEMO_LEARN_INTERVAL_DAYS` | whole number ≥ 0 | `7` | At most one training attempt per scope per this many days. |
+| `MEMO_SENSE_CAPTURE` | true / false | `true` | memo sense / memory_sense also stores a standing rule the user states (a sentence that opens with always, never, from now on, make sure, remember to, you must …; a short turn, no question) as a decision memory when no memory already holds it — so a rule given in conversation is not lost for want of a memory to attach it to. The memory holds the rule and, for context, the first 300 characters of what the assistant had just said. memory_brief lists what was captured; memory_delete removes a wrong one. |
+| `MEMO_SENSE_CAPTURE_SIMILARITY` | number, 0–1 | `0.6` | How close an existing memory must be to a stated rule for it to count as already holding it (the rule is then not stored again). |
+| `MEMO_FEEDBACK_ENABLED` | true / false | `false` | Log every search (its text, the scope and the ids it returned, in this database; the ones that found nothing too) and detect missed memories. It is what the learned reranker trains on and what memo usage reads. Off by default because it keeps what was asked; older searches are removed (MEMO_FEEDBACK_RETENTION_DAYS says when, and what stays). If the project has joined an organization that shares more than signals, the queries go there too. |
+| `MEMO_FEEDBACK_RETENTION_DAYS` | whole number ≥ 0 | `90` | How long the usage log keeps a search, in days (0: forever). Past it, the newest 20 searches (per scope) that offered each memory with a recorded reinforcement (praise, direct command, mistake, reversal or miss) stay — that is what the learned reranker trains on — and so does a row adopted from an organization. A folded memory counts as shown useful (MEMO_FOLD_USEFUL_OFFERS) only by the searches still in the log: keep this above the longer of MEMO_FOLD_GRACE_DAYS and MEMO_DIGEST_GRACE_DAYS. |
+| `MEMO_MISS_THRESHOLD` | number, 0–1 | `0.95` | Similarity at which a new write reveals a memory a search missed (unset: the dedup threshold — one definition of "the same memory"). |
+| `MEMO_GEN_MODEL` | text | — | GGUF instruct model, in-process, for every generative feature: memo sense --generative, the scheduled summaries (MEMO_SUMMARIZER_ADAPTER=auto), consolidate's merge and the wording of the digest's observations. |
 | `MEMO_GEN_NCTX` | whole number ≥ 1 | `4096` | Context size of the generative model. |
 | `MEMO_GEN_NGL` | whole number ≥ -1 | `0` | GPU layers for the generative model: 0 CPU, N layers, -1 all. |
 
@@ -230,6 +243,7 @@ Read from the environment where they are used (not from `memo config`).
 | `MEMO_LIB_SODIUM` | Load this libsodium instead of the system's (a path). |
 | `MEMO_LIB_SQLITE3` | Load this libsqlite3 instead of the system's (a path). |
 | `MEMO_LUA` | The LuaJIT interpreter memo runs: a name or a path (default: luajit). |
+| `MEMO_NO_MAINTENANCE` | 1: luamemo never starts its background maintenance process (memo maintain) — `memo eval` and the test runner set it, so a scratch database does not grow a process of its own; set it yourself when you run a benchmark runner directly. |
 | `MEMO_PROJECT` | The project directory whose .luamemorc memo reads and writes (default: the nearest directory from here up that holds a .luamemorc, else the current one; memo calibrate --root and memo mcp --project win over it). |
 | `MEMO_PROJECTION_W` | The projected embedder's weights file (default luamemo/projection_W.json, relative to the working directory). |
 | `MEMO_RERANK_WEIGHTS` | The learned reranker's global weights file, used for a scope without promoted weights (default luamemo/rerank_weights.json, relative to the working directory). |

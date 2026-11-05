@@ -17,8 +17,11 @@ local function status()
     local set = os.getenv("MEMO_GGUF_SHIM")
     io.write("GGUF runtime\n")
     io.write(("  shim:      %s (%s)\n"):format(shim, (set and set ~= "") and "MEMO_GGUF_SHIM" or "next to the modules"))
+    local loads, stale = false, false
+    if exists(shim) then loads, stale = bundle.loads(shim) end
     if not exists(shim) then io.write("  state:     not installed\n")
-    elseif bundle.loads(shim) then io.write("  state:     loads\n")
+    elseif stale then io.write("  state:     loads, but " .. require("luamemo.embedders.native.ffi_shim").STALE .. "\n")
+    elseif loads then io.write("  state:     loads\n")
     else io.write("  state:     present, but it doesn't load on this machine\n") end
     local b, why = bundle.available()
     if b then

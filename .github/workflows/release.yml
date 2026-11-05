@@ -2,11 +2,14 @@
 # luamemo.VERSION, with its rockspec and its CHANGELOG section already on the branch).
 #   1. the checks, and the whole CI (tests + rock smoke test) on that commit;
 #   2. the prebuilt GGUF runtime for Linux x86_64 and macOS arm64 (eval/release/gguf_bundle.sh);
-#   3. the release commit — its checksums in luamemo/embedders/native/bundles.lua and the
+#   3. the eval kit (eval/release/eval_kit.sh — the benchmark runners `memo eval install`
+#      downloads); the release commit — the runtimes' checksums in
+#      luamemo/embedders/native/bundles.lua, the kit's in luamemo/evalkit.lua, the
 #      CHANGELOG date — which only the tag points to (the branch is left as it is), the
 #      tag v<version>;
 #   4. the source rock packed from that tag, smoke-tested exactly as it will be published;
-#   5. the GitHub Release (rock, rockspec, runtimes + checksums, notes from the CHANGELOG);
+#   5. the GitHub Release (rock, rockspec, runtimes, eval kit + checksums, notes from the
+#      CHANGELOG);
 #   6. with "publish", luarocks.org — needs the repository secret LUAROCKS_API_KEY.
 name: Release
 
@@ -101,9 +104,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           luajit eval/release/write_bundles.lua "$VERSION" dist
+          # (its own directory: write_bundles reads every dist/*.sha256 as a runtime's)
+          bash eval/release/eval_kit.sh "$VERSION" kit
+          luajit eval/release/write_evalkit.lua "$VERSION" kit
           sed -i "s/^## \[$VERSION\] — unreleased/## [$VERSION] — $(date -u +%Y-%m-%d)/" CHANGELOG.md
-          git add luamemo/embedders/native/bundles.lua CHANGELOG.md
-          git commit -m "release: v$VERSION (prebuilt GGUF runtime checksums, CHANGELOG date)"
+          git add luamemo/embedders/native/bundles.lua luamemo/evalkit.lua CHANGELOG.md
+          git commit -m "release: v$VERSION (prebuilt GGUF runtime and eval kit checksums, CHANGELOG date)"
           git tag -a "v$VERSION" -m "luamemo $VERSION"
           git push origin "v$VERSION"
 
@@ -119,7 +125,8 @@ jobs:
         run: |
           awk -v v="$VERSION" '$0 ~ "^## \\[" v "\\]" {on=1; next} on && /^## \[/ {exit} on' CHANGELOG.md > notes.md
           gh release create "v$VERSION" --title "luamemo $VERSION" --notes-file notes.md --verify-tag \
-            "luamemo-$VERSION-1.src.rock" "luamemo-$VERSION-1.rockspec" dist/*.tar.gz dist/*.sha256
+            "luamemo-$VERSION-1.src.rock" "luamemo-$VERSION-1.rockspec" dist/*.tar.gz dist/*.sha256 \
+            kit/*.tar.gz kit/*.sha256
 
       - name: luarocks.org
         if: inputs.publish
@@ -129,3 +136,43 @@ jobs:
           [[ -n "$LUAROCKS_API_KEY" ]] || { echo "::error::the repository secret LUAROCKS_API_KEY is not set"; exit 1; }
           # Uploads the rockspec and the source rock it packs from the tag (as above).
           luarocks upload "luamemo-$VERSION-1.rockspec" --api-key="$LUAROCKS_API_KEY"
+
+      # luarocks.org takes the module's summary and description from the FIRST rockspec uploaded and never updates them
+      # from a later one, and the site has no API for it (an API key reaches only the upload endpoints; the edit form needs
+      # a login session and a CSRF token). So this only CHECKS: when the page's summary differs from the rockspec's, it
+      # warns and puts the text to paste, and the edit link, into the job summary. It never fails the release.
+      - name: luarocks.org module text (check only)
+        if: inputs.publish
+        continue-on-error: true
+        env:
+          LUAROCKS_USER: ${{ github.repository_owner }}
+        run: |
+          mkdir -p lrtext
+          luajit eval/release/luarocks_text.lua "luamemo-$VERSION-1.rockspec" lrtext
+          url="https://luarocks.org/modules/$LUAROCKS_USER/luamemo"
+          page=$(curl -fsS --max-time 30 "$url") || { echo "::warning::could not read $url — check the module text by hand"; exit 0; }
+          decode() { sed -e 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g' -e "s/&#39;/'/g"; }
+          live=$(printf '%s' "$page" | grep -o '<p class="module_summary">[^<]*</p>' | head -1 | sed -e 's/<[^>]*>//g' | decode)
+          if [[ "$live" == "$(cat lrtext/summary.txt)" ]]; then
+            echo "the module summary on luarocks.org matches the rockspec"
+            exit 0
+          fi
+          echo "::warning::the luarocks.org module text differs from the rockspec — edit it at https://luarocks.org/edit/modules/$LUAROCKS_USER/luamemo (text in the job summary)"
+          {
+            echo "### luarocks.org module text is out of date"
+            echo
+            echo "Edit it at https://luarocks.org/edit/modules/$LUAROCKS_USER/luamemo (an upload never updates it)."
+            echo
+            echo "Live summary: \`$live\`"
+            echo
+            echo "**Summary** ($(wc -c < lrtext/summary.txt) bytes; the site's limit is 512 characters):"
+            echo '```'
+            cat lrtext/summary.txt
+            echo
+            echo '```'
+            echo
+            echo "**Description** ($(wc -c < lrtext/description.txt) bytes; the site's limit is 5120 characters):"
+            echo '```'
+            cat lrtext/description.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

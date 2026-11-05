@@ -119,6 +119,15 @@ else
     end
 end
 
+-- A '''-quoted docstring used to crash the parser ("unfinished capture").
+do
+    local ok, res = pcall(parser.parse_source,
+        "def g():\n    '''Does a thing.'''\n    pass\n", "x.py")
+    local g = ok and find(res.symbols, "g")
+    if g and g.docstring == "Does a thing." then pass("python: ''' docstring extracted")
+    else fail("python: ''' docstring: " .. tostring(ok and (g and g.docstring) or res)) end
+end
+
 -- ---------------------------------------------------------------------------
 -- Test 3: JavaScript parser
 -- ---------------------------------------------------------------------------
