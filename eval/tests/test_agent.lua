@@ -394,8 +394,9 @@ section("transcript hooks: whose they are decides whether they stay; uninstall a
     local prefix = w6.dir .. "/prefix"
     os.execute(("mkdir -p %q && cp %q %q/memo && ln -s %q %q/mcp && ln -s %q %q/hooks"):format(prefix .. "/bin", MEMO, prefix .. "/bin",
         REPO .. "/mcp", prefix, REPO .. "/hooks", prefix))
-    local doctor = H.sh(("cd %q && env -i HOME=%q PATH=%q XDG_DATA_HOME=%q MEMO_DB=%q MEMO_SCOPE=%s MEMO_EMBEDDER=hash MEMO_PROJECT=%q bash %q doctor </dev/null")
-        :format(w6.proj, w6.home, lua_dir .. ":" .. H.sys_path(), w6.data, os.getenv("MEMO_DB"), w6.scope, w6.proj, prefix .. "/bin/memo"))
+    -- (LUA_PATH: luamemo's modules come from this checkout — a machine with no rock installed, like CI, has them nowhere else)
+    local doctor = H.sh(("cd %q && env -i HOME=%q PATH=%q LUA_PATH=%q XDG_DATA_HOME=%q MEMO_DB=%q MEMO_SCOPE=%s MEMO_EMBEDDER=hash MEMO_PROJECT=%q bash %q doctor </dev/null")
+        :format(w6.proj, w6.home, lua_dir .. ":" .. H.sys_path(), REPO .. "/?.lua;" .. REPO .. "/?/init.lua;;", w6.data, os.getenv("MEMO_DB"), w6.scope, w6.proj, prefix .. "/bin/memo"))
     check("memo doctor (an installed layout) warns about a hook copy older than the installed luamemo",
         doctor:find("Claude Code hooks out of date", 1, true) ~= nil and doctor:find("user_prompt.sh", 1, true) ~= nil, doctor)
 end)
