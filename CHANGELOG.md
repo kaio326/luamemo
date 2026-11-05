@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.5.2] — unreleased
+## [0.5.2] — 2026-11-05
 
 - Fixed: the Python parser crashed ("unfinished capture") on a `'''`-quoted docstring, which stopped any
   index run over a tree that contained one; the corpus build also skips (and logs) a source whose ingest fails.

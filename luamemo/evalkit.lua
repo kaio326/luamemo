@@ -1,7 +1,8 @@
--- luamemo/evalkit.lua — the SHA-256 of this release's eval kit (eval/release/eval_kit.sh
--- builds it; `memo eval install` checks the download against it). Empty in a checkout:
--- the release workflow writes the release's checksum here, in the commit its tag points
--- to, so a rock carries exactly its own (as bundles.lua does for the GGUF runtimes).
---   { version = "<version>", sha256 = "<hex>", asset = "luamemo-evalkit-<version>.tar.gz" }
+-- luamemo/evalkit.lua — the SHA-256 of this release's eval kit, written by
+-- eval/release/write_evalkit.lua (`memo eval install` checks the download against it).
 -- Used only when `version` is luamemo.VERSION.
-return {}
+return {
+    version = "0.5.2",
+    sha256  = "0ea0b7af11bd54713ead7931c4bc72a604a584aa29a03bd48386509b54d6fc4b",
+    asset   = "luamemo-evalkit-0.5.2.tar.gz",
+}
