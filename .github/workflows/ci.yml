@@ -29,7 +29,7 @@ jobs:
           - os: ubuntu-24.04
             experimental: false
             cjson: true
-          - os: macos-14
+          - os: macos-15   # (arm64; GitHub retired macos-14 on 2026-11-02)
             experimental: true
             cjson: false
     steps:
