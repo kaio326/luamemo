@@ -219,7 +219,7 @@ section("import-notes: the project's Claude Code memory notes become luamemo mem
     put(nd .. "/MEMORY.md", "# Memory Index\n- [a](feedback-sed.md)\n")
     local dry, dcode = w.run("import-notes --dry-run")
     check("--dry-run counts the notes and moves nothing", dcode == 0 and dry:find("2 note(s)", 1, true) ~= nil
-        and H.sh(("ls %q | wc -l"):format(nd)) == "3", dry)
+        and H.sh(("ls %q | wc -l | tr -d ' '"):format(nd)) == "3", dry)   -- (macOS's wc pads the number with spaces)
     local st = w.run("status")
     check("status names the notes still in files", st:find("2 Claude Code memory note(s) not in luamemo", 1, true) ~= nil, st)
     local out, code = w.run("import-notes")
@@ -235,7 +235,7 @@ section("import-notes: the project's Claude Code memory notes become luamemo mem
     local archive = nd .. "/../memory-archive-" .. os.date("%Y-%m-%d")
     check("the originals moved to memory-archive-DATE, the user's own index with them; MEMORY.md is a pointer to luamemo",
         H.sh(("ls %q"):format(nd)) == "MEMORY.md" and slurp(nd .. "/MEMORY.md"):find("lives in luamemo", 1, true) ~= nil
-        and H.sh(("ls %q | wc -l"):format(archive)) == "3" and slurp(archive .. "/MEMORY.md"):find("[a](feedback-sed.md)", 1, true) ~= nil)
+        and H.sh(("ls %q | wc -l | tr -d ' '"):format(archive)) == "3" and slurp(archive .. "/MEMORY.md"):find("[a](feedback-sed.md)", 1, true) ~= nil)
     local again = w.run("import-notes")
     check("run again: no notes, nothing imported twice", again:find("no Claude Code memory notes", 1, true) ~= nil
         and tonumber(db.value("SELECT count(*) FROM lm_memories WHERE scope = ?", w.scope)) == 2, again)
