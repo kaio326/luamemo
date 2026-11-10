@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.5.3] — unreleased
+## [0.5.3] — 2026-11-10
 
 A bug-fix release for the learned reranker (`MEMO_RERANK_ADAPTER=learned`). With any other reranker, nothing changes
 except the usage log's retention and, for a dev sharing queries with an organization, the time pushed with each event
