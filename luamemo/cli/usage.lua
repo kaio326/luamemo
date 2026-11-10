@@ -149,8 +149,8 @@ local function text(r)
     put(("usage log, last %d days%s"):format(r.days, r.scope and (" · scope " .. r.scope) or ""))
     if r.retention_days then
         put(r.retention_days > 0
-            and ("the log keeps a search %d days (MEMO_FEEDBACK_RETENTION_DAYS), longer for the newest %d that offered a memory with a recorded reinforcement")
-                :format(r.retention_days, feedback.KEEP_PER_REINFORCED)
+            and ("the log keeps a search %d days (MEMO_FEEDBACK_RETENTION_DAYS), longer for one a reinforcement labels (the learned reranker trains on those)")
+                :format(r.retention_days)
             or "the log keeps every search (MEMO_FEEDBACK_RETENTION_DAYS=0)")
         if r.retention_days > 0 and r.days > r.retention_days then
             put(("  (asked for %d days, so older searches are not there)"):format(r.days))

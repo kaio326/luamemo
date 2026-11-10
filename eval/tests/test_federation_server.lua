@@ -307,12 +307,42 @@ check("ingest: org candidates only, attributed", rf and rf.source == "user:bob@c
 local r4 = central.ingest_feedback("user:bob@corp.io", body, "user:bob@corp.io")
 check("re-push: all duplicates, nothing re-applied", r4.accepted_events == 0 and r4.duplicates == 3
     and tonumber(row(R1.id).importance) == imp1)
+-- when it happened on the dev's machine: the learner's labels are made of these times
+local now_us = require("luamemo.util").now_us
+local T0 = now_us() - 3600 * 1000000
+local us = require("luamemo.federation.common").us_str
+local rat = central.ingest_feedback("user:bob@corp.io", { share = "triples",
+    events = { { ref = "bob:e-at", memory = R2.id, type = "praise", at = us(T0) },
+               { ref = "bob:e-future", memory = R2.id, type = "praise", at = us(now_us() + 7200 * 1000000) },
+               { ref = "bob:e-junk", memory = R2.id, type = "praise", at = "yesterday" },
+               { ref = "bob:e-zero", memory = R2.id, type = "praise", at = "0" },
+               { ref = "bob:e-number", memory = R2.id, type = "praise", at = 1700000000 },   -- (a JSON number: only a decimal string counts)
+               { ref = "bob:e-none", memory = R2.id, type = "praise" } },
+    retrievals = { { ref = "bob:r-at", query = "document the public api", candidates = { R2.id, R1.id }, at = us(T0 - 60 * 1000000) },
+                   { ref = "bob:r-junk", query = "a search with a bad time", candidates = { R2.id, R1.id }, at = "soon" } } },
+    "user:bob@corp.io")
+local function at_of(tbl, ref) return tonumber((db.value("SELECT created_at FROM " .. tbl .. " WHERE source_ref = ?", ref))) end
+check("ingest: accepted with their times", rat and rat.accepted_events == 6 and rat.accepted_retrievals == 2, rat and json.encode(rat))
+check("ingest: an event keeps the time it happened", at_of("lm_reinforcements", "bob:e-at") == T0, at_of("lm_reinforcements", "bob:e-at"))
+check("ingest: so does a search", at_of("lm_retrieval_feedback", "bob:r-at") == T0 - 60 * 1000000)
+local arrival = now_us()
+for _, ref in ipairs({ "bob:e-future", "bob:e-junk", "bob:e-zero", "bob:e-number", "bob:e-none" }) do
+    local t = at_of("lm_reinforcements", ref)
+    check("ingest: a bad or absent time is the arrival time (" .. ref .. ")", t <= arrival and t > T0, t)
+end
+check("ingest: and for a search too", at_of("lm_retrieval_feedback", "bob:r-junk") > T0)
+local found
+for _, t in ipairs(require("luamemo.feedback").harvest("org:fedsrv", {})) do
+    if t.query == "document the public api" and tonumber(t.positive) == R2.id then found = t end
+end
+check("a pushed confirmation is labelled by the search before it", found ~= nil and found.at == T0 - 60 * 1000000, found and tostring(found.at))
 local r5 = central.ingest_feedback("user:bob@corp.io", { share = "signals",
-    events = { { ref = "bob:e-sig", memory = R2.id, type = "praise", note = "private context" } },
+    events = { { ref = "bob:e-sig", memory = R2.id, type = "praise", note = "private context", at = us(T0) } },
     retrievals = { { ref = "bob:r2", query = "x", candidates = { R1.id } } } }, "user:bob@corp.io")
 local nrow = db.query("SELECT note FROM lm_reinforcements WHERE source_ref = 'bob:e-sig'")
 check("signals: retrievals ignored, event kept, its note dropped", r5.accepted_retrievals == 0
     and nrow and nrow[1] and nrow[1].note == nil)
+check("signals: a time the client sent anyway is not kept (the arrival time is)", at_of("lm_reinforcements", "bob:e-sig") > T0)
 check("attribution: other identity than the credential's → 403",
     select(3, central.ingest_feedback("user:eve@corp.io", { events = {} }, "user:bob@corp.io")) == 403)
 local many = {}

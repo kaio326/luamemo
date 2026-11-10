@@ -979,8 +979,10 @@ cmd_sense() {
 }
 
 # memo learn <scope> — per-scope promotion harness (Phase 11). Harvests the
-# scope's feedback, trains the reranker, gates on a held-out split, and promotes
-# only if it beats the incumbent. --dry-run trains + gates but never promotes.
+# scope's feedback, trains the reranker, gates on a held-out split and on memories'
+# own titles, and promotes only if it beats the incumbent and finds at least as many of
+# them first (a scope with too few to check is skipped). --dry-run trains + gates but
+# never promotes or records anything.
 cmd_learn() {
     require_jq
     local json='{}'

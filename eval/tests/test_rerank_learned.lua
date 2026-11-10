@@ -1,18 +1,13 @@
 -- eval/tests/test_rerank_learned.lua
--- Phase 4 — learned reranker MACHINERY (not the win): adapter, trainer, weight
--- lifecycle. These assert correctness/safety; whether a trained model beats the
+-- Phase 4 — learned reranker MACHINERY (not the win): adapter and trainer.
+-- These assert correctness/safety; whether a trained model beats the
 -- baseline on real data is measured by eval/rerank_bench.lua (a gate, not a unit
 -- test). No DB required.
 --
 -- Usage:
---   luajit eval/tests/run.lua --only rerank_learned   (it sets MEMO_RERANK_WEIGHTS to a scratch path)
+--   luajit eval/tests/run.lua --only rerank_learned
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
-
--- Isolate the weight artifact to a scratch path so we never touch a real one.
-if not os.getenv("MEMO_RERANK_WEIGHTS") or os.getenv("MEMO_RERANK_WEIGHTS") == "" then
-    io.stderr:write("set MEMO_RERANK_WEIGHTS to a scratch path before running\n"); os.exit(2)
-end
 
 local learned = require("luamemo.rerankers.learned")
 local trainer = require("luamemo.rerank_train")
@@ -63,29 +58,6 @@ check("training reduces pairwise loss", loss1 < loss0, string.format("%.4f -> %.
 check("learned weight on the separating feature is positive", (w.vec_score or 0) > 0, tostring(w.vec_score))
 check("positive now outscores negatives in pool 1",
     learned.score_one(w, examples[1].features[1]) > learned.score_one(w, examples[1].features[2]))
-
--- =========================================================================
-header("Section 3 — versioned weight lifecycle (promote / rollback)")
-
-os.remove(os.getenv("MEMO_RERANK_WEIGHTS"))
-learned.reset_cache()
-check("load_current is nil on empty artifact", trainer.load_current() == nil)
-
-local wA = trainer.prior();  wA.vec_score = 0.5
-local wB = trainer.prior();  wB.vec_score = 0.9
-local idA = trainer.save_version(wA, { score = 0.60 })
-local idB = trainer.save_version(wB, { score = 0.71 })
-check("save_version returns distinct ids", idA ~= idB, idA .. "," .. idB)
-check("saving does not auto-promote", trainer.load_current() == nil)
-
-trainer.promote(idA)
-check("promote A => current is A's weights", (trainer.load_current() or {}).vec_score == 0.5)
-trainer.promote(idB)
-check("promote B => current is B's weights", (trainer.load_current() or {}).vec_score == 0.9)
-local restored = trainer.rollback()
-check("rollback restores the previously-current version (A)", restored == idA and (trainer.load_current() or {}).vec_score == 0.5)
-
-os.remove(os.getenv("MEMO_RERANK_WEIGHTS"))
 
 -- =========================================================================
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))

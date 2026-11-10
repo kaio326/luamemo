@@ -23,54 +23,25 @@ local M = {}
 M.DIRECTIVE_K = 3
 M.MAX_DIRECTIVES = 500          -- probes per gate run (bounded cost)
 
--- Rank (1-based) of the positive under `weights` (ties rank the positive first).
-local function rank_of(learned, weights, ex)
-    local sp = learned.score_one(weights, ex.features[ex.positive])
-    local r = 1
-    for j, fv in ipairs(ex.features) do
-        if j ~= ex.positive and learned.score_one(weights, fv) > sp then r = r + 1 end
-    end
-    return r
+--- Probe examples: one per directive whose unreranked candidate pool contains it → examples, unreachable.
+function M.directive_probes(scope, opts)
+    local rows, err = db.query("SELECT id, title FROM lm_memories WHERE scope = ? AND tier = 3 "
+        .. "ORDER BY id LIMIT ?", scope, M.MAX_DIRECTIVES)
+    if not rows then error("directive_probes: " .. tostring(err), 0) end   -- (a gate that raises fails closed)
+    return require("luamemo.probes").examples(scope, rows, opts)
 end
 
---- Probe examples: one per directive whose unreranked candidate pool contains it.
-function M.directive_probes(scope, reuse, opts)
-    opts = opts or {}
-    local store   = require("luamemo.store")
-    local learned = require("luamemo.rerankers.learned")
-    local rows = db.query("SELECT id, title FROM lm_memories WHERE scope = ? AND tier = 3 "
-        .. "ORDER BY id LIMIT ?", scope, M.MAX_DIRECTIVES) or {}
-    local probes, unreachable = {}, 0
-    for _, d in ipairs(rows) do
-        local hits = (d.title and d.title ~= "") and store.search({
-            query = d.title, scope = scope, limit = tonumber(opts.candidate_limit) or 20,
-            skip_temporal = true, skip_observations = true, rerank = false, skip_feedback = true }) or {}
-        local p
-        for i, h in ipairs(hits) do
-            h.reuse_count = (reuse and reuse[tonumber(h.id)]) or 0
-            if tonumber(h.id) == tonumber(d.id) then p = i end
-        end
-        if p and #hits > 1 then
-            probes[#probes + 1] = { id = tonumber(d.id), title = d.title,
-                                    features = learned.pool_features(hits), positive = p }
-        elseif not p then
-            unreachable = unreachable + 1     -- a retrieval miss no reranker can fix
-        end
-    end
-    return probes, unreachable
-end
-
---- The gate (promote.run `gates` entry): ctx = { scope, candidate, incumbent, reuse, opts }.
+--- The gate (promote.run `gates` entry): ctx = { scope, candidate, incumbent, opts }.
 function M.directives_gate(ctx)
-    local learned = require("luamemo.rerankers.learned")
+    local rank_of = require("luamemo.probes").rank_of
     local k = math.max(1, math.floor(tonumber(ctx.opts and ctx.opts.directive_k) or M.DIRECTIVE_K))
-    local probes, unreachable = M.directive_probes(ctx.scope, ctx.reuse, ctx.opts)
+    local probes, unreachable = M.directive_probes(ctx.scope, ctx.opts)
     if #probes == 0 then
         return true, ("no directive probes (%d unreachable by retrieval)"):format(unreachable)
     end
     local hit_new, hit_inc, demoted = 0, 0, {}
     for _, ex in ipairs(probes) do
-        local rn, ri = rank_of(learned, ctx.candidate, ex), rank_of(learned, ctx.incumbent, ex)
+        local rn, ri = rank_of(ctx.candidate, ex), rank_of(ctx.incumbent, ex)
         if rn <= k then hit_new = hit_new + 1 end
         if ri <= k then hit_inc = hit_inc + 1 end
         if ri <= k and rn > k then demoted[#demoted + 1] = ("%q (rank %d → %d)"):format(ex.title, ri, rn) end
@@ -115,6 +86,9 @@ function M.run(opts)
     report.promotion = require("luamemo.promote").run(scope, {
         dry_run = opts.dry_run, min_samples = opts.min_samples, margin = opts.margin,
         directive_k = opts.directive_k, note = "org aggregate",
+        -- (a dev serves this model with its own confirmations only: the team's counts, which the central sees, are not
+        -- on its machine, so the model may not lean on them)
+        reuse = false,
         gates = { { name = "directives", fn = M.directives_gate } },
     })
     return report

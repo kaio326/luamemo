@@ -64,12 +64,15 @@ function M.info()
     }
 end
 
--- Microsecond timestamps (the stored values) travel as decimal STRINGS: JSON encoders (cjson and
--- dkjson alike) emit 14 significant digits, which would round a ~1.8e15 µs
--- value to ~100 µs — breaking exact version compares and row-derived cursors.
-local function us_str(v)
-    local n = tonumber(v)
-    return n and ("%d"):format(n) or nil
+local us_str = common.us_str
+
+-- When a pushed event or search happened on the dev's machine (µs, a decimal string): the learner pairs a confirmation with
+-- the search just before it, so arrival order will not do. Not trusted further than that: never the future; none or
+-- nonsense (a dev from before 0.5.3) is the arrival time, and those rows pair only as the pushes happened to arrive.
+local function happened(v)
+    local now = util.now_us()
+    local t = type(v) == "string" and v:match("^%d+$") and tonumber(v)
+    return (t and t > 0 and t <= now) and t or now
 end
 
 -- ids param: "1,2,3" / array → validated positive ints (≤ MAX_PAGE); false if malformed.
@@ -252,7 +255,7 @@ function M.ingest_feedback(dev_identity, payload, bound)
                 .. "(memory_id, scope, event_type, delta, note, source, source_ref, created_at) "
                 .. "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 .. "ON CONFLICT (source, source_ref) WHERE source_ref IS NOT NULL DO NOTHING RETURNING id",
-                mid, scope, kind, delta, note, dev_identity, ref, util.now_us())
+                mid, scope, kind, delta, note, dev_identity, ref, happened(share == "triples" and e.at or nil))   -- (signals: no searches to pair with)
             if rows and rows[1] then
                 res.accepted_events = res.accepted_events + 1
                 digest.apply_event_effect(mid, scope, kind, delta)   -- once: only on a new row
@@ -285,7 +288,7 @@ function M.ingest_feedback(dev_identity, payload, bound)
                     .. "(scope, query, candidate_ids, source, source_ref, created_at) "
                     .. "VALUES (?, ?, ?, ?, ?, ?) "
                     .. "ON CONFLICT (source, source_ref) WHERE source_ref IS NOT NULL DO NOTHING RETURNING id",
-                    scope, query, db.json(cands), dev_identity, ref, util.now_us())
+                    scope, query, db.json(cands), dev_identity, ref, happened(r.at))
                 if rows and rows[1] then
                     res.accepted_retrievals = res.accepted_retrievals + 1
                     -- The dev's top result was this org row: its decay clock restarts.

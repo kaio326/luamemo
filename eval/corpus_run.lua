@@ -169,6 +169,15 @@ local function run_learned()
     local qs = eval_queries(" AND holdout = 0 AND scope IN (SELECT DISTINCT scope FROM lm_reinforcements)")
     io.stderr:write(("  %d eval queries in projects with a history\n"):format(#qs))
 
+    -- A query whose right answer nobody ever confirmed is where a learned ranking can do harm unseen by its labels.
+    local positive = require("luamemo.feedback").POSITIVE_SQL
+    local unconfirmed = {}
+    for i, q in ipairs(qs) do
+        local in_ids, ids = db.in_list(json.decode(q.gold_ids))
+        unconfirmed[i] = tonumber(db.value("SELECT count(*) FROM lm_reinforcements WHERE memory_id IN " .. in_ids
+            .. " AND event_type IN " .. positive, ids)) == 0
+    end
+
     local base, by_scope = {}, {}
     for i, q in ipairs(qs) do
         local rows = search(q, { rerank = false })
@@ -190,12 +199,18 @@ local function run_learned()
     for pt in args.points:gmatch("%d+") do
         local limit = tonumber(pt)
         db.run("DELETE FROM lm_learner_weights"); db.run("DELETE FROM lm_promotion_runs")
-        local promoted, rejected, skipped = {}, 0, 0
+        local promoted, rejected, skipped, by_probes = {}, 0, 0, 0
         for _, s in ipairs(scopes) do
-            local d = promote.run(s, { harvest_limit = limit, min_samples = 20, candidate_limit = 20 })
-            if d.decision == "promote" then promoted[s] = true elseif d.decision == "reject" then rejected = rejected + 1 else skipped = skipped + 1 end
+            local d = promote.run(s, { harvest_limit = limit, min_samples = 20 })
+            if d.decision == "promote" then promoted[s] = true
+            elseif d.decision == "reject" then
+                rejected = rejected + 1
+                local last = d.gates and d.gates[#d.gates]
+                if last and last.name == "probes" and not last.pass then by_probes = by_probes + 1 end
+            else skipped = skipped + 1 end
         end
         local n, d1, drr, diffs = 0, 0, 0, {}
+        local n_un, d1_un = 0, 0
         -- (the reranker keeps each scope's weights in memory for the life of the process: without this the
         -- second and third points would be searched with the first point's weights)
         require("luamemo.rerankers.learned").reset_cache()
@@ -207,6 +222,7 @@ local function run_learned()
                 n = n + 1
                 d1 = d1 + (r1(rank) - r1(base[i])); drr = drr + (rr(rank) - rr(base[i]))
                 diffs[#diffs + 1] = r1(rank) - r1(base[i])
+                if unconfirmed[i] then n_un = n_un + 1; d1_un = d1_un + (r1(rank) - r1(base[i])) end
             end
         end
         memory.config.rerank_enabled = false
@@ -216,11 +232,12 @@ local function run_learned()
         local ci = n > 1 and 1.96 * math.sqrt(var / (n - 1) / n) or nil
         local npromoted = 0
         for _ in pairs(promoted) do npromoted = npromoted + 1 end
-        local point = { outcomes = limit, scopes_promoted = npromoted, scopes_rejected = rejected, scopes_skipped = skipped,
-                        n_eval = n, d_recall1 = mean, d_recall1_ci95 = ci, d_mrr = n > 0 and drr / n or 0 }
+        local point = { outcomes = limit, scopes_promoted = npromoted, scopes_rejected = rejected, scopes_rejected_by_probes = by_probes,
+                        scopes_skipped = skipped, n_eval = n, d_recall1 = mean, d_recall1_ci95 = ci, d_mrr = n > 0 and drr / n or 0,
+                        n_unconfirmed = n_un, d_recall1_unconfirmed = n_un > 0 and d1_un / n_un or 0 }
         result.curve[#result.curve + 1] = point
-        io.stderr:write(("  %6d outcomes: %d promoted / %d rejected / %d skipped; ΔR@1 %+.2f pts (±%.2f) over %d queries\n"):format(
-            limit, npromoted, rejected, skipped, mean * 100, (ci or 0) * 100, n))
+        io.stderr:write(("  %6d outcomes: %d promoted / %d rejected (%d by the probes) / %d skipped; ΔR@1 %+.2f pts (±%.2f) over %d queries; on %d whose answer nobody confirmed %+.2f pts\n"):format(
+            limit, npromoted, rejected, by_probes, skipped, mean * 100, (ci or 0) * 100, n, n_un, point.d_recall1_unconfirmed * 100))
         result.overall["learned_promoted_" .. pt] = npromoted
         result.overall["learned_d_r1_" .. pt] = mean
         result.overall["learned_n_eval_" .. pt] = n

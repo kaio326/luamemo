@@ -125,7 +125,8 @@ defines (`index_outline`) before grepping or reading files. See
 standing rules and praise (`memory_sense`); a write that duplicates an existing
 memory reveals a search that missed it. A per-scope learned reranker trains on
 those signals and is promoted only when it beats the current one on held-out
-data. See [Learning from use](#learning-from-use).
+data and finds at least as many memories first by their own titles. See
+[Learning from use](#learning-from-use).
 
 **Knows what is true now.** Facts that change over time — a rule, a preference,
 a version — are kept as `(subject, predicate, object)` triples with validity
@@ -439,9 +440,9 @@ help.
 the text of every search, its scope and the ids it returned, in the project's
 database (and, if the project has joined an organization with `MEMO_ORG_SHARE=triples`,
 the queries behind confirmed memories go there too). A search is removed after
-`MEMO_FEEDBACK_RETENTION_DAYS` (90; 0 keeps everything) unless it is one of the newest
-20 (per scope) that offered a memory with a recorded reinforcement (praise, direct command, mistake,
-reversal or miss) — those are the learner's training examples. `memo doctor` says whether the log is on, how much it holds and for how
+`MEMO_FEEDBACK_RETENTION_DAYS` (90; 0 keeps everything) unless a reinforcement labels it:
+it is the newest search offering that memory in the 10 minutes before a praise, direct command,
+mistake or miss — those are the learner's training examples. `memo doctor` says whether the log is on, how much it holds and for how
 long; `memo usage` reads it, says whose miss a miss was (the ranking's, an ignored
 result, or no search first) and when there are too few searches to read the rates.
 
@@ -462,7 +463,10 @@ result, or no search first) and when there are too few searches to read the rate
 3. **Gated promotion.** `memo learn <scope>` (or `memory_learn`) turns the
    scope's feedback into training examples, trains a learned reranker and
    compares it with the current one on held-out data — promoting it **only if
-   it is better**. Versions are kept per scope; `--status` lists them,
+   it is better and finds at least as many memories first by their own titles**.
+   A confirmation trains on the search just before it, with the confirmation count
+   as of that search; the rest of the example is rebuilt from today's memories.
+   Versions are kept per scope; `--status` lists them,
    `--rollback` goes back one; every run is recorded. Where the learned
    reranker is chosen (`MEMO_RERANK_ADAPTER=learned`, with the usage log on) the
    background `memo maintain` does this for you, at most weekly per scope; the
@@ -658,10 +662,10 @@ the replica exact. The central's vectors are reused when both sides embed alike,
 else rows are re-embedded locally. A failed pull keeps the last replica.
 
 **Up (feedback).** Reinforcements on org memories — and, with the default
-`MEMO_ORG_SHARE=triples`, the searches behind them — are pushed and attributed
-to the identity the device paired with, never to what a push claims. With
-`MEMO_ORG_SHARE=signals` no query text, note or proposal ever leaves the
-machine.
+`MEMO_ORG_SHARE=triples`, the searches behind them and when each happened — are
+pushed and attributed to the identity the device paired with, never to what a
+push claims. With `MEMO_ORG_SHARE=signals` no query text, note, proposal or event
+time ever leaves the machine.
 
 **Knowledge proposals (dev → admin → org).** A dev never pushes its memories
 wholesale. A deterministic filter (no LLM) proposes a memory only if it is a fact

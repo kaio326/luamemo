@@ -136,7 +136,7 @@ memory's id, scope, kind, title and tier, not the text the agent just sent, and 
 | Tool | Parameters | Notes |
 |---|---|---|
 | `memory_sense` | `turns` (`[{role, text}]`, oldest first), `scope`, `generative`, `min_similarity` | Corrections, standing rules and praise from the conversation the agent relays, recorded on the memories they concern; a standing rule no memory holds is stored as a `decision` (`captured`, `captured_ids` in the result; `MEMO_SENSE_CAPTURE`). Idempotent |
-| `memory_learn` | `action` (`run`, `status`, `rollback`), `scope`, `dry_run`, `min_samples`, `margin` | The scope's learned reranker: trained on that feedback, promoted only if it beats the current one on held-out data |
+| `memory_learn` | `action` (`run`, `status`, `rollback`), `scope`, `dry_run`, `min_samples`, `margin` | The scope's learned reranker: trained on that feedback, promoted only if it beats the current one on held-out data and finds at least as many memories first by their own titles |
 | `memory_tune_weights` | `scope`, `samples` (50), `metric` (`r_at_1`, `r_at_3`, `r_at_5`, `r_at_10`, `mrr`) | Which vector / full-text blend finds the scope's memories best — a report with the `memo config set` command a person runs to apply it |
 | `memory_embed` | `text`, `compare_to`, `include_vector` | The embedder's model and vector size; the cosine of two texts |
 

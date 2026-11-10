@@ -142,7 +142,7 @@ second pass that re-scores the hybrid top N against the query.
 | Adapter | Cost | Notes |
 |---|---|---|
 | `noop` | ~zero, in-process | Word overlap between query and memory. A surprisingly strong baseline |
-| `learned` | ~zero, in-process | Trained per scope on how memories were used ([README → Learning from use](README.md#learning-from-use)); `memo learn` promotes it only when it beats the current one. Needs `MEMO_FEEDBACK_ENABLED=true` (off by default); until a model is promoted the order is unchanged |
+| `learned` | ~zero, in-process | Trained per scope on how memories were used ([README → Learning from use](README.md#learning-from-use)); `memo learn` promotes it only when it beats the current one and finds at least as many memories first by their own titles. Needs `MEMO_FEEDBACK_ENABLED=true` (off by default); until a model is promoted the order is unchanged |
 | `ollama` | a local LLM call | Ollama with JSON output (`MEMO_RERANK_MODEL`, default `llama3.2`) |
 | `openai` | a hosted LLM call | OpenAI chat completions with JSON output; the key as `{secret:NAME}` in `MEMO_RERANK_HEADERS` |
 | `cross_encoder` | a sidecar call | A TEI / Cohere / Jina `/rerank` endpoint |

@@ -289,6 +289,31 @@ function H.visible(scope)
     return H.count("SELECT count(*) FROM lm_memories WHERE scope = ? AND tier >= 1 AND json_type(metadata, '$.lm_fold') IS NULL", scope)
 end
 
+--- Write `n` titled memories in `scope` that say different things and that nobody has confirmed → their ids (a write that
+--- fails raises). opts: title, body (prefixes), importance. For the promotion gate, 2 * probes.MIN_GATE + 4 fills its probes.
+function H.filler_memories(scope, n, opts)
+    opts = opts or {}
+    local ids = {}
+    for i = 1, n do
+        local row = assert(require("luamemo.store").write({ scope = scope, title = (opts.title or "background note") .. " " .. i,
+            body = (opts.body or "unconfirmed background fact number") .. " " .. i * 7919, importance = opts.importance, dedup_strategy = "append" }))
+        ids[i] = tonumber(row.id)
+    end
+    return ids
+end
+
+--- One row of the usage log as a device or a dev's push would leave it (source and ref nil: this device). A failed insert raises.
+function H.search_row(scope, query, ids, source, ref, at)
+    local db = require("luamemo.db")
+    assert(db.run("INSERT INTO lm_retrieval_feedback (scope, query, candidate_ids, source, source_ref, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        scope, query, db.json(ids), source, ref, at))
+end
+--- One reinforcement, likewise.
+function H.event_row(scope, id, kind, source, ref, at)
+    assert(require("luamemo.db").run("INSERT INTO lm_reinforcements (memory_id, scope, event_type, delta, source, source_ref, created_at) VALUES (?, ?, ?, 0.5, ?, ?, ?)",
+        id, scope, kind, source, ref, at))
+end
+
 --- Create database `name` (a new file, the schema applied). Removed by H.drop_dbs().
 --- Returns its path.
 function H.create_db(name)

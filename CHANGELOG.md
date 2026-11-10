@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.5.3] — unreleased
+
+A bug-fix release for the learned reranker (`MEMO_RERANK_ADAPTER=learned`). With any other reranker, nothing changes
+except the usage log's retention and, for a dev sharing queries with an organization, the time pushed with each event
+(both below).
+
+- **Fixed: the learned reranker was trained on a signal search never gave it.** Training told the model how often each
+  memory had been confirmed useful; search did not, so the model's largest weight did nothing in use and the other
+  weights were whatever was left over. On a test corpus that put an off-topic memory first. Search now supplies the
+  signal: one indexed query per search, and only where a promoted model exists.
+- **Fixed: a confirmation trained on searches that had nothing to do with it.** It was paired with the five newest
+  searches that had offered the memory, at any time; on a real log, 90 % of those came after the confirmation. It now
+  labels only the newest search that offered the memory at or before it, within 10 minutes, on the same device. A
+  `reversal` no longer counts as a positive, and a query with a time in it is left out (its results depend on when it ran).
+- **Fixed: the gate approved models it could not judge.** The held-out examples could see their own labels, the split
+  changed between runs, and every example was a case where a confirmed memory should win, so harm to other queries was
+  invisible. Now the split is by query and reproducible, an example's confirmation count is as of when its search ran,
+  training sees the pool `memory_search` sees (no tier-0 rows), and a model must find at least as many memories first by
+  their own titles as the current ranking. A scope with too few memories to check that (fewer than 5 on the gate side) is
+  skipped, not promoted.
+- **Changed: models promoted before this release are not served.** The broken gate judged them, and serving the signal
+  would change what they do. Search keeps its plain order until a new model passes. `memo learn --status` shows
+  `"served": false`, and the rows are kept. Training is automatic where it was on; expect fewer promotions than before.
+- **Removed: `MEMO_RERANK_WEIGHTS`.** The global weights file could only hold models no gate had judged, and nothing in
+  luamemo wrote one. `memo config check` says so if it is still set.
+- **Federation.** A dev sharing queries (`MEMO_ORG_SHARE=triples`) now says when each event and search happened (`at`, an
+  added field: no protocol change), because the central pairs them by time; `signals` sends no time. Rows from a dev that
+  has not upgraded are stored with their arrival time, so they pair only as the pushes happened to arrive. An
+  organization's model trains without the confirmation counts, because a dev has only its own. A dev does not serve a
+  model the central promoted before it upgraded.
+- **Usage log retention.** Past `MEMO_FEEDBACK_RETENTION_DAYS` a search now stays only if a reinforcement labels it (it
+  was the newest 20 per reinforced memory), so the first prune after upgrading can remove more rows than usual.
+
 ## [0.5.2] — unreleased
 
 - Fixed: the Python parser crashed ("unfinished capture") on a `'''`-quoted docstring, which stopped any

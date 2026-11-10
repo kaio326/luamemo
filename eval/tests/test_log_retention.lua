@@ -1,10 +1,10 @@
 -- eval/tests/test_log_retention.lua
 -- The usage log keeps a search MEMO_FEEDBACK_RETENTION_DAYS and no longer — except what something learns from.
---   A. the setting, and what goes: old searches (found something or nothing), what stays: young ones, a search that offered a
---      reinforced memory (the learner's training triples), a row adopted from an organization
+--   A. the setting, and what goes: old searches (found something or nothing), what stays: young ones, a search a reinforcement
+--      labels (the learner's training triples), a row adopted from an organization
 --   B. harvest gives the same triples before and after pruning
 --   C. 0 keeps everything; the daily throttle; `memo maintain` prunes
---   D. only the newest 20 per reinforced memory and scope stay past the retention; a search never prunes (the brief
+--   D. past the retention only the searches a reinforcement labels stay, per scope; a search never prunes (the brief
 --      starts the run that does); a prune that fails says so; `memo doctor` warns when the retention is shorter than
 --      either grace period
 -- Run: luajit eval/tests/run.lua --only log_retention
@@ -34,6 +34,9 @@ end
 
 -- a search logged `days` days ago
 local function log_at(days, fn, ...) return H.at_age(days * DAY, fn, ...) end
+-- a reinforcement, one minute after a search logged `days` days ago: the search is its label
+local MINUTE = 60 * 1000000
+local function label_at(days, id, scope, kind) return H.at_age(days * DAY - MINUTE, feedback.record_reinforcement, id, scope, kind) end
 
 section("the setting", function()
     local d = settings.defaults()
@@ -62,19 +65,21 @@ section("what goes and what stays", function()
     log_at(120, feedback.log_retrieval, scope, "old plain search", { m1.id })
     log_at(120, feedback.log_no_result, scope, "old search that found nothing")
     log_at(120, feedback.log_retrieval, scope, "old search that offered a praised memory", { m2.id })
+    log_at(130, feedback.log_retrieval, scope, "older search of a memory praised much later", { m2.id })
     log_at(10,  feedback.log_retrieval, scope, "young search", { m1.id })
     log_at(120, function()
         db.run("INSERT INTO lm_retrieval_feedback (scope, query, candidate_ids, created_at, source, source_ref) VALUES (?, ?, ?, ?, 'org', 'x1')",
             scope, "old row adopted from an org", db.json({ m1.id }), util.now_us())
     end)
-    feedback.record_reinforcement(m2.id, scope, "praise")
-    check("five rows to start with", logged(scope) == 5, logged(scope))
+    label_at(120, m2.id, scope, "praise")
+    check("six rows to start with", logged(scope) == 6, logged(scope))
 
     local n = feedback.prune()
-    check("pruning removes the old plain search and the old empty one (2)", n == 2, n)
+    check("pruning removes the old plain search, the old empty one, and the one no reinforcement came after (3)", n == 3, n)
     check("… the young one stays", logged(scope, " AND query = 'young search'") == 1)
-    check("… the old one that offered a reinforced memory stays (a training example)",
-        logged(scope, " AND query LIKE '%praised memory'") == 1)
+    check("… the old one a reinforcement labels stays (a training example)",
+        logged(scope, " AND query LIKE '%offered a praised memory'") == 1)
+    check("… a search that offered the memory long before it was praised does not", logged(scope, " AND query LIKE 'older search%'") == 0)
     check("… the old row adopted from an organization stays", logged(scope, " AND query LIKE '%adopted%'") == 1)
     check("its candidate rows follow the removal (cascade)", tonumber(db.value("SELECT count(*) FROM lm_retrieval_candidates c "
         .. "LEFT JOIN lm_retrieval_feedback f ON f.id = c.feedback_id WHERE f.id IS NULL")) == 0)
@@ -88,7 +93,7 @@ section("the learner's training set is the same after pruning", function()
     log_at(200, feedback.log_retrieval, scope, "how do deploys work", { b.id, a.id })
     log_at(200, feedback.log_retrieval, scope, "something nobody confirmed", { b.id })
     log_at(5,   feedback.log_retrieval, scope, "how do rollbacks work", { b.id })
-    feedback.record_reinforcement(a.id, scope, "praise")
+    label_at(200, a.id, scope, "praise")
     local function key(ts)
         local out = {}
         for i, t in ipairs(ts) do out[i] = t.query .. ">" .. tostring(t.positive) .. "/" .. #(t.negatives or {}) end
@@ -102,76 +107,66 @@ section("the learner's training set is the same after pruning", function()
     check("harvest gives the very same triples", before ~= "" and before == after, before .. " vs " .. after)
 end)
 
-section("every kind of reinforcement keeps its searches", function()
+section("every kind of label keeps its search", function()
     setup({})
     local scope = "repo:ret-e"
-    local kinds = { "mistake", "reversal", "direct_command", "miss", "praise" }
+    local labels = { "mistake", "direct_command", "miss", "praise" }
+    local kinds = { labels[1], labels[2], labels[3], labels[4], "reversal" }
     local mems = {}
     for i, k in ipairs(kinds) do
         mems[k] = assert(luamemo.store.write({ scope = scope, title = k, body = "note for the " .. k .. " case, number " .. i,
             dedup_strategy = "append" }))
         log_at(200, feedback.log_retrieval, scope, "old search about " .. k, { mems[k].id })
-        feedback.record_reinforcement(mems[k].id, scope, k)
+        label_at(200, mems[k].id, scope, k)
     end
     local plain = assert(luamemo.store.write({ scope = scope, title = "plain", body = "a note nobody reinforced", dedup_strategy = "append" }))
     log_at(200, feedback.log_retrieval, scope, "old search about the plain one", { plain.id })
     local n = feedback.prune()
-    check("only the search that offered nothing reinforced goes (1 of 6)", n == 1 and logged(scope) == 5, n)
-    for _, k in ipairs(kinds) do
-        check("a search that offered a memory with a '" .. k .. "' stays", logged(scope, " AND query = 'old search about " .. k .. "'") == 1)
+    check("the plain one goes, and so does the reversal's (it is no label) (2 of 6)", n == 2 and logged(scope) == 4, n)
+    for _, k in ipairs(labels) do
+        check("a search labelled by a '" .. k .. "' stays", logged(scope, " AND query = 'old search about " .. k .. "'") == 1)
     end
+    check("a search before a 'reversal' goes", logged(scope, " AND query = 'old search about reversal'") == 0)
 end)
 
-section("past the retention only the newest searches per reinforced memory stay", function()
+section("past the retention only the searches a reinforcement can label stay", function()
     setup({})
     local scope = "repo:ret-f"
     local m = assert(luamemo.store.write({ scope = scope, title = "hot", body = "a memory every search offers", dedup_strategy = "append" }))
-    feedback.record_reinforcement(m.id, scope, "praise")
-    for i = 1, 30 do log_at(100 + i, feedback.log_retrieval, scope, "old search " .. i, { m.id }) end   -- 1 is the newest
+    local other = assert(luamemo.store.write({ scope = scope, title = "cold", body = "a memory offered beside it, never confirmed", dedup_strategy = "append" }))
+    H.at_age(150 * DAY, feedback.record_reinforcement, m.id, scope, "praise")
+    for i = 1, 30 do log_at(100 + i, feedback.log_retrieval, scope, "after the praise " .. i, { m.id }) end
+    H.at_age(150 * DAY + 2 * MINUTE, feedback.log_retrieval, scope, "just before the praise", { m.id, other.id })
+    H.at_age(150 * DAY + 5 * MINUTE, feedback.log_retrieval, scope, "a little before the praise", { m.id, other.id })
+    H.at_age(150 * DAY + 20 * MINUTE, feedback.log_retrieval, scope, "too long before the praise", { m.id })
     log_at(5, feedback.log_retrieval, scope, "a young search", { m.id })
     local before = feedback.harvest(scope)
     local n = feedback.prune()
-    check("31 searches offered it: the newest 20 of all stay (the young one and 19 old), the other 11 old ones go",
-        n == 11 and logged(scope, " AND query LIKE 'old search %'") == 19, n)
-    check("… the ones that stay are the newest", logged(scope, " AND query = 'old search 1'") == 1 and logged(scope, " AND query = 'old search 19'") == 1
-        and logged(scope, " AND query = 'old search 20'") == 0)
+    check("32 old searches offered it and are no label: they go", n == 32 and logged(scope, " AND query LIKE 'after the praise %'") == 0, n)
+    check("the newest one before it is the label, and it stays", logged(scope, " AND query = 'just before the praise'") == 1)
+    check("… an older one in the window is no label and goes", logged(scope, " AND query = 'a little before the praise'") == 0)
+    check("… one further back goes", logged(scope, " AND query = 'too long before the praise'") == 0)
     check("… and the young one stays whatever (it is not old)", logged(scope, " AND query = 'a young search'") == 1)
-    check("the setting's text and `memo usage` name the same number the code keeps (" .. feedback.KEEP_PER_REINFORCED .. ")",
-        settings.get("MEMO_FEEDBACK_RETENTION_DAYS").doc:find("newest " .. feedback.KEEP_PER_REINFORCED .. " ", 1, true) ~= nil
-        and feedback.KEEP_PER_REINFORCED > feedback.HARVEST_EVENTS)
+    check("the setting's text names the window the code uses (" .. feedback.JUST_BEFORE_MINUTES .. " minutes)",
+        settings.get("MEMO_FEEDBACK_RETENTION_DAYS").doc:find(feedback.JUST_BEFORE_MINUTES .. " minutes", 1, true) ~= nil)
     local function keyset(ts) local o = {}; for i, t in ipairs(ts) do o[i] = t.query .. ">" .. tostring(t.positive) end; table.sort(o); return table.concat(o, "|") end
-    check("harvest reads the newest few: the same triples after as before", keyset(before) == keyset(feedback.harvest(scope)))
+    check("the same labels after as before", before[1] ~= nil and keyset(before) == keyset(feedback.harvest(scope)))
 end)
 
-section("the newest are counted per scope, and a tie in time is broken by the later row", function()
+section("a label belongs to its scope and its device; a tie in time counts", function()
     setup({})
     local m = assert(luamemo.store.write({ scope = "repo:ret-m", title = "shared", body = "one memory searched from two scopes", dedup_strategy = "append" }))
-    feedback.record_reinforcement(m.id, "repo:ret-m", "praise")
-    local K = feedback.KEEP_PER_REINFORCED
-    local scopes = { "repo:ret-g1", "repo:ret-g2" }
-    for _, s in ipairs(scopes) do
-        for i = 1, K + 3 do log_at(100 + i, feedback.log_retrieval, s, "old " .. i, { m.id }) end
-    end
+    H.at_age(100 * DAY, feedback.record_reinforcement, m.id, "repo:ret-m", "praise")
+    log_at(100, feedback.log_retrieval, "repo:ret-m", "the same moment in its scope", { m.id })
+    log_at(100, feedback.log_retrieval, "repo:ret-other", "the same moment in another scope", { m.id })   -- (logged last: the newest of the two)
+    db.run("UPDATE lm_retrieval_feedback SET created_at = (SELECT max(created_at) FROM lm_reinforcements WHERE scope = 'repo:ret-m') WHERE query LIKE 'the same moment%'")
+    local m2 = assert(luamemo.store.write({ scope = "repo:ret-m", title = "pushed", body = "a memory a dev confirmed elsewhere", dedup_strategy = "append" }))
+    H.event_row("repo:ret-m", m2.id, "praise", "user:a", "e1", util.now_us() - 100 * DAY)
+    H.at_age(100 * DAY + MINUTE, feedback.log_retrieval, "repo:ret-m", "my search before a dev's confirmation", { m2.id })
     local n = feedback.prune()
-    check("each scope keeps its own newest " .. K .. " (the other scope's searches do not use them up)",
-        n == 6 and logged(scopes[1]) == K and logged(scopes[2]) == K, n)
-
-    -- three searches in the very same microsecond: the one logged last counts as the newest
-    local scope = "repo:ret-h"
-    local t = util.now_us() - 100 * DAY
-    for i = 1, 3 do
-        feedback.log_retrieval(scope, "tied " .. i, { m.id })
-    end
-    db.run("UPDATE lm_retrieval_feedback SET created_at = ? WHERE scope = ?", t, scope)
-    local old = feedback.KEEP_PER_REINFORCED
-    local ok = pcall(function()
-        feedback.KEEP_PER_REINFORCED = 2
-        feedback.prune()
-    end)
-    feedback.KEEP_PER_REINFORCED = old
-    check("pruned with room for two", ok and logged(scope) == 2)
-    check("… the first-logged of three equal times is the one that went", logged(scope, " AND query = 'tied 1'") == 0
-        and logged(scope, " AND query = 'tied 3'") == 1)
+    check("another scope's search is no label for it, nor is this device's search for a dev's event (2 go)",
+        n == 2 and logged("repo:ret-other") == 0 and logged("repo:ret-m", " AND query LIKE 'my search%'") == 0, n)
+    check("… a search in the very same microsecond as the reinforcement is", logged("repo:ret-m") == 1)
 end)
 
 section("0 keeps everything; the daily throttle", function()

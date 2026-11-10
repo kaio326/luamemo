@@ -500,6 +500,13 @@ end
 -- -------------------------------------------------------------------------
 local int_array = common.int_array
 
+-- One reinforcement as it is pushed. Free text and when it happened go only along with queries (triples).
+function M._event_payload(r, ref, oid, share)
+    local triples = share == "triples"
+    return { ref = ref, memory = oid, type = r.event_type, delta = tonumber(r.delta),
+             at = triples and common.us_str(r.created_at) or nil, note = triples and r.note or nil }
+end
+
 function M.push(opts)
     opts = opts or {}
     if policy.role() ~= "dev" then return nil, "not a dev instance (set MEMO_ORG_URL)" end
@@ -540,22 +547,20 @@ function M.push(opts)
 
     while #local_ids > 0 do
         if past(deadline) then stats.partial = true; break end
-        local ev_rows = db.query("SELECT id, memory_id, event_type, delta, note FROM lm_reinforcements "
+        local ev_rows = db.query("SELECT id, memory_id, event_type, delta, note, created_at FROM lm_reinforcements "
             .. "WHERE id > ? AND memory_id IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?",
             ev_cursor, id_json, M.PUSH_BATCH) or {}
         local events, new_ev = {}, ev_cursor
         for _, r in ipairs(ev_rows) do
             new_ev = tonumber(r.id)
             local oid = by_local[tonumber(r.memory_id)]
-            if oid then   -- notes are free text: only shared along with queries (triples)
-                events[#events + 1] = { ref = ("%s:e:%d"):format(inst, new_ev), memory = oid,
-                    type = r.event_type, delta = tonumber(r.delta),
-                    note = (share == "triples") and r.note or nil }
+            if oid then
+                events[#events + 1] = M._event_payload(r, ("%s:e:%d"):format(inst, new_ev), oid, share)
             end
         end
         local retrievals, new_fb, fb_rows = {}, fb_cursor, {}
         if share == "triples" then
-            fb_rows = db.query("SELECT f.id, f.query, f.candidate_ids FROM lm_retrieval_feedback f "
+            fb_rows = db.query("SELECT f.id, f.query, f.candidate_ids, f.created_at FROM lm_retrieval_feedback f "
                 .. "WHERE f.id > ? AND EXISTS (SELECT 1 FROM lm_retrieval_candidates c WHERE c.feedback_id = f.id "
                 .. "AND c.memory_id IN (SELECT value FROM json_each(?))) ORDER BY f.id LIMIT ?",
                 fb_cursor, id_json, M.PUSH_BATCH) or {}
@@ -568,7 +573,7 @@ function M.push(opts)
                 end
                 if #cands > 0 and r.query and r.query ~= "" then
                     -- top: the org row that was this search's best result, if any.
-                    retrievals[#retrievals + 1] = { ref = ("%s:r:%d"):format(inst, new_fb),
+                    retrievals[#retrievals + 1] = { ref = ("%s:r:%d"):format(inst, new_fb), at = common.us_str(r.created_at),
                         query = r.query, candidates = cands, top = all[1] and by_local[all[1]] or nil }
                 end
             end

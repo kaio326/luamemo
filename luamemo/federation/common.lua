@@ -10,6 +10,14 @@ M.EVENT_TYPES = { direct_command = true, mistake = true, reversal = true, praise
 -- Learned-weight kinds the central ships with a snapshot (learner_store kinds).
 M.WEIGHT_KINDS = { "reranker", "projection" }
 
+-- Microsecond timestamps (the stored values) travel as decimal STRINGS: JSON encoders (cjson and
+-- dkjson alike) emit 14 significant digits, which would round a ~1.8e15 µs
+-- value to ~100 µs — breaking exact version compares and row-derived cursors.
+function M.us_str(v)
+    local n = tonumber(v)
+    return n and ("%d"):format(n) or nil
+end
+
 --- Identify the embedding space: two instances can share raw vectors only when
 --- this string matches (same embedder, same model, same dim). Anything else is
 --- re-embedded locally, so a mismatch costs time, never correctness.

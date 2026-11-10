@@ -1937,6 +1937,15 @@ function M.resolve_scopes(ctx)
     return out
 end
 
+-- The lowest tier agents see unless they ask for less (tier 0 is raw session events): memory_search, memory_recent and the
+-- learned reranker's training all use this one value.
+M.DEFAULT_TIER_MIN = 1
+
+--- How many candidates search fetches for the reranker (top_n: default MEMO_RERANK_TOP_N, at most 100). Training builds the same pool.
+function M.rerank_pool_size(top_n)
+    return math.min(math.floor(tonumber(top_n) or tonumber(cfg.rerank_top_n) or 20), 100)
+end
+
 function M.search(args)
     assert(args and args.query, "search: query is required")
     local q     = args.query
@@ -2010,8 +2019,8 @@ function M.search(args)
     end
     local fetch_limit = limit
     if rerank_on then
-        local top_n = tonumber(args.rerank_top_n) or tonumber(cfg.rerank_top_n) or 20
-        if top_n > limit then fetch_limit = math.min(top_n, 100) end
+        local pool = M.rerank_pool_size(args.rerank_top_n)
+        if pool > limit then fetch_limit = pool end
     end
     -- Over-fetch for RRF when temporal leg is active.
     local rrf_fetch = twindow and math.min(fetch_limit * 2, 100) or fetch_limit

@@ -195,6 +195,7 @@ for i, t in ipairs({ "password rotation notes", "review checklist draft", "local
     local w = store.write({ scope = SCOPE, title = t, body = "collective note " .. i .. ": " .. t, importance = 0.5 })
     NOTES[i] = w and w.id
 end
+H.filler_memories(SCOPE, 2 * require("luamemo.probes").MIN_GATE + 4, { importance = 0.5 })   -- the probes that check a model for harm
 local agg     = require("luamemo.federation.aggregate")
 local trainer = require("luamemo.rerank_train")
 local PRIOR   = trainer.prior()
@@ -204,14 +205,20 @@ BAD.tier, BAD.importance = -5, -5
 
 section("C gate", function()
 io.write("\n--- C: directives gate ---\n")
-local probes = agg.directive_probes(SCOPE, {}, {})
+local probes = agg.directive_probes(SCOPE, {})
 check("a probe per retrievable directive", #probes >= 3, #probes)
-local ok1, info1 = agg.directives_gate({ scope = SCOPE, candidate = PRIOR, incumbent = PRIOR, reuse = {}, opts = {} })
+local ok1, info1 = agg.directives_gate({ scope = SCOPE, candidate = PRIOR, incumbent = PRIOR, opts = {} })
 check("candidate equal to the incumbent passes", ok1 == true, info1)
 check("gate reports directive recall", tostring(info1):find("directive recall@3", 1, true) ~= nil, info1)
-local ok2, info2 = agg.directives_gate({ scope = SCOPE, candidate = BAD, incumbent = PRIOR, reuse = {}, opts = {} })
+local ok2, info2 = agg.directives_gate({ scope = SCOPE, candidate = BAD, incumbent = PRIOR, opts = {} })
 check("candidate that buries directives fails", ok2 == false, info2)
 check("failure names the demoted directives", tostring(info2):find("demotes", 1, true) ~= nil, info2)
+local ok3, raised = pcall(H.with, store, "search", function() return nil, "database is locked" end, agg.directives_gate,
+    { scope = SCOPE, candidate = PRIOR, incumbent = PRIOR, opts = {} })
+check("a search that fails stops the gate (it fails closed): failed is not 'unreachable'",
+    ok3 == false and tostring(raised):find("database is locked", 1, true) ~= nil, tostring(raised))
+local ok4, raised4 = pcall(H.failing_sql, "query", "AND tier = 3", agg.directives_gate, { scope = SCOPE, candidate = PRIOR, incumbent = PRIOR, opts = {} })
+check("… and so does a failed read of the directives themselves", ok4 == false and tostring(raised4):find("boom", 1, true) ~= nil, tostring(raised4))
 end)
 
 -- Aggregated feedback, as devs' pushes land on the central.
@@ -222,10 +229,10 @@ for i, id in ipairs(NOTES) do
     if id then
         local cands = { id }
         for j, o in ipairs(NOTES) do if j ~= i and o then cands[#cands + 1] = o end end
-        assert(db.run("INSERT INTO lm_retrieval_feedback (scope, query, candidate_ids, source, source_ref, created_at) "
-            .. "VALUES (?, ?, ?, 'user:a@corp.io', ?, ?)", SCOPE, QUERIES[i], db.json(cands), "r" .. i, NOW))
-        assert(db.run("INSERT INTO lm_reinforcements (memory_id, scope, event_type, delta, source, source_ref, "
-            .. "created_at) VALUES (?, ?, 'praise', 0.5, 'user:a@corp.io', ?, ?)", id, SCOPE, "e" .. i, NOW))
+        -- (each confirmation just after its own search, as they happened on the dev's machine)
+        local at = NOW - 120 * 1000000 + i * 10 * 1000000
+        H.search_row(SCOPE, QUERIES[i], cands, "user:a@corp.io", "r" .. i, at)
+        H.event_row(SCOPE, id, "praise", "user:a@corp.io", "e" .. i, at + 1000000)
     end
 end
 
@@ -290,6 +297,18 @@ with_trainer(cand, function() r2 = agg.run({ min_samples = 2 }) end)
 local p2 = (r2 or {}).promotion or {}
 check("a reranker that keeps directives in place is promoted",
     p2.decision == "promote" and p2.gates and p2.gates[1].name == "directives" and p2.gates[1].pass, p2.reason)
+reset_weights()
+-- a dev serves the model with its own confirmations only, so the team's counts must not be in what it learns from
+local seen, seen_reuse = 0, 0
+H.with(trainer, "train", function(examples)
+    for _, ex in ipairs(examples) do
+        for _, fv in ipairs(ex.features) do seen = seen + 1; seen_reuse = math.max(seen_reuse, fv.reuse or 0) end
+    end
+    return cand
+end, function()
+    agg.run({ min_samples = 2, dry_run = true })
+end)
+check("an org's model trains without confirmation counts (they are not on the dev's machine)", seen > 0 and seen_reuse == 0, seen .. "/" .. seen_reuse)
 check("directives untouched by the digest", ndir("standards") == 4 and n("SELECT count(*) AS n FROM lm_memories "
     .. "WHERE scope = '" .. SCOPE .. "' AND tier = 3 AND decay_rate <> 0") == 0)
 local body0 = q1("SELECT body FROM lm_memories WHERE scope = '" .. SCOPE .. "' AND title = 'Lua style — Locals'").body
@@ -307,6 +326,16 @@ io.write("\n--- F: memo org (org central) ---\n")
 local sh = H.sh
 local env = ("MEMO_EMBEDDER=hash MEMO_LUA=%q MEMO_ROLE=org MEMO_ORG_NAME=fedagg MEMO_FEDERATION_DIR=%q ")
     :format(lua_bin, TMP .. "/keyring")
+local ls = require("luamemo.learner_store")
+local vo = assert(ls.save_version(SCOPE, "reranker", { bias = 0 }, {}))
+assert(ls.promote(SCOPE, "reranker", vo))
+local older = sh(env .. "./cli/memo org status")
+check("org status: a model of an older format says devs do not serve it", older:find("an older format", 1, true) ~= nil, older)
+local vn = assert(ls.save_version(SCOPE, "reranker", { bias = 0, format = require("luamemo.rerankers.learned").MODEL_FORMAT }, {}))
+assert(ls.promote(SCOPE, "reranker", vn))
+local current = sh(env .. "./cli/memo org status")
+check("org status: a current one says devs pull it", current:find("pulled by devs", 1, true) ~= nil, current)
+reset_weights()
 local o1, c1 = sh(env .. "./cli/memo org status")
 check("org status", c1 == 0 and o1:find("org central", 1, true) and o1:find(SCOPE, 1, true)
     and o1:find("t3=", 1, true) and o1:find("devices:", 1, true), o1)

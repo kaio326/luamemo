@@ -54,7 +54,7 @@ io.write("\n--- every config key luamemo reads is a setting ---\n")
 local NOT_CONFIG = {
     projection_W   = "tests / eval inject projection weights (MEMO_PROJECTION_W)",
     rerank_scope   = "the reranker's per-call view (the search's scope)",
-    rerank_weights = "the reranker's per-call view (explicit weights: eval / tests, MEMO_RERANK_WEIGHTS)",
+    rerank_weights = "the reranker's per-call view (explicit weights: eval / tests)",
     root           = "federation/identity.lua's own options table",
     max_tokens     = "sensing generation length — the sense call's own options (default 256)",
 }
@@ -100,7 +100,7 @@ local INTERNAL = {   -- arguments no surface takes, with the reason
     rerank_headers    = "per-call override of MEMO_RERANK_HEADERS (credentials stay in settings / the vault)",
     rerank_timeout_ms = "per-call override of MEMO_RERANK_TIMEOUT_MS",
     rerank_top_n      = "per-call override of MEMO_RERANK_TOP_N",
-    rerank_weights    = "explicit learned-reranker weights: eval / tests (MEMO_RERANK_WEIGHTS)",
+    rerank_weights    = "explicit learned-reranker weights: eval / tests",
     obs_max_slots     = "per-call override of MEMO_OBS_MAX_SLOTS",
     epochs            = "learner training hyper-parameter (the harness's default; eval only)",
     gate_frac         = "learner training hyper-parameter",

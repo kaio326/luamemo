@@ -69,7 +69,7 @@ for i = 1, 4 do
 end
 local base = learned.rerank("q", hits, { rerank_scope = X })
 check("no per-scope weights → baseline order (distinct scores)", base[1].score ~= base[2].score)
-lstore.save_version(X, "reranker", { bias = 5.0 }, {})   -- all-bias → constant score
+lstore.save_version(X, "reranker", { bias = 5.0, format = learned.MODEL_FORMAT }, {})   -- all-bias → constant score
 lstore.promote(X, "reranker", 1)
 learned.reset_cache()
 local mod = learned.rerank("q", hits, { rerank_scope = X })
@@ -101,6 +101,8 @@ for _, t in ipairs(topics) do
     local row = memory.write({ scope = S, title = t, body = "About " .. t .. " in the system.", importance = 0.8 })
     ids[t] = row and row.id
 end
+local H = require("eval.tests._harness")
+H.filler_memories(S, 2 * require("luamemo.probes").MIN_GATE + 4, { importance = 0.8 })   -- the probes that check a model for harm
 local all = {}; for _, t in ipairs(topics) do all[#all + 1] = math.floor(ids[t]) end
 for _, t in ipairs(topics) do
     assert(db.run("INSERT INTO lm_retrieval_feedback (scope, query, candidate_ids, created_at) VALUES (?, ?, ?, ?)",

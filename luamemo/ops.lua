@@ -223,15 +223,22 @@ end
 --- rollback → the answer | nil, err.
 function M.learn(p, scope)
     if not str(scope) then return nil, "learn: scope required" end
-    local ls = require("luamemo.learner_store")
     local action = p.action or "run"
     if action == "status" then
-        return { ok = true, scope = scope, kind = "reranker", status = ls.status(scope, "reranker") }
+        local ls, learned = require("luamemo.learner_store"), require("luamemo.rerankers.learned")
+        local status = ls.status(scope, "reranker")
+        for _, v in ipairs(status.versions) do
+            v.served = learned.usable({ format = v.format })
+            v.format = nil
+        end
+        return { ok = true, scope = scope, kind = "reranker", status = status }
     elseif action == "rollback" then
+        local ls = require("luamemo.learner_store")
         local was = ls.current_version(scope, "reranker")
         local v, err = ls.rollback(scope, "reranker")
         if not v then return nil, err end
-        return { ok = true, scope = scope, kind = "reranker", current = v, previous = was }
+        return { ok = true, scope = scope, kind = "reranker", current = v, previous = was,
+                 warning = (not require("luamemo.rerankers.learned").served_model(scope)) and "this version is from before 0.5.3's gate and is not served: search keeps its plain order" or nil }
     elseif action ~= "run" then
         return nil, "learn: action is run, status or rollback"
     end

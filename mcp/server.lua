@@ -349,7 +349,7 @@ Tools.memory_search = {
         ensure_setup()
         -- The project's scope when the call names none; tier_min 1 hides ephemeral events
         -- unless the call passes tier_min = 0.
-        local rows, facts = ops.search(args, { scope = MEMO_SCOPE, tier_min = 1 })
+        local rows, facts = ops.search(args, { scope = MEMO_SCOPE, tier_min = require("luamemo.store").DEFAULT_TIER_MIN })
         if not rows then return nil, facts end
         local res = { ok = true, results = rows_out(rows, to_bool(args.verbose)) }
         -- The facts the query is about ride along (KG spike 2: agents read them here;
@@ -376,7 +376,7 @@ Tools.memory_recent = {
         ensure_setup()
         -- tier_min 1, as search: tier 0 is raw conversation the hooks save for the digest
         -- (a session scope's newest 20 were all transcript chunks — 26 KB).
-        local rows, err = ops.recent(args, { scope = MEMO_SCOPE, tier_min = 1 })
+        local rows, err = ops.recent(args, { scope = MEMO_SCOPE, tier_min = require("luamemo.store").DEFAULT_TIER_MIN })
         if not rows then return nil, err end
         return { ok = true, results = rows_out(rows, to_bool(args.verbose)) }
     end,

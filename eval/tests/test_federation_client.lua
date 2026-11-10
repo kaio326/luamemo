@@ -360,6 +360,15 @@ local cur = ls.load_current(ORG, "reranker") or {}
 check("installed weights match the central's", cur.bias == 0.3)
 local w2 = client.pull() or {}
 check("unchanged model → not reinstalled", w2.weights == 0, w2.weights)
+local learned = require("luamemo.rerankers.learned")
+check("a model from before this release's gate is installed but not served", not learned.usable(cur))
+central(([[
+local v = ls.save_version("org:fedcli", "reranker", { bias = 0.4, format = %d }, { note = "central" })
+ls.promote("org:fedcli", "reranker", v)
+result({ v = v })
+]]):format(learned.MODEL_FORMAT))
+local w2b = client.pull() or {}
+check("a current model crosses the pull and may be served", w2b.weights == 1 and learned.usable(ls.load_current(ORG, "reranker")), json.encode(w2b))
 central([[ ls.deactivate("org:fedcli", "reranker"); result({}) ]])
 local w3 = client.pull() or {}
 check("central withdrew its model → deactivated locally",
@@ -369,8 +378,8 @@ end)
 -- ---------------------------------------------------------------------------
 local function central_feedback()
     return central([[
-local ev = db.query("SELECT memory_id, event_type, note, source, source_ref FROM lm_reinforcements WHERE source IS NOT NULL ORDER BY id")
-local rf = db.query("SELECT query, candidate_ids AS c, source, source_ref FROM lm_retrieval_feedback WHERE source IS NOT NULL ORDER BY id")
+local ev = db.query("SELECT memory_id, event_type, note, source, source_ref, CAST(created_at AS TEXT) AS at FROM lm_reinforcements WHERE source IS NOT NULL ORDER BY id")
+local rf = db.query("SELECT query, candidate_ids AS c, source, source_ref, CAST(created_at AS TEXT) AS at FROM lm_retrieval_feedback WHERE source IS NOT NULL ORDER BY id")
 result({ ev = ev, rf = rf, nev = #ev, nrf = #rf })
 ]])
 end
@@ -404,6 +413,10 @@ check("triples: event note shared", ev.note == "helpful", ev.note)
 check("central triple: query kept, candidates mapped (personal ids dropped)",
     rf.query == "how small should PRs be" and rf.c == ("[%d]"):format(seed.N1), json.encode(rf))
 check("personal-only retrieval never shipped", cf.nrf == 1, cf.nrf)
+local local_ev = q1("SELECT CAST(created_at AS TEXT) AS at FROM lm_reinforcements WHERE memory_id = " .. n1)
+local local_rf = q1("SELECT CAST(created_at AS TEXT) AS at FROM lm_retrieval_feedback WHERE query = 'how small should PRs be'")
+check("the central keeps when each happened on this machine (the learner pairs a confirmation with the search before it)",
+    ev.at == local_ev.at and rf.at == local_rf.at and ev.at ~= nil and rf.at ~= nil, json.encode({ ev.at, local_ev.at, rf.at, local_rf.at }))
 
 local r2 = client.push() or {}
 check("nothing new → nothing sent", r2.events == 0 and r2.retrievals == 0 and r2.duplicates == 0, json.encode(r2))
@@ -430,6 +443,13 @@ check("central never saw the signals-mode query", cf3.nrf == 1 and cf3.nev == 2,
 local sev = (cf3.ev or {})[2] or {}
 check("signals: event shipped without its free-text note", sev.event_type == "mistake" and sev.note == nil,
     json.encode(sev))
+local row_out = { event_type = "praise", delta = 0.5, note = "n", created_at = 1793835210836865 }
+local sig, tri = client._event_payload(row_out, "r", 7, "signals"), client._event_payload(row_out, "r", 7, "triples")
+check("signals: the dev sends no time and no note", sig.at == nil and sig.note == nil and sig.memory == 7, json.encode(sig))
+check("triples: it sends both, the time as a whole decimal string", tri.at == "1793835210836865" and tri.note == "n", json.encode(tri))
+local local_sev = q1("SELECT CAST(created_at AS TEXT) AS at FROM lm_reinforcements WHERE memory_id = " .. n3)
+check("signals: the central has only when the push arrived, not when the event happened", sev.at ~= nil and local_sev.at ~= nil and sev.at ~= local_sev.at,
+    json.encode({ sev.at, local_sev.at }))
 end)
 
 -- ---------------------------------------------------------------------------

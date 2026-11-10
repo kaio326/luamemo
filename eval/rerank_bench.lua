@@ -109,7 +109,9 @@ for f=1,K do
         if ((i-1)%K)+1 == f then
             local rows=search(q.query); enrich(rows)
             local br=gold_rank(rows,q.gold_id)
-            local scored=learned.rerank(q.query, rows, { rerank_weights=w })
+            -- (score_pool, not learned.rerank: that reads reuse from the database, and this bench's reuse is the
+            -- train fold's golds — the same signal search serves, simulated without a usage log)
+            local scored=learned.score_pool(w, rows)
             local lr=gold_rank(reorder(rows,scored), q.gold_id)
             add(base.all,br); add(lrn.all,lr)
             add(ov(base,q.lexical_overlap or "?"),br); add(ov(lrn,q.lexical_overlap or "?"),lr)

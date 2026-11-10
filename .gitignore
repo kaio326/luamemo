@@ -32,3 +32,6 @@ research/
 # Phase 7 native embedder — built locally, never committed
 luamemo/embedders/native/*.so
 *.gguf
+
+# Local bug reports and working notes
+/issues/

@@ -470,7 +470,8 @@ local function run_org(sub, argv)
         end
         local ls = require("luamemo.learner_store")
         local v = ls.current_version(scope, "reranker")
-        line("reranker", v and ("v" .. v .. " (pulled by devs)") or "none promoted")
+        local served = require("luamemo.rerankers.learned").served_model(scope)
+        line("reranker", v and ("v" .. v .. (served and " (pulled by devs)" or " (an older format: devs do not serve it)")) or "none promoted")
         local run = db.first("SELECT decision, note, created_at FROM lm_promotion_runs WHERE scope = ? "
             .. "ORDER BY id DESC LIMIT 1", scope)
         if run then line("last run", ("%s %s%s"):format(require("luamemo.util").us_to_iso(run.created_at), run.decision,

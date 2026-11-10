@@ -3,70 +3,55 @@
 -- Closes the learned-from-usage loop safely, per scope:
 --   harvest feedback triples → build (features, positive) training examples by
 --   re-running retrieval → split train/gate → train the reranker → GATE on the
---   held-out split → promote the new weights ONLY if they beat the incumbent on
---   the gate, else reject. Every attempt is audited in lm_promotion_runs.
+--   held-out split and on probes → promote the new weights ONLY if they beat the
+--   incumbent and find at least as many memories by their own titles, else reject.
+--   Every attempt is audited in lm_promotion_runs (a dry run changes nothing).
 --
 -- Weights are stored per-scope in the DB (luamemo.learner_store), so a scope with
 -- enough signal activates its OWN reranker, and the org can later sync weights
 -- down (Phase 12). Bounded by feedback volume — a no-op until enough labeled
 -- signal exists (by design). Never throws.
 --
--- Reuses the exact feature-prep the offline bench validated: search → set
--- reuse_count → rerankers.learned.pool_features → find the positive's rank.
+-- The examples and the gate go through learned.pool, the one path that builds what search shows the model. An example's
+-- confirmation count is as of when its search ran (the label's `at`); the rest of its pool is rebuilt from today's memories.
+
+local util = require("luamemo.util")
 
 local M = {}
 
--- reuse feature: how often each memory is a labelled positive across triples.
-local function reuse_counts(triples)
-    local reuse = {}
-    for _, t in ipairs(triples) do
-        if t.positive then reuse[t.positive] = (reuse[t.positive] or 0) + 1 end
-    end
-    return reuse
-end
-
 -- Build (features, positive) examples from harvested triples by re-running search.
-local function build_examples(scope, triples, opts, reuse)
-    local store   = require("luamemo.store")
-    local learned = require("luamemo.rerankers.learned")
-    local cand = tonumber(opts.candidate_limit) or 20
+local function build_examples(scope, triples, opts)
+    local learned  = require("luamemo.rerankers.learned")
+    local temporal = require("luamemo.temporal")
     local examples = {}
     for _, t in ipairs(triples) do
-        if t.query and t.positive then
-            local rows = store.search({
-                query = t.query, scope = scope, limit = cand,
-                skip_temporal = true, skip_observations = true, rerank = false, skip_feedback = true,
-            })
-            if rows and #rows > 0 then
-                for _, r in ipairs(rows) do r.reuse_count = reuse[r.id] or 0 end
-                local p
-                for i, r in ipairs(rows) do
-                    if tonumber(r.id) == tonumber(t.positive) then p = i; break end
-                end
-                if p then
-                    examples[#examples + 1] = {
-                        features = learned.pool_features(rows), positive = p, weight = t.weight or 1.0,
-                    }
-                end
+        -- (a query with a time in it: its pool depends on when it ran, so it cannot be rebuilt)
+        if t.query and t.positive and not temporal.parse(t.query) then
+            local rows = learned.pool(scope, t.query, opts, t.at)
+            local ex = rows and #rows > 1 and learned.example(rows, t.positive, t.weight)   -- (a pool of one ranks nothing)
+            if ex then
+                ex.query = t.query
+                examples[#examples + 1] = ex
             end
         end
     end
     return examples
 end
 
--- Deterministic held-out split (every Nth example → gate). No RNG, so a run is
--- reproducible and the gate is a true hold-out (never trained on).
+-- Deterministic held-out split, by a hash of the query: one query is never on both sides (a gate must not be asked
+-- what training was shown). No RNG, so a run is reproducible and the gate is a true hold-out (never trained on).
 local function split(examples, gate_frac)
     local every = math.max(2, math.floor(1 / (tonumber(gate_frac) or 0.3)))
-    local train, gate = {}, {}
-    for i, ex in ipairs(examples) do
-        if (i % every) == 0 then gate[#gate + 1] = ex else train[#train + 1] = ex end
+    local train, held_out = {}, {}
+    for _, ex in ipairs(examples) do
+        if util.djb2(tostring(ex.query)) % every == 0 then held_out[#held_out + 1] = ex else train[#train + 1] = ex end
     end
-    return train, gate
+    return train, held_out
 end
+M._split = split   -- tests
 
--- Extra gates (pluggable): each { name, fn } where fn(ctx) → pass, info. ctx =
--- { scope, candidate, incumbent, reuse, opts }. A gate that raises fails closed.
+-- Gates (pluggable): each { name, fn } where fn(ctx) → pass, info. ctx =
+-- { scope, candidate, incumbent, opts }. A gate that raises fails closed.
 local function run_gates(gates, ctx)
     local results = {}
     for i, g in ipairs(gates or {}) do
@@ -80,11 +65,29 @@ local function run_gates(gates, ctx)
     return true, results
 end
 
+-- The last gate: a model must find at least as many memories first by their own titles as the incumbent.
+local function make_probes_gate(probes, examples)
+    return function(ctx)
+        local new, inc = probes.count_first(ctx.candidate, examples), probes.count_first(ctx.incumbent, examples)
+        return new >= inc, ("probe recall@1 %d/%d (incumbent %d/%d)"):format(new, #examples, inc, #examples)
+    end
+end
+
+local function gates_note(gates)
+    local parts = {}
+    for _, g in ipairs(gates or {}) do parts[#parts + 1] = g.name .. ": " .. tostring(g.info) end
+    return #parts > 0 and table.concat(parts, "; ") or nil
+end
+
+local function too_few_probes(n, min)
+    return string.format("too few probes to check for harm (%d < %d: memories with a title that nobody has confirmed useful)", n, min)
+end
+
 --- run(scope, opts) -> decision table. opts: min_samples(20), margin(0.0),
---- gate_frac(0.3), epochs/lr/l2 (trainer), candidate_limit(20), harvest_limit,
---- dry_run (train + gate but never promote), gates (extra promotion gates —
---- see run_gates; all must pass after the loss gate), note (version note).
---- Decision ∈ skip|promote|reject.
+--- gate_frac(0.3), epochs/lr/l2 (trainer), harvest_limit, dry_run (train + gate but never promote, and nothing audited),
+--- gates (extra promotion gates — see run_gates; all must pass after the loss gate, before the probes),
+--- reuse = false (train without confirmation counts), note (version note).
+--- Decision ∈ skip|promote|reject (would-promote|would-reject on a dry run).
 function M.run(scope, opts)
     opts = opts or {}
     local kind = "reranker"
@@ -94,7 +97,22 @@ function M.run(scope, opts)
     local ok_fb, feedback = pcall(require, "luamemo.feedback")
     local ok_tr, trainer  = pcall(require, "luamemo.rerank_train")
     local ok_ls, lstore   = pcall(require, "luamemo.learner_store")
-    if not (ok_fb and ok_tr and ok_ls) then out.reason = "deps unavailable"; return out end
+    local ok_le, learned  = pcall(require, "luamemo.rerankers.learned")
+    local ok_pr, probes   = pcall(require, "luamemo.probes")
+    if not (ok_fb and ok_tr and ok_ls and ok_le and ok_pr) then out.reason = "deps unavailable"; return out end
+
+    local function skip(reason, meta)
+        out.reason = reason
+        if not opts.dry_run then
+            meta.note = reason
+            lstore.record_run(scope, kind, "skip", meta)
+        end
+        return out
+    end
+    local function failed(what, err)
+        out.reason = what .. " failed: " .. tostring(err)
+        return out
+    end
 
     local min_samples = tonumber(opts.min_samples) or 20
     local margin      = tonumber(opts.margin) or 0.0
@@ -102,51 +120,75 @@ function M.run(scope, opts)
     local ok_h, triples = pcall(feedback.harvest, scope, { limit = opts.harvest_limit })
     if not ok_h or type(triples) ~= "table" then out.reason = "harvest failed"; return out end
 
-    local reuse = reuse_counts(triples)
-    local ok_b, examples = pcall(build_examples, scope, triples, opts, reuse)
-    if not ok_b or type(examples) ~= "table" then out.reason = "example build failed"; return out end
+    -- (one query, before the search each label costs: is there anything to check a model against?)
+    local train_rows, gate_rows
+    if #triples >= min_samples then
+        local ok_s, a, b = pcall(probes.sample, scope)
+        if not ok_s then return failed("probes", a) end
+        train_rows, gate_rows = a, b
+        if #gate_rows < probes.MIN_GATE then return skip(too_few_probes(#gate_rows, probes.MIN_GATE), {}) end
+    end
+
+    local ok_b, examples = pcall(build_examples, scope, triples, opts)
+    if not ok_b or type(examples) ~= "table" then return failed("example build", examples) end
     out.n_examples = #examples
     if #examples < min_samples then
-        out.reason = string.format("insufficient examples (%d < %d)", #examples, min_samples)
-        lstore.record_run(scope, kind, "skip", { note = out.reason, n_train = #examples })
-        return out
+        return skip(string.format("insufficient examples (%d < %d)", #examples, min_samples), { n_train = #examples })
     end
 
-    local train, gate = split(examples, opts.gate_frac)
-    if #train == 0 or #gate == 0 then
-        out.reason = "train/gate split empty"
-        lstore.record_run(scope, kind, "skip", { note = out.reason, n_train = #train, n_gate = #gate })
-        return out
+    local train, held_out = split(examples, opts.gate_frac)
+    if #train == 0 or #held_out == 0 then
+        return skip("train/gate split empty", { n_train = #train, n_gate = #held_out })
     end
 
-    local new_w = trainer.train(train, { epochs = opts.epochs, lr = opts.lr, l2 = opts.l2 })
-    -- Incumbent = the scope's current promoted weights, else the shrink-to-prior
+    local ok_t, train_probes = pcall(probes.examples, scope, train_rows, opts)
+    if not ok_t then return failed("probes", train_probes) end
+
+    local fit = {}
+    for _, list in ipairs({ train, train_probes }) do
+        for _, ex in ipairs(list) do fit[#fit + 1] = ex end
+    end
+    local new_w = trainer.train(fit, { epochs = opts.epochs, lr = opts.lr, l2 = opts.l2 })
+    -- Incumbent = the scope's model that search serves, else the shrink-to-prior
     -- baseline (so the very first promotion must still beat "do nothing").
-    local incumbent = lstore.load_current(scope, kind) or trainer.prior()
+    local incumbent = learned.served_model(scope) or trainer.prior()
 
     -- Gate: mean pairwise logistic loss on the held-out split (LOWER is better).
-    local new_loss = trainer.loss(new_w, gate)
-    local inc_loss = trainer.loss(incumbent, gate)
+    local new_loss = trainer.loss(new_w, held_out)
+    local inc_loss = trainer.loss(incumbent, held_out)
     out.new_score, out.incumbent_score = new_loss, inc_loss
-    out.n_train, out.n_gate = #train, #gate
-
+    out.n_train, out.n_gate = #train, #held_out
     local beats = new_loss < (inc_loss - margin)
-    local gates_ok, failed_gate = true, nil
-    if beats and opts.gates then
-        gates_ok, out.gates, failed_gate = run_gates(opts.gates, {
-            scope = scope, candidate = new_w, incumbent = incumbent, reuse = reuse, opts = opts })
+
+    if beats then
+        -- (only now: each probe is a search, and a model that lost on the labels has no use for them)
+        local ok_g, gate_probes = pcall(probes.examples, scope, gate_rows, opts)
+        if not ok_g then return failed("probes", gate_probes) end
+        out.n_probes = #gate_probes
+        if #gate_probes < probes.MIN_GATE then
+            return skip(too_few_probes(#gate_probes, probes.MIN_GATE), { n_train = #train, n_gate = #held_out })
+        end
+        local gates = {}
+        for _, g in ipairs(opts.gates or {}) do gates[#gates + 1] = g end
+        gates[#gates + 1] = { name = "probes", fn = make_probes_gate(probes, gate_probes) }
+        local gates_ok, results, failed_gate = run_gates(gates, { scope = scope, candidate = new_w, incumbent = incumbent, opts = opts })
+        out.gates = results
+        if not gates_ok then
+            out.reason = ("%s gate failed: %s"):format(failed_gate, tostring(results[#results].info or "?"))
+        end
+    else
+        out.reason = string.format("gate not beaten (new loss %.4f >= incumbent %.4f)", new_loss, inc_loss)
     end
 
     if opts.dry_run then
-        out.decision = (beats and gates_ok) and "would-promote" or "would-reject"
+        out.decision = out.reason and "would-reject" or "would-promote"
         return out
     end
 
-    if beats and not gates_ok then
-        local g = out.gates[#out.gates]
+    if out.reason then
         out.decision = "reject"
-        out.reason = ("%s gate failed: %s"):format(failed_gate, tostring(g and g.info or "?"))
-    elseif beats then
+    else
+        new_w.format = learned.MODEL_FORMAT
         local version, verr = lstore.save_version(scope, kind, new_w, { score = new_loss, note = opts.note })
         if version then
             lstore.promote(scope, kind, version)
@@ -154,13 +196,10 @@ function M.run(scope, opts)
         else
             out.decision, out.reason = "reject", "save failed: " .. tostring(verr)
         end
-    else
-        out.decision = "reject"
-        out.reason = string.format("gate not beaten (new loss %.4f >= incumbent %.4f)", new_loss, inc_loss)
     end
     lstore.record_run(scope, kind, out.decision, {
         new_score = new_loss, incumbent_score = inc_loss,
-        n_train = #train, n_gate = #gate, version = out.version, note = out.reason,
+        n_train = #train, n_gate = #held_out, version = out.version, note = out.reason or gates_note(out.gates),
     })
     return out
 end

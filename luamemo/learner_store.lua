@@ -106,9 +106,9 @@ end
 --- { current = version | nil, versions = { … }, runs = { … } }.
 function M.status(scope, kind, n)
     local iso = util.us_to_iso
-    local versions = db.query("SELECT version, score, note, is_current, created_at FROM lm_learner_weights "
-        .. "WHERE scope = ? AND kind = ? ORDER BY version DESC", scope, kind) or {}
-    for _, v in ipairs(versions) do v.is_current = v.is_current == 1; v.created_at = iso(v.created_at) end
+    local versions = db.query("SELECT version, score, note, is_current, created_at, json_extract(weights, '$.format') AS format "
+        .. "FROM lm_learner_weights WHERE scope = ? AND kind = ? ORDER BY version DESC", scope, kind) or {}
+    for _, v in ipairs(versions) do v.is_current = v.is_current == 1; v.created_at = iso(v.created_at); v.format = tonumber(v.format) end
     local runs = db.query("SELECT decision, new_score, incumbent_score, n_train, n_gate, version, note, created_at "
         .. "FROM lm_promotion_runs WHERE scope = ? AND kind = ? ORDER BY created_at DESC, id DESC LIMIT ?",
         scope, kind, math.floor(tonumber(n) or 10)) or {}

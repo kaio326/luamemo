@@ -149,7 +149,7 @@ S{ env = "MEMO_RERANK_ENABLED", key = "rerank_enabled", type = "boolean", defaul
    doc = "Rerank every search (a call can still turn it off)." }
 S{ env = "MEMO_RERANK_ADAPTER", key = "rerank_adapter", type = "string", default = "noop",
    values = { "noop", "ollama", "openai", "cross_encoder", "learned" }, group = "rerank",
-   doc = "Reranker: noop (word overlap), ollama, openai, cross_encoder (TEI / Cohere / Jina), learned (from use: with MEMO_FEEDBACK_ENABLED, memo maintain trains it in the background and promotes a model only if it beats the current ranking on held-out data; until then the order is untouched)." }
+   doc = "Reranker: noop (word overlap), ollama, openai, cross_encoder (TEI / Cohere / Jina), learned (from use: with MEMO_FEEDBACK_ENABLED, memo maintain trains it in the background and promotes a model only if it beats the current ranking on held-out data and finds at least as many memories first by their own titles; until then the order is untouched)." }
 S{ env = "MEMO_RERANK_URL", key = "rerank_url", type = "string", group = "rerank", doc = "Reranker endpoint." }
 S{ env = "MEMO_RERANK_MODEL", key = "rerank_model", type = "string", group = "rerank", doc = "Reranker model." }
 S{ env = "MEMO_RERANK_HEADERS", key = "rerank_headers", type = "json", default = {}, headers = true,
@@ -236,7 +236,7 @@ S{ env = "MEMO_CORPUS_HEALTH_CHECK", key = "corpus_health_check", type = "boolea
 
 -- ── learning from use ───────────────────────────────────────────────────────
 S{ env = "MEMO_LEARN_AUTO", key = "learn_auto", type = "boolean", default = true, group = "learning",
-   doc = "memo maintain trains each scope's learned reranker when it is due (MEMO_LEARN_INTERVAL_DAYS) and enough of the usage log has accumulated; the gate promotes a model only if it beats the current ranking on held-out data. Only where MEMO_RERANK_ADAPTER is learned and MEMO_FEEDBACK_ENABLED is on." }
+   doc = "memo maintain trains each scope's learned reranker when it is due (MEMO_LEARN_INTERVAL_DAYS) and enough of the usage log has accumulated; the gate promotes a model only if it beats the current ranking on held-out data and finds at least as many memories first by their own titles (a scope with too few memories to check that is skipped). Only where MEMO_RERANK_ADAPTER is learned and MEMO_FEEDBACK_ENABLED is on." }
 S{ env = "MEMO_LEARN_INTERVAL_DAYS", key = "learn_interval_days", type = "integer", default = 7, min = 0, group = "learning",
    doc = "At most one training attempt per scope per this many days." }
 S{ env = "MEMO_SENSE_CAPTURE", key = "sense_capture", type = "boolean", default = true, group = "learning",
@@ -247,7 +247,7 @@ S{ env = "MEMO_SENSE_CAPTURE_SIMILARITY", key = "sense_capture_similarity", type
 S{ env = "MEMO_FEEDBACK_ENABLED", key = "feedback_enabled", type = "boolean", default = false,
    group = "learning", doc = "Log every search (its text, the scope and the ids it returned, in this database; the ones that found nothing too) and detect missed memories. It is what the learned reranker trains on and what memo usage reads. Off by default because it keeps what was asked; older searches are removed (MEMO_FEEDBACK_RETENTION_DAYS says when, and what stays). If the project has joined an organization that shares more than signals, the queries go there too." }
 S{ env = "MEMO_FEEDBACK_RETENTION_DAYS", key = "feedback_retention_days", type = "integer", default = 90, min = 0, group = "learning",
-   doc = "How long the usage log keeps a search, in days (0: forever). Past it, the newest 20 searches (per scope) that offered each memory with a recorded reinforcement (praise, direct command, mistake, reversal or miss) stay — that is what the learned reranker trains on — and so does a row adopted from an organization. A folded memory counts as shown useful (MEMO_FOLD_USEFUL_OFFERS) only by the searches still in the log: keep this above the longer of MEMO_FOLD_GRACE_DAYS and MEMO_DIGEST_GRACE_DAYS." }
+   doc = "How long the usage log keeps a search, in days (0: forever). Past it, a search stays only if a reinforcement labels it (it is the newest search offering that memory in the 10 minutes before a praise, direct command, mistake or miss) — that is what the learned reranker trains on — and so does a row adopted from an organization. A folded memory counts as shown useful (MEMO_FOLD_USEFUL_OFFERS) only by the searches still in the log: keep this above the longer of MEMO_FOLD_GRACE_DAYS and MEMO_DIGEST_GRACE_DAYS." }
 S{ env = "MEMO_MISS_THRESHOLD", key = "miss_threshold", type = "number", min = 0, max = 1,
    implied = function(cfg) return M.same_memory(cfg) end, group = "learning",
    doc = "Similarity at which a new write reveals a memory a search missed (unset: the dedup threshold — one definition of \"the same memory\")." }
@@ -272,7 +272,7 @@ S{ env = "MEMO_ORG_NAME", key = "org_name", type = "string", group = "federation
    doc = "org: the org's name (its scope is org:<name>)." }
 S{ env = "MEMO_ORG_SHARE", key = "org_share", type = "string", default = "triples",
    values = { "triples", "signals" }, group = "federation", mcp_env = true, strict = true,
-   doc = "dev: push feedback with the query text (triples) or without (signals)." }
+   doc = "dev: push feedback with the query text and when each event and search happened (triples), or with neither (signals)." }
 S{ env = "MEMO_ORG_SYNC_TTL", key = "org_sync_ttl", type = "integer", default = 900, min = 0,
    group = "federation", doc = "dev: the org replica is synced again once this many seconds old." }
 S{ env = "MEMO_ORG_PROPOSE", key = "org_propose", type = "boolean", default = true, group = "federation",
@@ -322,8 +322,6 @@ M.OTHER_VARS = {
     MEMO_HOOK_MAX_CHARS = "Characters a capture hook keeps per message (default 500).",
     MEMO_HOOK_COOLDOWN_SECS = "Claude Code's post-message hook saves at most once per this many seconds (default 300).",
     MEMO_INDEX_NO_CTAGS = "1: memo index never uses universal-ctags.",
-    MEMO_RERANK_WEIGHTS = "The learned reranker's global weights file, used for a scope without promoted weights "
-        .. "(default luamemo/rerank_weights.json, relative to the working directory).",
     MEMO_PROJECTION_W = "The projected embedder's weights file (default luamemo/projection_W.json, relative to the "
         .. "working directory).",
     MEMO_NO_MAINTENANCE = "1: luamemo never starts its background maintenance process (memo maintain) — "
@@ -340,6 +338,7 @@ M.RETIRED = {
     MEMO_SECRETS_FILE = "secrets live in the database now (memo secret-store)",
     MEMO_URL = NO_SERVER, MEMO_TOKEN = NO_SERVER,
     MEMO_ORG_TOKEN_FILE = PAIRED, MEMO_ORG_TOKEN = PAIRED, MEMO_ORG_TOKENS = PAIRED,
+    MEMO_RERANK_WEIGHTS = "the learned reranker's models are kept per scope in the database now (memo learn)",
 }
 
 --- The entry of a MEMO_ name, a config key, or a name without MEMO_ (any case) | nil.

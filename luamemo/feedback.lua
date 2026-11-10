@@ -9,11 +9,11 @@
 --   * lm_reinforcements — corrections/outcomes on a memory
 --     (mistake / reversal / direct_command / miss / praise).
 --
--- harvest() joins them: for each reinforced memory, it finds retrieval events
--- whose candidate set contained that memory and emits a (query, positive,
--- negatives, weight, signal) triple. Because a positive requires a
--- reinforcement, RAW ACCESS FREQUENCY YIELDS NO TRAINING SIGNAL — corrections
--- and outcomes are the only thing that labels data, exactly as the plan requires.
+-- harvest() joins them: a reinforcement labels the search just before it that
+-- offered the memory, and emits a (query, positive, negatives, weight, signal, at)
+-- triple. Because a positive requires a reinforcement, RAW ACCESS FREQUENCY YIELDS
+-- NO TRAINING SIGNAL — corrections and outcomes are the only thing that labels data,
+-- exactly as the plan requires.
 --
 -- log_retrieval() / log_no_result() are fail-silent; store.search calls them only
 -- when config.feedback_enabled is true, so the log is inert by default. The log
@@ -45,6 +45,7 @@ M.REINFORCE_WEIGHT = REINFORCE_WEIGHT
 M.POSITIVE_SQL = "('praise', 'direct_command')"
 M.NEGATIVE_SQL = "('mistake', 'reversal')"
 M.MISTAKE_SQL  = "('mistake', 'direct_command')"   -- the digest's: the mistakes behind a memory (escalation, the core tier)
+M.LABEL_SQL    = "('praise', 'direct_command', 'mistake', 'miss')"   -- the learner's: a reversal is not one (the digest lowers that memory, the fold counts it as wrong)
 
 -- candidate_ids comes back decoded (a Lua array); tolerate a "[1,2,3]" string too.
 local function id_list(v)
@@ -99,25 +100,28 @@ function M.retention_days(cfg)
     return settings.number(cfg or _cfg, "feedback_retention_days")
 end
 
--- harvest() reads the newest HARVEST_EVENTS searches that offered a reinforced memory; KEEP_PER_REINFORCED of them
--- are kept per such memory, past the retention, so the learner still has more than it reads (the setting's text in
--- settings.lua names the number; test_log_retention checks it says the same).
-M.HARVEST_EVENTS = 5
-M.KEEP_PER_REINFORCED = 4 * M.HARVEST_EVENTS
+-- "Just before": the one definition, for a reinforcement's label and for a miss.
+M.JUST_BEFORE_MINUTES = 10
+local JUST_BEFORE_US = M.JUST_BEFORE_MINUTES * 60 * 1000000
+
+-- The search a reinforcement `r` labels, as a scalar subquery: the newest at or before it, within the window, that offered
+-- the memory in the same scope and from the same place (this device, or the same dev on a central). harvest trains on
+-- this row and prune keeps this row, so they agree on which search a reinforcement labels. (harvest reads only each scope's
+-- newest 1000 reinforcements; prune keeps the older ones' searches too, at most one each.)
+local LABELLED_SEARCH_SQL = "SELECT f.id FROM lm_retrieval_candidates c JOIN lm_retrieval_feedback f ON f.id = c.feedback_id "
+    .. "WHERE c.memory_id = r.memory_id AND f.scope = r.scope AND f.source IS r.source AND f.created_at <= r.created_at "
+    .. ("AND f.created_at >= r.created_at - %d ORDER BY f.created_at DESC, f.id DESC LIMIT 1"):format(JUST_BEFORE_US)
 
 --- Remove the searches older than the retention that nothing learns from. → rows removed | nil, err (the delete failed)
--- Kept: the newest KEEP_PER_REINFORCED searches (per scope) that offered each memory someone reinforced (feedback.harvest turns
--- exactly those into training triples), and a row adopted from an organization (source set: not ours to drop).
--- A search that found nothing offered no memory, so it goes at the same age.
+-- Kept: a search a reinforcement labels, and a row adopted from an organization (source set: not ours to drop). A
+-- reinforcement arrives within the window, so a search older than the retention can never gain a label. A search that found
+-- nothing offered no memory, so it goes at the same age.
 function M.prune()
     local days = M.retention_days()
     if days <= 0 then return 0 end
     local ok, n, err = pcall(db.run, "DELETE FROM lm_retrieval_feedback WHERE source IS NULL AND created_at < ? AND id NOT IN ("
-        .. "SELECT feedback_id FROM (SELECT c.feedback_id AS feedback_id, row_number() OVER ("
-        .. "PARTITION BY c.memory_id, f.scope ORDER BY f.created_at DESC, f.id DESC) AS rn "
-        .. "FROM lm_retrieval_candidates c JOIN lm_retrieval_feedback f ON f.id = c.feedback_id "
-        .. "WHERE c.memory_id IN (SELECT DISTINCT memory_id FROM lm_reinforcements)) WHERE rn <= ?)",
-        util.now_us() - days * DAY_US, M.KEEP_PER_REINFORCED)
+        .. "SELECT id FROM (SELECT (" .. LABELLED_SEARCH_SQL .. ") AS id FROM lm_reinforcements r WHERE r.event_type IN "
+        .. M.LABEL_SQL .. ") WHERE id IS NOT NULL)", util.now_us() - days * DAY_US)
     if not ok then return nil, tostring(n) end
     if n == nil then return nil, tostring(err) end
     return tonumber(n) or 0
@@ -130,8 +134,6 @@ function M.log_no_result(scope, query)
     -- write's maintenance or by the session brief.)
     return insert_row(scope, query, M.EMPTY)
 end
-
-M.MISS_WINDOW_MINUTES = 10
 
 -- The kinds of miss, and how one is written in the note of its lm_reinforcements row (store writes it, memo usage reads it).
 M.MISS_KINDS = { "not-offered", "offered", "no-search" }
@@ -146,10 +148,10 @@ function M.parse_miss_note(note)
 end
 
 --- A memory was written again (a near-duplicate): was it a ranking miss? Looks at the searches in that scope in the
---- last MISS_WINDOW_MINUTES. → "no-search" (nobody looked: a habit, not the ranking's fault) | "offered" (a search
+--- last JUST_BEFORE_MINUTES. → "no-search" (nobody looked: a habit, not the ranking's fault) | "offered" (a search
 --- offered it and it was written anyway) | "not-offered" (a search ran and did not offer it: the ranking missed it)
 function M.miss_kind(scope, memory_id)
-    local since = util.now_us() - M.MISS_WINDOW_MINUTES * 60 * 1000000
+    local since = util.now_us() - JUST_BEFORE_US
     local ok, row = pcall(db.first, "SELECT count(*) AS n, COALESCE(sum(EXISTS(SELECT 1 FROM lm_retrieval_candidates c "
         .. "WHERE c.feedback_id = f.id AND c.memory_id = ?)), 0) AS offered FROM lm_retrieval_feedback f "
         .. "WHERE f.scope = ? AND f.created_at >= ?", math.floor(tonumber(memory_id) or 0), scope, since)
@@ -208,50 +210,48 @@ function M.record_reinforcement(memory_id, scope, event_type, delta, note)
     return true
 end
 
---- Harvest (query, positive, negatives, weight, signal) triples for a scope by
---- joining reinforcements to the retrieval events that surfaced them.
---- Deduplicated by (query, positive), keeping the highest-weight signal, so a
---- single strong correction outranks many weak repeats.
--- @param opts.limit         max reinforcement events to consider (default 1000)
--- @param opts.recent_events retrieval events scanned per positive (default HARVEST_EVENTS)
--- @return array of { query, positive, negatives[], weight, signal }
+--- Harvest (query, positive, negatives, weight, signal, at) triples for a scope: each reinforcement labels the newest
+--- search at or before it, within the window, that offered the memory and came from the same place (this device, or
+--- the same dev on a central). `at` is when that search ran: what search could have known then is what the example
+--- may use. Deduplicated by (query, positive), keeping the highest-weight signal, so a single strong correction
+--- outranks many weak repeats. In a fixed order, so the same database always trains the same model.
+-- @param opts.limit  max reinforcement events to consider (default 1000)
+-- @return array of { query, positive, negatives[], weight, signal, at }
 function M.harvest(scope, opts)
     opts = opts or {}
     local ev_limit = tonumber(opts.limit) or 1000
-    local per_pos  = tonumber(opts.recent_events) or M.HARVEST_EVENTS
 
-    local reinf = db.query("SELECT memory_id, event_type FROM lm_reinforcements WHERE scope = ? "
-        .. "ORDER BY created_at DESC, id DESC LIMIT ?", scope, ev_limit)
-    if not reinf then return {} end
+    local labels = db.query("SELECT r.memory_id, r.event_type, f.query, f.candidate_ids, f.created_at FROM ("
+        .. "SELECT * FROM lm_reinforcements WHERE scope = ? AND event_type IN " .. M.LABEL_SQL
+        .. " ORDER BY created_at DESC, id DESC LIMIT ?) r JOIN lm_retrieval_feedback f ON f.id = (" .. LABELLED_SEARCH_SQL
+        .. ") ORDER BY r.created_at DESC, r.id DESC", scope, ev_limit)
+    if not labels then return {} end
 
     local best = {}   -- "query\0positive" -> triple (highest weight wins)
-    for _, r in ipairs(reinf) do
-        local pos = tonumber(r.memory_id)
-        local w   = REINFORCE_WEIGHT[r.event_type] or 1.0
-        if pos then
-            local events = db.query("SELECT f.query, f.candidate_ids FROM lm_retrieval_candidates c "
-                .. "JOIN lm_retrieval_feedback f ON f.id = c.feedback_id "
-                .. "WHERE c.memory_id = ? AND f.scope = ? ORDER BY f.created_at DESC, f.id DESC LIMIT ?",
-                pos, scope, per_pos)
-            for _, e in ipairs(events or {}) do
-                local negs = {}
-                for _, cid in ipairs(id_list(e.candidate_ids)) do
-                    if cid ~= pos then negs[#negs + 1] = cid end
-                end
-                if #negs > 0 then
-                    local key  = tostring(e.query) .. "\0" .. tostring(pos)
-                    local prev = best[key]
-                    if not prev or w > prev.weight then
-                        best[key] = { query = e.query, positive = pos, negatives = negs,
-                                      weight = w, signal = r.event_type }
-                    end
-                end
+    for _, e in ipairs(labels) do
+        local pos = tonumber(e.memory_id)
+        local w = REINFORCE_WEIGHT[e.event_type] or 1.0
+        local negs = {}
+        for _, cid in ipairs(id_list(e.candidate_ids)) do
+            if cid ~= pos then negs[#negs + 1] = cid end
+        end
+        if #negs > 0 then
+            local key  = tostring(e.query) .. "\0" .. tostring(pos)
+            local prev = best[key]
+            if not prev or w > prev.weight then
+                best[key] = { query = e.query, positive = pos, negatives = negs,
+                              weight = w, signal = e.event_type, at = tonumber(e.created_at) }
             end
         end
     end
 
     local out = {}
     for _, t in pairs(best) do out[#out + 1] = t end
+    table.sort(out, function(a, b)
+        if a.at ~= b.at then return a.at < b.at end
+        if a.positive ~= b.positive then return a.positive < b.positive end
+        return a.query < b.query
+    end)
     return out
 end
 

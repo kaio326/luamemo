@@ -11,7 +11,7 @@
 -- overlap gold's vector toward the query, changing what is retrieved.
 --
 -- Versioned matrix artifact (path via MEMO_PROJECTION_W): save_version / promote /
--- rollback / load_current, mirroring luamemo.rerank_train.
+-- rollback / load_current.
 
 local cjson = require("luamemo.json")   -- lua-cjson when installed, else the bundled dkjson
 

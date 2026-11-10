@@ -331,25 +331,34 @@ version of this table (R@1 52.3) worse than the store deserved, both of the benc
 a file question's answer was only the file's own row (the symbols it defines, which name the file, count now),
 and a rescan had written the README rows twice, so half of those questions had an identical twin ranked first.
 
+**Rerun 2026-11-09 under 0.5.3's gate** (same database and defaults; `sqrt`, 68.0 without reranking, 1,822
+questions in scopes with a history — down from 2,607 because the probes gate now skips a scope with too
+few memories to check for harm, below):
+
 | Learned reranker, R@1 without it | after 100 outcomes | after 1,000 | after 10,000 |
 |---|---|---|---|
-| under `sqrt` (the default), 63.9 without: ΔR@1 (95 % CI), 2,607 questions | +3.38 (±1.12) | +3.38 (±1.17) | +1.99 (±1.07) |
+| ΔR@1 (95 % CI) | +4.56 (±1.03) | +4.67 (±1.05) | +4.67 (±1.05) |
+| … on the 1,656 questions whose answer nobody had confirmed before | +4.89 | +4.95 | +4.95 |
+| scopes promoted / rejected (by the probes gate) / skipped | 10 / 0 (0) / 374 | 10 / 0 (0) / 374 | 10 / 0 (0) / 374 |
+
+Fewer scopes promote than before (10 against 76), because most now fail the probes gate's own minimum (5
+memories with a title nobody has confirmed, to check the model for harm) rather than the old loss-only gate.
+The unconfirmed-questions row is new: those are exactly the queries round 1's review found invisible to the
+old gate (every training example was a case where a reinforced memory should win), and the lift holds on them
+too. This run used only `sqrt`; the `linear` row below is **from before the fix** and is kept for history, not
+as a current number — the gate it was measured under leaked the confirmation count into its own test.
+
+| Learned reranker, R@1 without it (pre-0.5.3, superseded above) | after 100 outcomes | after 1,000 | after 10,000 |
+|---|---|---|---|
+| under `sqrt`, 63.9 without: ΔR@1 (95 % CI), 2,607 questions | +3.38 (±1.12) | +3.38 (±1.17) | +1.99 (±1.07) |
 | under `linear`, 61.7 without | +0.38 (±0.93) | +5.56 (±1.30) | +6.44 (±1.36) |
 | scopes promoted / rejected / skipped | 76 / 0 / 308 | 76 / 0 / 308 | 76 / 0 / 308 |
 
-The default curve already does part of what the learner learned (it stops a heavy memory covering a better
-match), so under `sqrt` the learned reranker adds about 3½ points of R@1 at 100 and 1,000 outcomes and less at
-10,000 (+2.0): the scopes that reach 10,000 are the ones the simulation asks the same questions six times
-over (`--heavy-cycles`), and a learner fed the same questions again probably fits them rather than learning more
-(not tested: the drop could also be noise at the edge of the interval). Under
-`linear` it moved nothing at 100 outcomes and gained 5½ to 6½ points at 1,000 and 10,000. Read both with the
-caveats: the person is simulated (a
-click model that the learner may fit — a real person's corrections are noisier), the gain is pooled over the
-76 scopes the gate promoted (it skips a scope with too few outcomes, which is most of them), and a point
-trains on the newest N outcomes *of each scope*, so a scope with fewer outcomes than N contributes all it
-has: the step from 1,000 to 10,000 comes from the handful of scopes that have more than 1,000 (the largest
-has 9,654), repeated six times each (`--heavy-cycles`). An earlier version of this table showed the same
-number at every point; the benchmark had not cleared the reranker's in-memory weights between points.
+Read every number here with the caveats: the person is simulated (a click model the learner may fit — a real
+person's corrections are noisier), the gain is pooled over the scopes the gate promoted, and a point trains on
+the newest N outcomes *of each scope*, so a scope with fewer outcomes than N contributes all it has: the step
+from 1,000 to 10,000 comes from the handful of scopes that have more than 1,000 (the largest has 9,654),
+repeated six times each (`--heavy-cycles`).
 
 **The other four suites** (same database and day):
 
