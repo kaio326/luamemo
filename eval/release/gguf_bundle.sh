@@ -17,9 +17,8 @@ set -euo pipefail
 VERSION="${1:?usage: gguf_bundle.sh VERSION [OUTDIR]}"
 OUT="${2:-dist}"
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-NATIVE="$REPO/luamemo/embedders/native"
-TAG="${LLAMA_TAG:-$(sed -n 's/^M\.LLAMA_TAG = "\(.*\)"$/\1/p' "$NATIVE/bundle.lua")}"
-[[ -n "$TAG" ]] || { echo "gguf_bundle: no M.LLAMA_TAG in $NATIVE/bundle.lua" >&2; exit 1; }
+TAG="${LLAMA_TAG:-$(bash "$REPO/eval/release/source_build.sh" --tag)}"
+[[ -n "$TAG" ]] || { echo "gguf_bundle: no M.LLAMA_TAG in luamemo/embedders/native/bundle.lua" >&2; exit 1; }
 
 case "$(uname -s)" in
     Linux)  os=linux ;;
@@ -56,11 +55,11 @@ cmake --build "$LL/build" --target llama -j "$(getconf _NPROCESSORS_ONLN 2>/dev/
 echo "== shim"
 if [[ $os == linux ]]; then
     cp -P "$LL"/build/bin/lib*.so* "$STAGE"/
-    cc -O2 -fPIC -shared "$NATIVE/gguf_shim.c" -o "$STAGE/gguf_shim.so" \
+    cc -O2 -fPIC -shared "$REPO/gguf/gguf_shim.c" -o "$STAGE/gguf_shim.so" \
         -I"$LL/include" -I"$LL/ggml/include" -L"$STAGE" -Wl,-rpath,'$ORIGIN' -lllama -lm
 else
     cp -P "$LL"/build/bin/lib*.dylib "$STAGE"/
-    cc -O2 -fPIC -shared "$NATIVE/gguf_shim.c" -o "$STAGE/gguf_shim.so" \
+    cc -O2 -fPIC -shared "$REPO/gguf/gguf_shim.c" -o "$STAGE/gguf_shim.so" \
         -I"$LL/include" -I"$LL/ggml/include" -L"$STAGE" -Wl,-rpath,@loader_path -lllama -lm
 fi
 printf '%s\n' "llama.cpp $TAG, built $(date -u +%Y-%m-%d) for $os-$arch by eval/release/gguf_bundle.sh" \

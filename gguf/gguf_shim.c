@@ -9,7 +9,7 @@
  * EmbeddingGemma-300M, but swappable), mean-pools the token embeddings, and
  * L2-normalises the result.
  *
- * Build (see luamemo/embedders/native/build.sh):
+ * Build (see gguf/build.sh):
  *   cc -O2 -fPIC -shared gguf_shim.c -o gguf_shim.so \
  *      -I<llama.cpp>/include -I<llama.cpp>/ggml/include \
  *      -L<llama.cpp>/build/bin -lllama -lm

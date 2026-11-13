@@ -95,7 +95,7 @@ S{ env = "MEMO_GGUF_NCTX", key = "gguf_n_ctx", type = "integer", min = 1, group 
 S{ env = "MEMO_GGUF_NGL", key = "gguf_n_gpu", type = "integer", implied = 0, min = -1, group = "embedder",
    aliases = { "MEMO_GEMMA_NGL" }, doc = "GPU layers for the GGUF embedder: 0 CPU, N layers, -1 all." }
 S{ env = "MEMO_GGUF_SHIM", key = "gguf_shim_path", type = "string", group = "embedder",
-   aliases = { "MEMO_GEMMA_SHIM" }, doc = "Path of the built GGUF shim (default: the one next to luamemo)." }
+   aliases = { "MEMO_GEMMA_SHIM" }, doc = "Path of the GGUF shim (default: the one gguf/build.sh makes, ~/.local/share/luamemo/native/gguf_shim.so; memo gguf install sets this)." }
 S{ env = "MEMO_CA_FILE", type = "string", group = "embedder", mcp_env = true,
    doc = "A PEM certificate (or CA) trusted for https:// calls besides the system's — a self-hosted service's." }
 S{ env = "MEMO_SKIP_EMBED_PROBE", key = "skip_embed_probe", type = "boolean", default = false,

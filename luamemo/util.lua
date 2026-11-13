@@ -475,6 +475,14 @@ function M.with_umask(mask, fn, ...)
     return unpack(res, 2, res.n)
 end
 
+--- luamemo's data directory: $XDG_DATA_HOME/luamemo, else ~/.local/share/luamemo — the
+--- databases, the prebuilt and source-built GGUF runtime (native/), the hook copies.
+function M.data_dir()
+    local base = os.getenv("XDG_DATA_HOME")
+    if not base or base == "" then base = (os.getenv("HOME") or ".") .. "/.local/share" end
+    return base .. "/luamemo"
+end
+
 --- Create a directory and its missing parents; a directory created here is 0700, and
 --- with `own` (luamemo's own: the keyring, the vault key) an existing one is made 0700
 --- too. Otherwise a directory that already exists is left as it is — a database's

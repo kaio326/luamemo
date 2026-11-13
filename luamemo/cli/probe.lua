@@ -191,7 +191,7 @@ function M.gguf()
     local have_cmake  = M.has_command("cmake")
     local have_git    = M.has_command("git")
     local shim_mod    = require("luamemo.embedders.native.ffi_shim")
-    local have_shim   = shim_mod.exists(shim_mod.shim_path())
+    local have_shim   = not shim_mod.missing()
     local prebuilt    = (not have_shim) and require("luamemo.embedders.native.bundle").available() or nil
     local buildable   = have_cc and have_cmake and have_git
     local missing = {}
@@ -248,7 +248,7 @@ function M.gguf_model_settings(path)
 end
 
 -- Directory holding the luamemo/ module tree this file was loaded from, so a
--- luajit subprocess resolves the same modules (and the same gguf_shim.so).
+-- luajit subprocess resolves the same modules.
 local function module_root()
     local src = debug.getinfo(1, "S").source:gsub("^@", "")
     return src:match("^(.*)[/\\]luamemo[/\\]cli[/\\]probe%.lua$")
@@ -262,7 +262,7 @@ end
 -- gguf().ok. Returns { ready = bool, model = path?, dim = n?, reason = str? }.
 function M.gguf_ready()
     local shim = require("luamemo.embedders.native.ffi_shim")
-    if not shim.exists(shim.shim_path()) then
+    if shim.missing() then
         return { ready = false, reason = "native shim not built" }
     end
     local model = M.gguf_model_path()

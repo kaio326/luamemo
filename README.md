@@ -166,7 +166,7 @@ pure-Lua fallback is bundled, and used with an older one),
 languages beyond Lua, Python and JS/TS), and for the in-process GGUF embedder
 either nothing (`memo gguf install` downloads the release's prebuilt runtime for
 Linux x86_64 and macOS arm64, checked against the checksum the rock ships) or a C
-toolchain + cmake to build it (`luamemo/embedders/native/build.sh`).
+toolchain + cmake to build it (`gguf/build.sh`; `memo gguf status` prints its path).
 
 | System | Packages |
 |---|---|
@@ -309,7 +309,7 @@ are listed by neither — open the client once, then run `memo doctor`.
 | `memo maintain [--scope S] [--all] [--digest] [--summarize] [--review] [--learn] [--quiet] [--max-seconds N]` | The maintenance that runs beside the agent — the digest, one batch of summarizing, the review of folded memories whose grace period is over, the learned reranker's training, the usage log's retention. A write that makes it due starts it in the background, silent (`<database>.maintenance.log` has the result); run by hand it prints a line per scope, and what went wrong. `--max-seconds N` (default 900): no part is started after N seconds, for the whole run however many scopes `--all` takes, and the review stops there; N must be a positive number or it is a usage error |
 | `memo usage [--scope S] [--days N] [--gap SECONDS] [--json]` | What the usage log says about how your agent really uses memory — searches, follow-ups within `--gap` seconds (default 120: asked again / in other words), what was said afterwards, where a memory confirmed useful stood in the results. Needs `MEMO_FEEDBACK_ENABLED=true`; reads only |
 | `memo eval status / install / fetch / run / history / build-corpus` | The retrieval benchmarks on your machine — R@k, miss rate, bytes to the right memory — from an optional, checksum-checked kit ([Benchmarks](#benchmarks)) |
-| `memo ping` / `memo doctor` | Health check (libraries, database, embedder) / corpus health (truncation, row sizes) and MCP clients too old for something luamemo needs |
+| `memo ping` / `memo doctor` | Health check (libraries, database, embedder) / corpus health (truncation, row sizes), the GGUF runtime when the embedder is `gguf_ffi`, and MCP clients too old for something luamemo needs |
 | `memo write` / `search` / `recent` / `get` / `update` | The memories, as the MCP tools do |
 | `memo delete ID` · `memo delete --scope S [--kind K] [--meta JSON] [--yes]` | Delete one (a `warning` in the answer when the observations made from it could not be removed), or preview a filter and delete it with `--yes` |
 | `memo context QUERY` | Search + current facts in one block, formatted for an agent |

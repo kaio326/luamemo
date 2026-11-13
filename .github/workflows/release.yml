@@ -2,6 +2,7 @@
 # luamemo.VERSION, with its rockspec and its CHANGELOG section already on the branch).
 #   1. the checks, and the whole CI (tests + rock smoke test) on that commit;
 #   2. the prebuilt GGUF runtime for Linux x86_64 and macOS arm64 (eval/release/gguf_bundle.sh);
+#      the Linux one is loaded through an installed rock in a read-only job (runtime-smoke);
 #   3. the eval kit (eval/release/eval_kit.sh — the benchmark runners `memo eval install`
 #      downloads); the release commit — the runtimes' checksums in
 #      luamemo/embedders/native/bundles.lua, the kit's in luamemo/evalkit.lua, the
@@ -78,8 +79,32 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The Linux x86_64 runtime the release is about to publish, loaded through an installed rock
+  # (eval/release/smoke.sh). A job of its own: it executes a library built from an upstream llama.cpp
+  # tag, so it holds no write token and keeps no git credentials.
+  runtime-smoke:
+    needs: [checks, gguf]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0 (pinned by commit; Node 24)
+        with:
+          persist-credentials: false
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends luajit luarocks libsqlite3-0 libsodium23 lua-socket jq git build-essential
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131   # v7.0.0 (Node 24)
+        with:
+          name: gguf-ubuntu-24.04
+          path: dist
+      - name: Smoke test with the runtime
+        run: SMOKE_GGUF_BUNDLE="dist/luamemo-gguf-$VERSION-linux-x86_64.tar.gz" bash eval/release/smoke.sh "luamemo-$VERSION-1.rockspec"
+
   release:
-    needs: [ci, gguf]
+    needs: [ci, gguf, runtime-smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

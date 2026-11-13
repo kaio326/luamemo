@@ -3,7 +3,7 @@
 -- built (owner, 2026-10-15). The checksums come with the rock (bundles.lua): a download
 -- that doesn't match is refused. Installed into ~/.local/share/luamemo/native/<version>-
 -- <platform>/; MEMO_GGUF_SHIM points luamemo at it. Without a checksum for this machine
--- (a checkout, another platform) the shim is built from source (build.sh) as before.
+-- (a checkout, another platform) the shim is built from source (gguf/build.sh) as before.
 
 local M = {}
 
@@ -48,13 +48,15 @@ function M.available(version)
     local entry = ok_sums and type(sums) == "table" and sums.version == version and sums[platform]
     if not (entry and entry.sha256 and entry.asset) then
         return nil, ("no prebuilt runtime for %s in luamemo %s (a checkout, or not built for it) — "
-            .. "build it from source: luamemo/embedders/native/build.sh"):format(platform, version)
+            .. "build it from source: %s"):format(platform, version,
+            require("luamemo.embedders.native.ffi_shim").build_hint())
     end
     local cok, cerr = M.cpu_ok(platform)
     if not cok then return nil, cerr end
-    local data = os.getenv("XDG_DATA_HOME")
-    data = ((data and data ~= "") and data or ((os.getenv("HOME") or "") .. "/.local/share")) .. "/luamemo"
-    local dir = ("%s/native/%s-%s"):format(data, version, platform)
+    -- (never installed into, or loaded from, a place that depends on the working directory)
+    local refusal = require("luamemo.embedders.native.ffi_shim").data_dir_refusal()
+    if refusal then return nil, "no place to install it: " .. refusal .. " — fix that first" end
+    local dir = ("%s/native/%s-%s"):format(util.data_dir(), version, platform)
     return {
         platform = platform, asset = entry.asset, sha256 = entry.sha256:lower(),
         url = ("%s/releases/download/v%s/%s"):format(M.REPO_URL, version, entry.asset),

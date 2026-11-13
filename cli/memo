@@ -188,9 +188,10 @@
 #                    needs no MEMO_* environment; --print-config: that client entry)
 #
 #   memo gguf       [status | install]
-#                   (the in-process GGUF embedder's runtime: what is in use and whether it
-#                    loads; install downloads this release's prebuilt one for this machine,
-#                    checked against the checksum the install ships)
+#                   (the in-process GGUF embedder's runtime: what is in use, which rule found
+#                    it, whether it loads, and where gguf/build.sh is; install downloads this
+#                    release's prebuilt one for this machine, checked against the checksum
+#                    the install ships)
 #
 #   memo eval       status [--json] | install [--from CHECKOUT] | fetch NAME… [--yes]
 #                   | run [BENCH…] [--tier quick|standard|full|corpus] [--embedder E[,E…]] [--n N]
@@ -231,7 +232,8 @@
 #
 #   memo doctor
 #                   (health report: corpus truncation and row sizes, language model,
-#                    background maintenance, usage log, MCP clients, Claude Code hooks)
+#                    background maintenance, usage log, MCP clients, Claude Code hooks,
+#                    the GGUF runtime when the embedder is gguf_ffi — exit 1 when it is missing)
 #
 #   memo secret-store   NAME [--desc DESCRIPTION] [--file PATH]
 #   memo secret-list

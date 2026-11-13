@@ -1,4 +1,5 @@
-# The full test suite and the rock's smoke test, on every push and pull request.
+# The full test suite and the rock's smoke test, and the GGUF shim built from source (Linux and
+# macOS), on every push and pull request.
 # Linux is the reference; macOS runs too but may fail without blocking (it is newer to
 # the suite: the runner and the tests pick GNU or BSD tools — timeout / gtimeout,
 # stat -c / -f, script -qec / -q — through eval/tests/_harness.lua).
@@ -93,3 +94,61 @@ jobs:
           v=$(luajit -e 'package.path="./?.lua;./?/init.lua;"..package.path io.write(require("luamemo").VERSION)')
           luajit eval/release/rockspec.lua "$v" --check
           bash eval/release/smoke.sh "luamemo-$v-1.rockspec"
+
+  # The GGUF shim built from source, as a user does it (llama.cpp built with the commands
+  # `memo calibrate` prints, then gguf/build.sh). Nothing else in CI runs build.sh. Unlike the
+  # macOS test job above, a red macOS here blocks: this job exists to test macOS.
+  source-build:
+    name: GGUF shim from source (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]   # (macos-15 is arm64)
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0 (pinned by commit; Node 24)
+
+      - name: Install (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            luajit libsqlite3-0 libsodium23 lua-socket jq git build-essential cmake
+
+      - name: Install (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install luajit luarocks sqlite libsodium jq cmake
+          luarocks --lua-dir="$(brew --prefix luajit)" --lua-version 5.1 install luasocket
+          echo "MEMO_LIB_SODIUM=$(brew --prefix libsodium)/lib/libsodium.dylib" >> "$GITHUB_ENV"
+          echo "MEMO_LIB_SQLITE3=$(brew --prefix sqlite)/lib/libsqlite3.dylib" >> "$GITHUB_ENV"
+          eval "$(luarocks --lua-dir="$(brew --prefix luajit)" --lua-version 5.1 path)"
+          echo "LUA_PATH=$LUA_PATH" >> "$GITHUB_ENV"
+          echo "LUA_CPATH=$LUA_CPATH" >> "$GITHUB_ENV"
+
+      - name: llama.cpp release
+        id: llama
+        run: echo "tag=$(bash eval/release/source_build.sh --tag)" >> "$GITHUB_OUTPUT"
+
+      # The first run builds llama.cpp (several minutes); it is saved as soon as it is built, so a
+      # failing check below doesn't throw the build away. Later runs reuse it.
+      # (the key holds the script too: it has the cmake recipe, and a change to it must rebuild)
+      - name: Restore llama.cpp
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0 (pinned by commit; Node 24)
+        with:
+          path: ${{ runner.temp }}/llama.cpp
+          key: llama-${{ matrix.os }}-${{ steps.llama.outputs.tag }}-${{ hashFiles('eval/release/source_build.sh') }}
+
+      - name: Build llama.cpp
+        run: bash eval/release/source_build.sh --llama-only "$RUNNER_TEMP/llama.cpp"
+
+      - name: Save llama.cpp
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0 (pinned by commit; Node 24)
+        with:
+          path: ${{ runner.temp }}/llama.cpp
+          key: llama-${{ matrix.os }}-${{ steps.llama.outputs.tag }}-${{ hashFiles('eval/release/source_build.sh') }}
+
+      - name: Build the shim from source
+        run: bash eval/release/source_build.sh "$RUNNER_TEMP/llama.cpp"

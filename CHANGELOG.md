@@ -1,6 +1,36 @@
 # Changelog
 
-## [0.5.3] — unreleased
+## [0.5.4] — unreleased
+
+A bug-fix release for the GGUF embedder (`MEMO_EMBEDDER=gguf_ffi`) when luamemo is installed with LuaRocks.
+
+- **Fixed: with luamemo installed through LuaRocks, the MCP server could not find a GGUF runtime built from source.**
+  Every tool that embeds text (`memory_write`, `memory_search`, …) failed with "cannot open shared object file", while
+  `memo` and `memo gguf status` said the runtime loaded. The rock installed a second copy of three modules beside
+  `mcp/`; the server put that directory first on its module path, loaded the copy, and looked for the runtime next to
+  it, while `build.sh` had put it next to the real modules. The rock now installs each module once, and the server runs
+  its own install's modules however it is started (through `memo`, or directly). The runtime is looked for in one place
+  that `memo` and the server share.
+- **Changed: `build.sh` is `gguf/build.sh`, and it builds into `~/.local/share/luamemo/native/`** for a checkout, the
+  plugin and a LuaRocks install alike, with no root needed (`gguf/build.sh --where` prints the place). `memo gguf status`
+  shows which rule found the runtime and where `build.sh` is; `memo doctor` fails, and says what to do, when the
+  embedder is `gguf_ffi` and the runtime is missing. `build.sh` now also accepts macOS's `libllama.dylib`. When
+  `MEMO_GGUF_SHIM` names a file that isn't there, the message says it wins over a runtime built from source (building
+  can't fix that) and offers `memo gguf install` or unsetting it. luamemo never loads a runtime from its default
+  place when that place depends on the working directory (`HOME` unset, a relative `XDG_DATA_HOME`), and `memo gguf
+  status` and `memo gguf install` don't touch it either: `status` says to fix `HOME` / `XDG_DATA_HOME` or to set
+  `MEMO_GGUF_SHIM` to an absolute path, and `install` (which always installs into the data directory) says to fix
+  `HOME` / `XDG_DATA_HOME`.
+- **Action needed if you built the runtime from source** (not if you used `memo gguf install`): build it once more with
+  `gguf/build.sh` (`memo gguf status` prints its path), or run `memo gguf install`. luamemo no longer looks for a runtime
+  next to its modules; the embedder's error, `memo gguf status` and `memo doctor` name the old file and the fix.
+- **Release checks.** The installed rock is now tested with the GGUF embedder, through `memo` and through the MCP server,
+  with a stand-in runtime; a log of where each module was loaded from proves the server runs the installed ones; the
+  GGUF runtime is built from source on Ubuntu and macOS in CI; and the prebuilt runtime a release is about to publish
+  must load through the installed rock first (in a job with a read-only token, because it executes a library built
+  from an upstream tag).
+
+## [0.5.3] — 2026-11-10
 
 A bug-fix release for the learned reranker (`MEMO_RERANK_ADAPTER=learned`). With any other reranker, nothing changes
 except the usage log's retention and, for a dev sharing queries with an organization, the time pushed with each event

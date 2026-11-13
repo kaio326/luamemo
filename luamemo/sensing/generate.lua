@@ -71,7 +71,7 @@ end
 --- Is in-process generation usable right now? (shim + model both present.)
 function M.available(cfg)
     local m = model_path(cfg)
-    return (m ~= nil and m ~= "") and ffishim.exists(ffishim.shim_path(cfg)) and ffishim.exists(m)
+    return (m ~= nil and m ~= "") and not ffishim.missing(cfg) and require("luamemo.util").exists(m)
 end
 
 --- complete(prompt, cfg, opts) -> string | nil, err. Greedy/deterministic. opts.max_tokens (cfg.max_tokens, 256).

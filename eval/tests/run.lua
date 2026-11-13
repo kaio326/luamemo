@@ -159,6 +159,17 @@ if not keep_env.MEMO_GGUF_MODEL then
     local m = real_home .. "/models/embeddinggemma-300M-Q8_0.gguf"
     if io.open(m, "rb") then setenv("MEMO_GGUF_MODEL", m) end
 end
+-- The runner's HOME and XDG_DATA_HOME are temporary, so the shim built in the real data directory would
+-- be out of sight, and test_gguf_ffi's live checks would skip. It is named for that file alone
+-- (LUAMEMO_TEST_GGUF_SHIM: not a MEMO_ name, which luamemo's settings check would reject): MEMO_GGUF_SHIM
+-- would change what every other file sees (memo calibrate would find a runtime here and not on CI).
+do
+    local data = os.getenv("XDG_DATA_HOME")
+    local s = keep_env.MEMO_GGUF_SHIM
+        or (((data and data:sub(1, 1) == "/") and data or (real_home .. "/.local/share")) .. "/luamemo/native/gguf_shim.so")
+    local f = io.open(s, "rb")
+    if f then f:close(); setenv("LUAMEMO_TEST_GGUF_SHIM", s) end
+end
 
 setenv("HOME", tmp .. "/home")
 setenv("XDG_CONFIG_HOME", tmp .. "/xdg-config")

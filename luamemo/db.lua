@@ -40,11 +40,7 @@ M.JSON_COLUMNS = {
 -- ---------------------------------------------------------------------------
 -- Where the database lives
 -- ---------------------------------------------------------------------------
-function M.data_dir()
-    local base = os.getenv("XDG_DATA_HOME")
-    if not base or base == "" then base = (os.getenv("HOME") or ".") .. "/.local/share" end
-    return base .. "/luamemo"
-end
+M.data_dir = require("luamemo.util").data_dir
 
 --- Create a database's directory and its missing parents (a directory luamemo creates is
 --- 0700; one that already exists is left as it is). luamemo.util.private_dir.

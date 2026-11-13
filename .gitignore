@@ -29,8 +29,10 @@ research/
 # Per-project local config written by memo calibrate (embedder/DB selection)
 .luamemorc
 
-# Phase 7 native embedder — built locally, never committed
+# A native embedder shim built locally, never committed (0.5.4 builds it in the data directory;
+# an earlier build.sh left one here, and a checkout may still hold it)
 luamemo/embedders/native/*.so
+gguf/*.so
 *.gguf
 
 # Local bug reports and working notes

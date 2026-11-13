@@ -404,6 +404,66 @@ local function scan_all(root, scope, flags)
     end
 end
 
+--- Step 1 of the optional GGUF upgrade (the runtime) as the text calibrate prints, for what probe.gguf() found:
+--- installed already, the prebuilt one to download, or llama.cpp and the shim to build — its last line a
+--- command that can be pasted into a shell.
+function M.runtime_step(gguf)
+    if gguf.shim then
+        return "  1. The runtime (gguf_shim.so) is installed already — nothing to do here.\n"
+    elseif gguf.prebuilt then
+        return "  1. Install the prebuilt runtime for " .. gguf.prebuilt.platform .. " (no compiler needed):\n"
+            .. "       memo gguf install\n"
+    end
+    return [[
+  1. Build llama.cpp (shared libs) and the shim:
+       git clone --depth 1 --branch ]] .. llama_tag() .. [[ https://github.com/ggml-org/llama.cpp ~/llama.cpp
+       cmake -B ~/llama.cpp/build -S ~/llama.cpp -DBUILD_SHARED_LIBS=ON \
+             -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+             -DLLAMA_BUILD_TOOLS=OFF -DCMAKE_BUILD_TYPE=Release
+       cmake --build ~/llama.cpp/build --target llama -j
+       LLAMA_DIR=~/llama.cpp bash ]] .. require("luamemo.embedders.native.ffi_shim").build_command() .. "\n"
+end
+
+--- The whole optional-upgrade text `memo calibrate` prints when it recommends the GGUF embedder, for what
+--- probe.gguf() found (the runtime step first: M.runtime_step).
+function M.upgrade_guide(gguf)
+    return [[
+
+Optional upgrade — in-process GGUF embedder (one-time setup)
+------------------------------------------------------------
+This host can run a GGUF embedding model INSIDE your process via LuaJIT FFI — no
+sidecar, no vendor API, owned weights (survives provider changes), and far better
+retrieval than hash. It is not set up yet, so calibrate configured the working
+embedder above; memo is usable now. Upgrade whenever you like:
+
+]] .. M.runtime_step(gguf) .. [[
+
+  2. Download the model (EmbeddingGemma 2 recommended; ~300 MB, needs the runtime of
+     step 1 from luamemo 0.5.2 or newer):
+       mkdir -p ~/models && curl -sL -o ~/models/embeddinggemma-2-Q8_0.gguf \
+         ]] .. require("luamemo.cli.probe").GGUF_DEFAULT_URL .. [[
+
+     Want a different / newer open-weights model instead? Point MEMO_GGUF_MODEL
+     at ANY llama.cpp-compatible GGUF embedding model — gemma is just the default.
+
+  3. Check it: re-run `memo calibrate --probe-only` — the GGUF line must say "ready".
+
+  4. Switch this project:
+       memo config set MEMO_EMBEDDER gguf_ffi
+       memo config set MEMO_GGUF_MODEL <path-to.gguf>
+       memo config set MEMO_EMBED_DIM 768
+       memo config set MEMO_EMBED_MAX_CHARS 24000
+       memo config set MEMO_EMBED_PROMPTS auto    (EmbeddingGemma 2's task prompts)
+       memo config unset MEMO_EMBEDDER_URL        (and MEMO_EMBEDDER_ADAPTER, if set)
+     Then restart the MCP server in your client, and re-embed what is already
+     stored:  memo reembed --all
+     (the database moves to the new vector size once every scope is re-embedded).
+
+Hide this suggestion: re-run `memo calibrate --no-gguf`.
+]]
+end
+
 --- What `memo calibrate`'s scan would write for a project, as rows (the tables `memo write`
 --- takes: scope, kind, title, body, importance, tags, metadata, dedup_strategy), without
 --- touching the project or any database — the same code, the same rows. flags: no_comments,
@@ -563,60 +623,7 @@ function M.run(argv)
         or "\nSettings (recorded in .luamemorc unless it already sets them):\n")
     for _, kv in ipairs(recommended) do io.write("  ", kv[1], "=", kv[2], "\n") end
 
-    if rec.gguf_upgrade then
-        local step1
-        if gguf.shim then
-            step1 = "  1. The runtime (gguf_shim.so) is installed already — nothing to do here.\n"
-        elseif gguf.prebuilt then
-            step1 = "  1. Install the prebuilt runtime for " .. gguf.prebuilt.platform .. " (no compiler needed):\n"
-                .. "       memo gguf install\n"
-        else
-            step1 = [[
-  1. Build llama.cpp (shared libs) and the shim:
-       git clone --depth 1 --branch ]] .. llama_tag() .. [[ https://github.com/ggml-org/llama.cpp ~/llama.cpp
-       cmake -B ~/llama.cpp/build -S ~/llama.cpp -DBUILD_SHARED_LIBS=ON \
-             -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
-             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
-             -DLLAMA_BUILD_TOOLS=OFF -DCMAKE_BUILD_TYPE=Release
-       cmake --build ~/llama.cpp/build --target llama -j
-       LLAMA_DIR=~/llama.cpp bash <luamemo>/embedders/native/build.sh
-]]
-        end
-        io.write([[
-
-Optional upgrade — in-process GGUF embedder (one-time setup)
-------------------------------------------------------------
-This host can run a GGUF embedding model INSIDE your process via LuaJIT FFI — no
-sidecar, no vendor API, owned weights (survives provider changes), and far better
-retrieval than hash. It is not set up yet, so calibrate configured the working
-embedder above; memo is usable now. Upgrade whenever you like:
-
-]] .. step1 .. [[
-
-  2. Download the model (EmbeddingGemma 2 recommended; ~300 MB, needs the runtime of
-     step 1 from luamemo 0.5.2 or newer):
-       mkdir -p ~/models && curl -sL -o ~/models/embeddinggemma-2-Q8_0.gguf \
-         ]] .. require("luamemo.cli.probe").GGUF_DEFAULT_URL .. [[
-
-     Want a different / newer open-weights model instead? Point MEMO_GGUF_MODEL
-     at ANY llama.cpp-compatible GGUF embedding model — gemma is just the default.
-
-  3. Check it: re-run `memo calibrate --probe-only` — the GGUF line must say "ready".
-
-  4. Switch this project:
-       memo config set MEMO_EMBEDDER gguf_ffi
-       memo config set MEMO_GGUF_MODEL <path-to.gguf>
-       memo config set MEMO_EMBED_DIM 768
-       memo config set MEMO_EMBED_MAX_CHARS 24000
-       memo config set MEMO_EMBED_PROMPTS auto    (EmbeddingGemma 2's task prompts)
-       memo config unset MEMO_EMBEDDER_URL        (and MEMO_EMBEDDER_ADAPTER, if set)
-     Then restart the MCP server in your client, and re-embed what is already
-     stored:  memo reembed --all
-     (the database moves to the new vector size once every scope is re-embedded).
-
-Hide this suggestion: re-run `memo calibrate --no-gguf`.
-]])
-    end
+    if rec.gguf_upgrade then io.write(M.upgrade_guide(gguf)) end
 
     if flags.write then
         local f, ferr = io.open(flags.write, "w")

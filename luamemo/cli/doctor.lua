@@ -6,7 +6,8 @@
 --
 -- Reads the same settings as every other memo command (.luamemorc / MEMO_*).
 --
--- Exit codes: 0 = OK / WARN, 1 = FAIL (truncation > 10%, DB error, settings), 2 = unknown flag.
+-- Exit codes: 0 = OK / WARN, 1 = FAIL (truncation > 10%, DB error, settings, the GGUF runtime
+-- missing while the embedder is gguf_ffi), 2 = unknown flag.
 
 local M = {}
 
@@ -105,8 +106,16 @@ function M.run(argv)
     end
 
     local exit_code = 0
+    -- The in-process GGUF embedder can't run without its runtime (the same message memo gguf status
+    -- and the embedder's own error give).
+    local shim_why = lm.config.embedder_local == "gguf_ffi"
+        and require("luamemo.embedders.native.ffi_shim").missing(lm.config) or nil
+    if shim_why then
+        io.write("[FAIL] " .. shim_why .. "\n")
+        exit_code = 1
+    end
     if #stats.warnings == 0 then
-        io.write("[OK] No issues detected.\n")
+        if not shim_why then io.write("[OK] No issues detected.\n") end
     else
         for _, w in ipairs(stats.warnings) do
             io.write("[WARN] " .. w .. "\n")

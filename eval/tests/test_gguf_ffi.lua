@@ -5,8 +5,9 @@
 --     Matryoshka truncation renormalised. (Skips those live checks if the
 --     shim/model are absent — they are built/downloaded locally, gitignored.)
 --
--- Usage:
---   MEMO_GGUF_MODEL=~/models/embeddinggemma-300M-Q8_0.gguf luajit eval/tests/run.lua --only gguf_ffi
+-- Usage (the runner finds a shim built in the real data directory and hands it to this file alone as
+-- LUAMEMO_TEST_GGUF_SHIM, and ~/models/embeddinggemma-300M-Q8_0.gguf; MEMO_GGUF_SHIM / MEMO_GGUF_MODEL name others):
+--   MEMO_GGUF_MODEL=~/models/embeddinggemma-2-Q8_0.gguf luajit eval/tests/run.lua --only gguf_ffi
 
 package.path = "./?.lua;./?/init.lua;eval/?.lua;" .. package.path
 
@@ -21,7 +22,7 @@ if not ok_req then io.write("\n0 passed, 1 failed\n"); os.exit(1) end
 -- The shim + a model are needed to exercise the real embed.
 local model = os.getenv("MEMO_GGUF_MODEL")
 if not model or model == "" then model = (os.getenv("HOME") or "") .. "/models/embeddinggemma-300M-Q8_0.gguf" end
-local shim = "luamemo/embedders/native/gguf_shim.so"
+local shim = os.getenv("LUAMEMO_TEST_GGUF_SHIM") or require("luamemo.embedders.native.ffi_shim").shim_path()
 local function exists(p) local f=io.open(p,"r"); if f then f:close(); return true end return false end
 
 if not (exists(model) and exists(shim)) then
@@ -34,7 +35,7 @@ end
 
 -- (a 2,048-token context whatever the model: EmbeddingGemma 2 would otherwise read 8K,
 -- and the truncation checks below would need a text four times as long)
-local cfg = { embedder_model = model, gguf_n_ctx = 2048 }
+local cfg = { embedder_model = model, gguf_n_ctx = 2048, gguf_shim_path = shim }
 local v, err = g.embed("Never commit or push autonomously.", cfg)
 check("embed returns a vector", type(v) == "table" and #v > 0, tostring(err))
 if type(v) == "table" and #v > 0 then
@@ -42,7 +43,7 @@ if type(v) == "table" and #v > 0 then
     local ss = 0; for i=1,#v do ss = ss + v[i]*v[i] end
     check("output is L2-normalised", math.abs(math.sqrt(ss) - 1.0) < 1e-3, string.format("%.5f", math.sqrt(ss)))
 end
-local v2 = g.embed("test", { embedder_model = model, embed_dim = 256 })
+local v2 = g.embed("test", { embedder_model = model, embed_dim = 256, gguf_shim_path = shim })
 if type(v2) == "table" then
     local ss2 = 0; for i=1,#v2 do ss2 = ss2 + v2[i]*v2[i] end
     check("Matryoshka truncation to 256 dims, renormalised", #v2 == 256 and math.abs(math.sqrt(ss2)-1.0) < 1e-3,

@@ -18,12 +18,15 @@
 --     | MEMO_DB=scratch luajit mcp/server.lua
 
 -- ---------------------------------------------------------------------------
--- Self-locate the bundled luamemo modules. Derive the repo/plugin root from
--- this script's own path (".../mcp/server.lua" → root) and prepend it to
--- package.path so `require("luamemo.*")` resolves to the code shipped next to
--- this server — no reliance on a LUA_PATH env var, and a stale system LuaRocks
--- install can't shadow the bundled modules. Falls back to the ambient path if
--- the root can't be derived (e.g. arg[0] unavailable).
+-- Self-locate the bundled luamemo modules, the way `memo` does. The root is derived from
+-- this script's own path (".../mcp/server.lua" → root), and `require("luamemo.*")`
+-- resolves to the code this server ships with — no reliance on a LUA_PATH env var, and a
+-- stale system LuaRocks install can't shadow it:
+--   · root/luamemo/init.lua exists (a checkout, the plugin): the root comes first;
+--   · the server sits in a rock's directory (<tree>/lib/luarocks/rocks-5.1/luamemo/<v>/mcp):
+--     the root holds no modules (and must not: a partial copy there shadowed the
+--     installed ones), so the tree's own module directories come first;
+--   · otherwise the ambient path (e.g. arg[0] unavailable).
 -- ---------------------------------------------------------------------------
 local SERVER_DIR   -- this script's directory (mcp/: instructions.md is next to it)
 do
@@ -42,7 +45,15 @@ do
         local root = self_path:gsub("\\", "/"):match("^(.-)/?mcp/[^/]+$")
         if root then
             if root == "" then root = "." end
-            package.path = root .. "/?.lua;" .. root .. "/?/init.lua;" .. package.path
+            local function is_file(p) local f = io.open(p, "r"); if f then f:close() end return f ~= nil end
+            local tree, lua_ver = (root:gsub("/+$", "")):match("^(.*)/lib/luarocks/rocks%-([%d%.]+)/luamemo/[^/]+$")
+            local share = tree and (tree .. "/share/lua/" .. lua_ver)
+            if is_file(root .. "/luamemo/init.lua") then
+                package.path = root .. "/?.lua;" .. root .. "/?/init.lua;" .. package.path
+            elseif share and is_file(share .. "/luamemo/init.lua") then
+                package.path  = share .. "/?.lua;" .. share .. "/?/init.lua;" .. package.path
+                package.cpath = tree .. "/lib/lua/" .. lua_ver .. "/?.so;" .. package.cpath
+            end
         end
     end
 end

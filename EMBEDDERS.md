@@ -83,7 +83,14 @@ assets, checked against the SHA-256 the installed rock ships, unpacked into
 `~/.local/share/luamemo/native/<version>-<platform>/` and recorded as
 `MEMO_GGUF_SHIM` in `~/.luamemorc`. `memo gguf status` shows what is in use.
 Elsewhere (or with a CUDA build), step 1 builds it — a C toolchain and cmake, and
-the llama.cpp release luamemo is tested against:
+the llama.cpp release luamemo is tested against (Linux and macOS: CI builds it from
+source on both). The script is `gguf/build.sh` in a
+checkout or the plugin, and `memo gguf status` prints its path in an install; it
+writes `~/.local/share/luamemo/native/gguf_shim.so` (no root needed), where luamemo
+looks when `MEMO_GGUF_SHIM` is not set. A `MEMO_GGUF_SHIM` recorded by
+`memo gguf install` wins over it: `memo config unset --user MEMO_GGUF_SHIM` to use the
+build (`memo gguf status` says which is in use). The `sed` form below works when
+`memo gguf status` prints a path on its `build:` line:
 
 ```bash
 # 1. the runtime: memo gguf install — or llama.cpp (shared libraries) and the shim
@@ -92,7 +99,7 @@ cmake -B ~/llama.cpp/build -S ~/llama.cpp -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=OFF
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
       -DLLAMA_BUILD_TOOLS=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build ~/llama.cpp/build --target llama -j
-LLAMA_DIR=~/llama.cpp bash <luamemo>/luamemo/embedders/native/build.sh
+LLAMA_DIR=~/llama.cpp bash "$(memo gguf status | sed -n 's/^ *build: *//p')"   # or gguf/build.sh in a checkout
 
 # 2. the model (~300 MB)
 mkdir -p ~/models && curl -sL -o ~/models/embeddinggemma-2-Q8_0.gguf \

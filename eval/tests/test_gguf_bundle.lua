@@ -98,7 +98,7 @@ end)
 section("a shim built before 0.5.0 is recognised", function()
 io.write("\n--- a stale shim ---\n")
 -- Before 0.5.0 the shim had no lmembed_last_truncated and failed on any text longer than
--- the context; an upgrade keeps one built next to the modules.
+-- the context; an upgrade keeps one built in the data directory.
 local ffi_shim = require("luamemo.embedders.native.ffi_shim")
 local old = setmetatable({}, { __index = function(_, k) error("undefined symbol: " .. k) end })
 check("stale(): a library without lmembed_last_truncated", ffi_shim.stale(old)
@@ -112,7 +112,7 @@ f:write("int lmembed_dim(void *h) { (void) h; return 768; }\n"); f:close()
 local _, cc = sh(("cc -shared -fPIC -o %q %q"):format(so, src))
 local loads, stale = bundle.loads(so)
 check("loads(): a pre-0.5.0 shim loads, and is reported stale", cc == 0 and loads and stale)
-local here = require("luamemo.embedders.native.ffi_shim").shim_path()
+local here = os.getenv("LUAMEMO_TEST_GGUF_SHIM") or require("luamemo.embedders.native.ffi_shim").shim_path()
 if require("luamemo.util").exists(here) then
     local l2, s2 = bundle.loads(here)
     check("loads(): this checkout's shim is current", l2 and not s2)

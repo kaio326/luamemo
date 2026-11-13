@@ -1,7 +1,8 @@
 -- luamemo.cli.gguf
 --
--- `memo gguf [status]` — the in-process GGUF embedder's runtime: the shim in use, whether
--- it loads, whether this release has a prebuilt one for this machine, the model.
+-- `memo gguf [status]` — the in-process GGUF embedder's runtime: the shim in use (and which
+-- rule found it), whether it loads, where gguf/build.sh is, whether this release has a
+-- prebuilt runtime for this machine, the model.
 -- `memo gguf install` — download that prebuilt runtime (checked against the checksum the
 -- rock ships), unpack it into ~/.local/share/luamemo/native/; prints `SHIM <path>` last —
 -- cli/memo then records it: memo config set --user MEMO_GGUF_SHIM <path>.
@@ -13,16 +14,27 @@ local bundle = require("luamemo.embedders.native.bundle")
 local exists = require("luamemo.util").exists
 
 local function status()
-    local shim = require("luamemo.embedders.native.ffi_shim").shim_path()
-    local set = os.getenv("MEMO_GGUF_SHIM")
+    local ffi_shim = require("luamemo.embedders.native.ffi_shim")
+    local shim = ffi_shim.shim_path()
+    local set = ffi_shim.override()
     io.write("GGUF runtime\n")
-    io.write(("  shim:      %s (%s)\n"):format(shim, (set and set ~= "") and "MEMO_GGUF_SHIM" or "next to the modules"))
+    io.write(("  shim:      %s (%s)\n"):format(shim, set and "MEMO_GGUF_SHIM" or "the default place"))
     local loads, stale = false, false
-    if exists(shim) then loads, stale = bundle.loads(shim) end
-    if not exists(shim) then io.write("  state:     not installed\n")
-    elseif stale then io.write("  state:     loads, but " .. require("luamemo.embedders.native.ffi_shim").STALE .. "\n")
+    -- Nothing is loaded (dlopen'd, even to test it) from a place missing() refuses.
+    local unusable = ffi_shim.missing()
+    if not unusable then loads, stale = bundle.loads(shim) end
+    if unusable then
+        io.write("  state:     not installed\n")
+        io.write("             " .. unusable .. "\n")
+    elseif stale then io.write("  state:     loads, but " .. ffi_shim.STALE .. "\n")
     elseif loads then io.write("  state:     loads\n")
     else io.write("  state:     present, but it doesn't load on this machine\n") end
+    if set and exists(ffi_shim.default_path()) then
+        io.write("  note:      a shim built from source is at " .. ffi_shim.default_path()
+            .. ", unused while MEMO_GGUF_SHIM is set\n")
+    end
+    local build = ffi_shim.build_script()
+    io.write("  build:     " .. (build or ("not found from here — get " .. ffi_shim.build_hint())) .. "\n")
     local b, why = bundle.available()
     if b then
         io.write(("  prebuilt:  %s for %s — memo gguf install%s\n"):format(b.asset, b.platform,

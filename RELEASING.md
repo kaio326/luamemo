@@ -15,10 +15,12 @@ Every step can be checked locally first.
    ```bash
    luajit eval/tests/run.lua                               # the suite
    bash eval/release/smoke.sh luamemo-X.Y.Z-1.rockspec     # the rock, installed and used
+   bash eval/release/source_build.sh ~/llama.cpp           # the GGUF shim built from source
    ```
 5. Commit, push, and wait for **CI** to pass. CI runs the suite on Ubuntu, with and
    without lua-cjson, plus the smoke test. A macOS job also runs, but it doesn't
-   block yet.
+   block yet. The `GGUF shim from source` job (llama.cpp built as `memo calibrate`
+   says, then `gguf/build.sh`) runs on Ubuntu **and macOS, and both block**.
 
 ## The run
 
@@ -34,7 +36,11 @@ The workflow does this, and stops at the first failure:
 2. **CI:** the whole of CI on that commit.
 3. **GGUF runtimes:** `eval/release/gguf_bundle.sh` runs on Linux x86_64 and on
    macOS arm64. It builds llama.cpp at `M.LLAMA_TAG` (in
-   `luamemo/embedders/native/bundle.lua`) and the shim.
+   `luamemo/embedders/native/bundle.lua`) and the shim (`gguf/gguf_shim.c`). The
+   **runtime-smoke** job then loads the Linux x86_64 runtime through an installed rock
+   (`SMOKE_GGUF_BUNDLE`), in a job with a read-only token and no stored credentials,
+   because it executes a library built from an upstream tag; the release needs it. The
+   macOS runtime isn't checked this way: the smoke runs on Ubuntu.
 4. **Eval kit:** `eval/release/eval_kit.sh` packs the benchmark runners, the
    personalization set, the fixtures, the baselines and the dataset list (the files
    `luamemo/cli/eval.lua` lists in `M.KIT_FILES`) into

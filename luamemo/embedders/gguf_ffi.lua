@@ -9,7 +9,7 @@
 --
 -- Config (cfg or env; MEMO_GEMMA_* accepted as back-compat aliases):
 --   embedder_model / MEMO_GGUF_MODEL   path to the .gguf  (required)
---   gguf_shim_path / MEMO_GGUF_SHIM    path to gguf_shim.so (default: ./native/)
+--   gguf_shim_path / MEMO_GGUF_SHIM    path to gguf_shim.so (default: <data dir>/native/gguf_shim.so)
 --   embed_dim                          Matryoshka truncation dim (<= model dim; renormalised)
 --   gguf_n_ctx / MEMO_GGUF_NCTX        context length (unset: the model's trained length, at most 8192)
 

@@ -105,7 +105,7 @@ for the few settings marked below where a mistake must stop luamemo instead.
 | `MEMO_PROJECTED_BASE` | text | — | Base embedder of the projected embedder (hash, gguf_ffi, …). Changing it: `memo reembed --all`. |
 | `MEMO_GGUF_NCTX` | whole number ≥ 1 | — | Context size of the in-process GGUF embedder (unset: the context the model was trained with, at most 8192 — EmbeddingGemma 2 reads 8K, EmbeddingGemma-300M 2K). Older name, still read: `MEMO_GEMMA_NCTX`. |
 | `MEMO_GGUF_NGL` | whole number ≥ -1 | `0` | GPU layers for the GGUF embedder: 0 CPU, N layers, -1 all. Older name, still read: `MEMO_GEMMA_NGL`. |
-| `MEMO_GGUF_SHIM` | text | — | Path of the built GGUF shim (default: the one next to luamemo). Older name, still read: `MEMO_GEMMA_SHIM`. |
+| `MEMO_GGUF_SHIM` | text | — | Path of the GGUF shim (default: the one gguf/build.sh makes, ~/.local/share/luamemo/native/gguf_shim.so; memo gguf install sets this). Older name, still read: `MEMO_GEMMA_SHIM`. |
 | `MEMO_CA_FILE` | text | — | A PEM certificate (or CA) trusted for https:// calls besides the system's — a self-hosted service's. Set only in your shell, `memo calibrate` offers to save it in `.luamemorc` (an MCP client starts the server without your shell's settings). |
 | `MEMO_SKIP_EMBED_PROBE` | true / false | `false` | Skip the embedder check at startup. |
 | `MEMO_ENSURE_READY_RETRY_SECS` | whole number ≥ 0 | `10` | While the embedder is down, retry it at most once per this many seconds (0: on every call). |

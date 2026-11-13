@@ -130,9 +130,10 @@ build = {
     },
     -- mcp/: the server and its usage rules (instructions.md); hooks/: the Claude Code
     -- hooks `memo agent install` wires (brief, sensing, file-memory guard, optional
-    -- transcript capture); luamemo/embedders/native: the GGUF shim's source and build.sh
-    -- (built on demand — a built gguf_shim.so is never shipped).
-    copy_directories = { "examples", "hooks", "mcp", "luamemo/embedders/native" },
+    -- transcript capture); gguf/: the GGUF shim's source and build.sh (built on demand — a
+    -- built gguf_shim.so is never shipped). Nothing under luamemo/ is copied: a second copy of
+    -- a module beside mcp/ is what 0.5.3's server loaded in place of the installed one.
+    copy_directories = { "examples", "gguf", "hooks", "mcp" },
 }
 ]=]
 

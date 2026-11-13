@@ -2,12 +2,16 @@
 # eval/release/smoke.sh — install the rock into a temporary tree and use it (development
 # only; never shipped). Catches what the suite, run from the checkout, can't: a module
 # left out of the rock, a file it doesn't copy, memo or the MCP server not finding
-# their code once installed.
+# their code once installed, the server loading a module from anywhere but the tree
+# (a recorder logs every module's file), and the GGUF embedder not finding its shim (a
+# stand-in, eval/fixtures/stub_gguf_shim.c, takes the real one's place: no llama.cpp).
 #
 #   bash eval/release/smoke.sh luamemo-X.Y.Z-1.rockspec   (builds it from this checkout)
 #   bash eval/release/smoke.sh luamemo-X.Y.Z-1.src.rock   (the release's own rock)
 #
-# Env: LUAROCKS (default luarocks), LUAJIT (default luajit), SMOKE_KEEP=1 keeps the tree.
+# Env: LUAROCKS (default luarocks), LUAJIT (default luajit), SMOKE_KEEP=1 keeps the tree,
+# SMOKE_GGUF_BUNDLE=<luamemo-gguf-X.Y.Z-<os>-<arch>.tar.gz>: also check that this prebuilt
+# runtime loads through the installed rock (the release passes the one it is about to publish).
 # Prints one PASS / FAIL line per check; exit 1 when any fails. The tree, home and
 # project are temporary: nothing on this machine is read or changed.
 set -uo pipefail
@@ -28,6 +32,7 @@ fi
 lr() { env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_1 -u LUA_CPATH_5_1 "$LUAROCKS" ${LR_LUA[@]+"${LR_LUA[@]}"} "$@"; }
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 [[ "$SPEC" == /* ]] || SPEC="$PWD/$SPEC"
+[[ -z "${SMOKE_GGUF_BUNDLE:-}" || "$SMOKE_GGUF_BUNDLE" == /* ]] || SMOKE_GGUF_BUNDLE="$PWD/$SMOKE_GGUF_BUNDLE"
 SMOKE_TMP="${TMPDIR:-/tmp}"
 WORK=$(mktemp -d "${SMOKE_TMP%/}/luamemo-smoke.XXXXXX")
 TREE="$WORK/tree" HOMEDIR="$WORK/home" PROJ="$WORK/project"
@@ -118,7 +123,8 @@ out=$(cd "$PROJ" && "${RUN[@]}" memo eval status --json 2>&1)
     && pass "memo eval status (no kit installed — it is an optional download)" || fail "memo eval status" "$out"
 
 # ── memo mcp: the server from the rock ───────────────────────────────────────────
-req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}'
+req="$INIT"'
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"staging gate"}}}
 {"jsonrpc":"2.0","id":4,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
@@ -141,15 +147,113 @@ named=$(sed -n 's/^ *"command": "\([^"]*\)".*/\1/p' <<<"$out" | head -1)
     && pass "memo mcp --print-config names the installed memo" \
     || fail "memo mcp --print-config names the installed memo" "$out"
 
+# ── Where the server's modules come from (0.5.3: it loaded a second copy of ffi_shim.lua
+# that the rock installed beside mcp/, and looked for the GGUF shim next to that copy) ──
+cp "$REPO/eval/release/lua_recorder.sh" "$WORK/lua_recorder" && chmod +x "$WORK/lua_recorder"
+rec_log="$WORK/loaded.tsv"
+# record_mcp DIR REQUEST: a `memo mcp` session with the recorder in front of luajit → $rec_log
+record_mcp() {
+    rm -f "$rec_log"
+    (cd "$1" && printf '%s\n' "$2" | "${RUN[@]}" MEMO_LUA="$WORK/lua_recorder" LUA_RECORDER_BIN="$LUAJIT" \
+        LUA_RECORDER_OUT="$rec_log" memo mcp >/dev/null 2>&1)
+}
+record_mcp "$PROJ/src" "$req"
+TREE_REAL=$(cd "$TREE" && pwd -P)
+# provenance NAME: every luamemo module the recorder logged came from the tree's module directory.
+# (With the hash embedder the server never loads ffi_shim, the module 0.5.3 shadowed: the
+# gguf_ffi session below repeats the check.)
+provenance() {
+    local n_mod stray
+    n_mod=$(awk -F'\t' '$1 ~ /^luamemo/' "$rec_log" 2>/dev/null | wc -l | tr -d ' ')
+    stray=$(awk -F'\t' -v a="$TREE/share/lua/5.1/" -v b="$TREE_REAL/share/lua/5.1/" \
+        '$1 ~ /^luamemo/ && index($2, a) != 1 && index($2, b) != 1 { print $1 " <- " $2 }' "$rec_log" 2>/dev/null | head -5)
+    if [[ "${n_mod:-0}" -gt 20 && -z "$stray" ]]; then pass "$1 ($n_mod modules)"
+    else fail "$1" "modules logged: ${n_mod:-0}; elsewhere: $stray"; fi
+}
+provenance "memo mcp loads every luamemo module from the tree"
+
+if [[ -e "$ROCKDIR/luamemo" ]]; then fail "the rock keeps no luamemo/ beside mcp/" "$(find "$ROCKDIR/luamemo" -type f | head -5)"
+else pass "the rock keeps no luamemo/ beside mcp/"; fi
+
+# The server started on its own: no memo, no LUA_PATH (only where the dependencies are). Under the
+# recorder: answering with the right version is not enough, because a luamemo of the same version
+# installed on this machine would answer too.
+rm -f "$rec_log"
+passenv=(); for v in MEMO_LIB_SQLITE3 MEMO_LIB_SODIUM; do [[ -n "${!v:-}" ]] && passenv+=("$v=${!v}"); done
+out=$(cd "$PROJ" && printf '%s\n' "$INIT" | env -i HOME="$HOMEDIR" PATH="$LUAJIT_DIR:/usr/bin:/bin" \
+    LUA_PATH="$DEP_PATH;;" LUA_CPATH="$DEP_CPATH;;" MEMO_DB="$WORK/direct.db" MEMO_EMBEDDER=hash \
+    LUA_RECORDER_BIN="$LUAJIT" LUA_RECORDER_OUT="$rec_log" \
+    ${passenv[@]+"${passenv[@]}"} "$WORK/lua_recorder" "$ROCKDIR/mcp/server.lua" 2>&1)
+[[ "$(jq -r 'select(.id == 1) | .result.serverInfo.version' <<<"$out" 2>/dev/null)" == "$VERSION" ]] \
+    && pass "the server starts on its own (no memo; the dependencies' paths only)" \
+    || fail "the server starts on its own (no memo; the dependencies' paths only)" "$out"
+provenance "the server started on its own loads every luamemo module from the tree"
+
+# ── The GGUF embedder, with a stand-in shim (no llama.cpp, no model) ─────────────
+shim=$(cd "$PROJ" && "${RUN[@]}" memo gguf status 2>&1 | sed -n 's/^ *shim: *\(.*\) (.*$/\1/p')
+WORK_REAL=$(cd "$WORK" && pwd -P)
+if ! command -v cc >/dev/null 2>&1; then echo "SKIP  the GGUF embedder (no C compiler)"
+elif [[ "$shim" != "$WORK"/* && "$shim" != "$WORK_REAL"/* ]]; then
+    fail "memo gguf status names a shim place inside the smoke test's own home" "$shim"
+else
+    mkdir -p "$(dirname "$shim")" && cc -O2 -fPIC -shared "$REPO/eval/fixtures/stub_gguf_shim.c" -o "$shim" -lm
+    GPROJ="$WORK/project-gguf"; mkdir -p "$GPROJ"; : > "$WORK/stub.gguf"
+    for kv in "MEMO_DB=$WORK/smoke-gguf.db" "MEMO_SCOPE=repo:smoke-gguf" "MEMO_EMBEDDER=gguf_ffi" "MEMO_GGUF_MODEL=$WORK/stub.gguf"; do
+        out=$(cd "$GPROJ" && "${RUN[@]}" memo config set "${kv%%=*}" "${kv#*=}" 2>&1) || fail "memo config set ${kv%%=*} (gguf project)" "$out"
+    done
+    out=$(cd "$GPROJ" && "${RUN[@]}" memo gguf status 2>&1)
+    grep -q "state:     loads" <<<"$out" && pass "memo gguf status says the stand-in shim loads" \
+        || fail "memo gguf status says the stand-in shim loads" "$out"
+    out=$(cd "$GPROJ" && "${RUN[@]}" memo write --kind fact --title "gguf deploy" --body "releases go through the canary ring first" 2>&1)
+    out2=$(cd "$GPROJ" && "${RUN[@]}" memo search "canary ring" 2>&1)
+    grep -q '"gguf deploy"' <<<"$out2" && pass "memo write / search with gguf_ffi" \
+        || fail "memo write / search with gguf_ffi" "$out | $out2"
+    greq="$INIT"'
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_write","arguments":{"kind":"fact","title":"gguf mcp note","body":"the nightly build runs on the blue pool"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"blue pool"}}}'
+    out=$(cd "$GPROJ" && printf '%s\n' "$greq" | "${RUN[@]}" memo mcp 2>&1)
+    [[ "$(got 2 '.result.isError // false')" == false && -n "$(got 2 '.result.content[0].text')" ]] \
+        && pass "memo mcp: memory_write with gguf_ffi" || fail "memo mcp: memory_write with gguf_ffi" "$(got 2 .)"
+    got 3 '.result.content[0].text' | grep -q "gguf mcp note" && pass "memo mcp: memory_search with gguf_ffi" \
+        || fail "memo mcp: memory_search with gguf_ffi" "$(got 3 .)"
+    record_mcp "$GPROJ" "$greq"
+    provenance "memo mcp with gguf_ffi loads every luamemo module from the tree"
+fi
+build_where=$("${RUN[@]}" bash "$ROCKDIR/gguf/build.sh" --where 2>&1)
+[[ -n "$shim" && "$(real_path "$build_where")" == "$(real_path "$shim")" ]] \
+    && pass "gguf/build.sh --where names the shim memo looks for" \
+    || fail "gguf/build.sh --where names the shim memo looks for" "build.sh: $build_where | memo: $shim"
+
+# A prebuilt-runtime tarball (luamemo-gguf-…/gguf_shim.so, as gguf_bundle.sh packs it) loaded through
+# the installed rock (no model in CI: it can't embed here; the stand-in above covers that path).
+bundle_check() {
+    local name="$1" tarball="$2" dir bshim
+    dir=$(mktemp -d "$WORK/bundle.XXXXXX") && tar -xzf "$tarball" -C "$dir"
+    bshim=$(ls "$dir"/*/gguf_shim.so 2>/dev/null | head -1)
+    out=$(cd "$PROJ" && "${RUN[@]}" MEMO_GGUF_SHIM="$bshim" memo gguf status 2>&1)
+    # (the shim: line names the bundle's file: a default-place stand-in that loads would satisfy "loads" alone)
+    if [[ -n "$bshim" ]] && grep -qF "$bshim (MEMO_GGUF_SHIM)" <<<"$out" && grep -q "state:     loads" <<<"$out" \
+        && ! grep -q "built before" <<<"$out"; then pass "$name"
+    else fail "$name" "${bshim:-no gguf_shim.so in $tarball}: $out"; fi
+}
+# The release's own bundle runs this only in the release; a stand-in tarball in the same layout runs the
+# same code on every push.
+if command -v cc >/dev/null 2>&1; then
+    sb="$WORK/standin-bundle/luamemo-gguf-$VERSION-test"; mkdir -p "$sb"
+    cc -O2 -fPIC -shared "$REPO/eval/fixtures/stub_gguf_shim.c" -o "$sb/gguf_shim.so" -lm \
+        && tar -czf "$WORK/standin-bundle.tar.gz" -C "$WORK/standin-bundle" "luamemo-gguf-$VERSION-test" \
+        && bundle_check "a prebuilt-runtime tarball (the release's layout) loads through the installed rock" "$WORK/standin-bundle.tar.gz"
+fi
+[[ -z "${SMOKE_GGUF_BUNDLE:-}" ]] || bundle_check "the release's prebuilt runtime loads through the installed rock" "$SMOKE_GGUF_BUNDLE"
+
 # ── What the rock copies ─────────────────────────────────────────────────────────
 for f in mcp/server.lua mcp/instructions.md hooks/claude/pre_compact.sh hooks/claude/post_message.sh \
-         hooks/claude/_save.sh hooks/hooks.json luamemo/embedders/native/build.sh \
-         luamemo/embedders/native/gguf_shim.c; do
+         hooks/claude/_save.sh hooks/hooks.json gguf/build.sh gguf/gguf_shim.c; do
     [[ -f "$ROCKDIR/$f" ]] || fail "the rock ships $f"
 done
-[[ -f "$ROCKDIR/luamemo/embedders/native/gguf_shim.so" ]] && fail "no built gguf_shim.so in the rock"
+[[ -f "$ROCKDIR/gguf/gguf_shim.so" ]] && fail "no built gguf_shim.so in the rock"
 [[ -e "$ROCKDIR/eval" ]] && fail "no eval/ in the rock (the eval kit is a release asset)"
-pass "the rock ships mcp/, hooks/, the GGUF shim's source (no built .so, no eval/ checked above)"
+pass "the rock ships mcp/, hooks/, gguf/ (the shim's source; no built .so, no eval/ checked above)"
 
 echo ""
 if [[ $FAILS -eq 0 ]]; then echo "smoke: all checks passed ($VERSION)"; exit 0; fi
