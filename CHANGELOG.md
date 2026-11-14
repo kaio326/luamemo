@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.5.4] — unreleased
+## [0.5.4] — 2026-11-14
 
 A bug-fix release for the GGUF embedder (`MEMO_EMBEDDER=gguf_ffi`) when luamemo is installed with LuaRocks.
 
